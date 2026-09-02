@@ -1,0 +1,13 @@
+# Артефакты сборки PyInstaller
+build/
+dist/
+
+# Виртуальное окружение и кэш
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+
+# Локальные данные (не коммитить!)
+turnalog_history.db
