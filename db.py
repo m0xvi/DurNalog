@@ -19,11 +19,22 @@ from tax import dates_overlap
 
 
 def default_db_path():
+    if _DB_PATH_OVERRIDE:
+        return _DB_PATH_OVERRIDE
     if getattr(sys, 'frozen', False):           # собранный EXE
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, 'turnalog_history.db')
+
+
+_DB_PATH_OVERRIDE = None
+
+
+def set_db_path(path):
+    """Путь к БД из конфига/диалога первого запуска. None = по умолчанию."""
+    global _DB_PATH_OVERRIDE
+    _DB_PATH_OVERRIDE = path or None
 
 
 class HistoryDB:

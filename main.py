@@ -7,6 +7,7 @@ import io
 import os
 import sys
 import json
+import shutil
 import zipfile
 import logging
 import tempfile
@@ -20,10 +21,10 @@ from agents import (match_dona_agent, match_agent, DONA_AGENTS, migrate_agents,
                     default_agents, import_agents, export_agents, parse_dmy)
 from tax import (tax_formula_daily_rate, tax_formula_method, tax_formula_tax,
                  parse_price, TaxParams, DEFAULT_TAX)
-from db import HistoryDB
+from db import HistoryDB, set_db_path, default_db_path
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 NOT_SET = "— не указано —"
 
 # Тема фиксированно светлая (по требованию пользователя)
@@ -331,6 +332,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._build_agents_tab(tv.add("Агенты"))
         if master.is_admin:
             self._build_users_tab(tv.add("Пользователи"))
+            self._build_data_tab(tv.add("Данные"))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(pady=(0, 12))
@@ -818,6 +820,68 @@ class SettingsDialog(ctk.CTkToplevel):
         self._refresh_users()
 
     # ------------------------------------------------------------
+    # вкладка «Данные»: расположение базы
+    # ------------------------------------------------------------
+    def _build_data_tab(self, tab):
+        ctk.CTkLabel(tab, text="База данных: расположение",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+            padx=14, pady=(8, 2), anchor="w")
+        self.db_path_label = ctk.CTkLabel(tab, text=default_db_path(),
+                                          text_color="gray", font=("Consolas", 11),
+                                          anchor="w", justify="left", wraplength=640)
+        self.db_path_label.pack(padx=14, fill="x")
+        ctk.CTkLabel(tab, text="В базе — история отчётов, дубли кварталов, пользователи.\n"
+                               "Общая сетевая папка = общая история и пользователи для всех ПК.\n"
+                               "Смена пути применяется сразу, перезапуск не нужен.",
+                     text_color="gray", font=ctk.CTkFont(size=10),
+                     justify="left", anchor="w").pack(padx=14, pady=(4, 6), fill="x")
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        bar.pack(padx=14, fill="x")
+        ctk.CTkButton(bar, text="Сменить папку…", width=130, height=30,
+                      command=self._change_db_dir).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="Сбросить (рядом с приложением)", width=230,
+                      height=30, fg_color="gray",
+                      command=self._reset_db).pack(side="left", padx=3)
+
+    def _change_db_dir(self):
+        d = filedialog.askdirectory(parent=self, title="Папка для базы данных")
+        if not d:
+            return
+        new = os.path.join(d, 'turnalog_history.db')
+        cur = default_db_path()
+        if os.path.normcase(new) == os.path.normcase(cur):
+            return
+        if not os.path.exists(new) and os.path.exists(cur):
+            if messagebox.askyesno("Копирование",
+                                   "Скопировать текущую базу (историю и пользователей)\n"
+                                   "в новую папку?", parent=self):
+                try:
+                    shutil.copy(cur, new)
+                except Exception as e:
+                    messagebox.showerror("База данных",
+                                         f"Не удалось скопировать базу:\n{e}", parent=self)
+                    return
+        try:
+            t = HistoryDB(new)
+            t.ensure_default_admin()
+            t.close()
+        except Exception as e:
+            messagebox.showerror("База данных",
+                                 f"Не удалось открыть/создать базу:\n{new}\n{e}",
+                                 parent=self)
+            return
+        set_db_path(new)
+        self.cfg['db_path'] = new
+        save_config(self.cfg)
+        self.db_path_label.configure(text=new)
+
+    def _reset_db(self):
+        self.cfg.pop('db_path', None)
+        save_config(self.cfg)
+        set_db_path(None)
+        self.db_path_label.configure(text=default_db_path())
+
+    # ------------------------------------------------------------
     def ok(self):
         tax = {}
         for hid, _hname in self.HOTELS:
@@ -971,6 +1035,47 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
 
 
 # ================================================================
+# ДИАЛОГ ПЕРВОГО ЗАПУСКА: ГДЕ ХРАНИТЬ БАЗУ
+# ================================================================
+class DbLocationDialog(ctk.CTkToplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("База данных")
+        self.transient(master)
+        self.resizable(False, False)
+        self.result = None
+
+        ctk.CTkLabel(self, text="Где хранить базу данных?",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(16, 2))
+        ctk.CTkLabel(self, text="В базе — история отчётов, дубли кварталов,\n"
+                                "пользователи и пароли.\n\n"
+                                "• «Рядом с приложением» — база только на этом ПК.\n"
+                                "• «Выбрать папку» — например, общая сетевая папка:\n"
+                                "   тогда история и пользователи будут общими.",
+                     justify="left", font=ctk.CTkFont(size=12)).pack(padx=20)
+        b = ctk.CTkFrame(self, fg_color="transparent")
+        b.pack(pady=14)
+        ctk.CTkButton(b, text="Рядом с приложением", width=170, height=34,
+                      fg_color="green",
+                      command=lambda: self.finish(None)).pack(side="left", padx=5)
+        ctk.CTkButton(b, text="Выбрать папку…", width=140, height=34,
+                      command=self.choose).pack(side="left", padx=5)
+        autosize(self, 470)
+        self.lift()
+        self.focus_force()
+        self.attributes("-topmost", True)
+
+    def choose(self):
+        d = filedialog.askdirectory(parent=self, title="Папка для базы данных")
+        if d:
+            self.finish(os.path.join(d, 'turnalog_history.db'))
+
+    def finish(self, path):
+        self.result = path
+        self.destroy()
+
+
+# ================================================================
 # ОКНО ВХОДА
 # ================================================================
 class LoginDialog(ctk.CTkToplevel):
@@ -997,6 +1102,8 @@ class LoginDialog(ctk.CTkToplevel):
         self.err.pack()
         ctk.CTkButton(self, text="Войти", fg_color="green", height=32,
                       command=self.ok).pack(padx=60, pady=4, fill="x")
+        ctk.CTkLabel(self, text=f"БД: {default_db_path()}", text_color="gray",
+                     font=ctk.CTkFont(size=8), wraplength=300).pack(pady=(2, 0))
         if db.check_user('admin', 'admin'):
             ctk.CTkLabel(self, text="Первый запуск: логин admin, пароль admin — "
                                      "смените пароль в «Пользователи»",
@@ -2282,6 +2389,22 @@ class App(ctk.CTk):
 
 if __name__ == "__main__":
     log.info("Запуск приложения v%s", APP_VERSION)
+    _cfg = load_config()
+    _db_path = _cfg.get('db_path')
+    if _db_path and not os.path.isdir(os.path.dirname(_db_path) or _app_dir()):
+        log.warning("Папка БД недоступна (%s) — путь по умолчанию", _db_path)
+        _db_path = None
+    if not _db_path:  # первый запуск: предлагаем расположение базы
+        _r0 = ctk.CTk()
+        _r0.withdraw()
+        _dlg0 = DbLocationDialog(_r0)
+        _r0.wait_window(_dlg0)
+        _db_path = _dlg0.result or os.path.join(_app_dir(), 'turnalog_history.db')
+        _r0.destroy()
+        _cfg['db_path'] = _db_path
+        save_config(_cfg)
+    set_db_path(_db_path)
+    log.info("БД: %s", _db_path)
     _db = HistoryDB()
     _db.ensure_default_admin()
     _root = ctk.CTk()

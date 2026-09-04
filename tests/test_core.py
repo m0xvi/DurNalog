@@ -348,3 +348,21 @@ def test_use_full_off(tmp_path):
     # налог от исходной стоимости D, а не от пересчитанной G
     assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,D2/102*2),2)'
     assert ws["J2"].value == '=D2/I2'
+
+
+def test_db_path_override(tmp_path):
+    from db import HistoryDB, set_db_path, default_db_path
+    p = os.path.join(str(tmp_path), "shared", "x.db")
+    os.makedirs(os.path.dirname(p))
+    set_db_path(p)
+    try:
+        assert default_db_path() == p
+        db = HistoryDB()
+        db.ensure_default_admin()
+        db.close()
+        assert os.path.exists(p)
+        db2 = HistoryDB(p)
+        assert db2.check_user('admin', 'admin') is not None
+        db2.close()
+    finally:
+        set_db_path(None)
