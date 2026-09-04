@@ -313,3 +313,38 @@ def test_import_export_roundtrip(tmp_path):
         assert 'ozon' in oz['aliases']
         ost = next(a for a in back if a['name'] == 'Островок')
         assert ost['rates'][0]['pct'] == 15
+
+
+def test_users_db(tmp_path):
+    from db import HistoryDB
+    db = HistoryDB(os.path.join(str(tmp_path), "u.db"))
+    db.ensure_default_admin()
+    assert db.check_user('admin', 'admin') is not None
+    assert db.check_user('admin', 'nope') is None
+    assert db.add_user('dona_user', 'pw', 'hotel', 'dna')
+    assert not db.add_user('dona_user', 'x', 'hotel', 'dna')  # логин занят
+    u = db.check_user('dona_user', 'pw')
+    assert u['role'] == 'hotel' and u['hotel'] == 'dna'
+    admin_id = [x for x in db.list_users() if x['login'] == 'admin'][0]['id']
+    assert db.del_user(admin_id) is False  # последний админ неприкосновенен
+    du = [x for x in db.list_users() if x['login'] == 'dona_user'][0]['id']
+    assert db.del_user(du) is True
+    db.set_password(admin_id, 'newpass')
+    assert db.check_user('admin', 'newpass') is not None
+    db.close()
+
+
+def test_use_full_off(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import main
+    src = os.path.join(str(tmp_path), "uf.csv")
+    out = os.path.join(str(tmp_path), "uf.xlsx")
+    pd.DataFrame([["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "островок"]],
+                 columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник"]
+                 ).to_csv(src, index=False)
+    _, _ = main.App.process_dona(src, out, tax={'use_full': False})
+    ws = openpyxl.load_workbook(out)["Дона"]
+    # налог от исходной стоимости D, а не от пересчитанной G
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,D2/102*2),2)'
+    assert ws["J2"].value == '=D2/I2'

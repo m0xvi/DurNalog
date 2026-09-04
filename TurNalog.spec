@@ -9,7 +9,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('F:/Desktop/Projects/DurNalog/.venv/Lib/site-packages/customtkinter', 'customtkinter')],
+    datas=[('F:\\Desktop\\DurNalog\\.venv\\Lib\\site-packages\\customtkinter', 'customtkinter')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

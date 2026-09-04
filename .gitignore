@@ -11,3 +11,7 @@ __pycache__/
 
 # Локальные данные (не коммитить!)
 turnalog_history.db
+turnalog_config.json
+
+# Упаковка для релизов
+TurNalog-win64.zip
