@@ -23,7 +23,7 @@ from tax import (tax_formula_daily_rate, tax_formula_method, tax_formula_tax,
 from db import HistoryDB
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 NOT_SET = "— не указано —"
 
 # Тема фиксированно светлая (по требованию пользователя)
@@ -181,6 +181,7 @@ class MappingDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title(title)
         self.geometry("640x600")
+        self.resizable(False, True)
         self.transient(master)
         self.headers = [str(h) for h in headers]
         self.schema = schema
@@ -266,7 +267,6 @@ class QuarterDialog(ctk.CTkToplevel):
     def __init__(self, master, hotel):
         super().__init__(master)
         self.title("Квартал отчёта")
-        self.geometry("300x190")
         self.resizable(False, False)
         self.transient(master)
         self.result = None
@@ -288,6 +288,7 @@ class QuarterDialog(ctk.CTkToplevel):
                       command=self.ok).pack(side="left", padx=5)
         ctk.CTkButton(btns, text="Отмена", width=100, fg_color="gray",
                       command=self.destroy).pack(side="left", padx=5)
+        autosize(self, 300)
         self.grab_set()
         self.lift()
         self.focus_force()
@@ -311,6 +312,7 @@ class SettingsDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title("Настройки")
         self.geometry("780x640")
+        self.resizable(False, True)
         self.transient(master)
         self.result = None
         self.cfg = cfg
@@ -327,6 +329,8 @@ class SettingsDialog(ctk.CTkToplevel):
         for hid, hname in self.HOTELS:
             self._build_hotel_tab(tv.add(hname), hid)
         self._build_agents_tab(tv.add("Агенты"))
+        if master.is_admin:
+            self._build_users_tab(tv.add("Пользователи"))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(pady=(0, 12))
@@ -681,6 +685,139 @@ class SettingsDialog(ctk.CTkToplevel):
             text=f"→ {name}, {comm}%" if name else "→ не распознан (0%)")
 
     # ------------------------------------------------------------
+    # вкладка «Пользователи» (админ)
+    # ------------------------------------------------------------
+    def _build_users_tab(self, tab):
+        ctk.CTkLabel(tab, text="Пользователи и права доступа",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+            padx=14, pady=(8, 2), anchor="w")
+        ctk.CTkLabel(tab, text="Пользователь отеля видит только свой отель и его историю.",
+                     text_color="gray", font=ctk.CTkFont(size=10)).pack(
+            padx=14, anchor="w")
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        bar.pack(padx=14, pady=6, fill="x")
+        ctk.CTkButton(bar, text="➕ Добавить", width=110, height=30, fg_color="green",
+                      font=ctk.CTkFont(size=12), command=self._add_user).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="Сменить пароль", width=140, height=30,
+                      font=ctk.CTkFont(size=12), command=self._change_pw).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="✕ Удалить", width=100, height=30, fg_color="#B33",
+                      font=ctk.CTkFont(size=12), command=self._del_user).pack(side="left", padx=3)
+
+        cols = ("login", "role", "hotel")
+        self.users_tree = ttk.Treeview(tab, columns=cols, show="headings", height=10)
+        for c, h, w in (("login", "Логин", 180), ("role", "Роль", 140),
+                        ("hotel", "Отель", 160)):
+            self.users_tree.heading(c, text=h)
+            self.users_tree.column(c, width=w, anchor="w")
+        self.users_tree.pack(padx=14, pady=(0, 10), fill="both", expand=True)
+        self._refresh_users()
+
+    def _refresh_users(self):
+        for i in self.users_tree.get_children():
+            self.users_tree.delete(i)
+        with HistoryDB() as db:
+            for u in db.list_users():
+                self.users_tree.insert("", "end", iid=str(u["id"]), values=(
+                    u["login"],
+                    "администратор" if u["role"] == "admin" else "пользователь",
+                    HOTEL_LABELS.get(u["hotel"], "—")))
+
+    def _sel_user(self):
+        sel = self.users_tree.selection()
+        return int(sel[0]) if sel else None
+
+    def _add_user(self):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Новый пользователь")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        pad = dict(padx=24, fill="x")
+
+        ctk.CTkLabel(dlg, text="Логин", font=ctk.CTkFont(size=12)).pack(
+            anchor="w", pady=(14, 0), **pad)
+        lv = tk.StringVar()
+        ctk.CTkEntry(dlg, textvariable=lv, height=30).pack(**pad)
+        ctk.CTkLabel(dlg, text="Пароль", font=ctk.CTkFont(size=12)).pack(
+            anchor="w", pady=(8, 0), **pad)
+        pv = tk.StringVar()
+        ctk.CTkEntry(dlg, textvariable=pv, height=30, show="*").pack(**pad)
+        ctk.CTkLabel(dlg, text="Роль", font=ctk.CTkFont(size=12)).pack(
+            anchor="w", pady=(8, 0), **pad)
+        rv = tk.StringVar(value="пользователь отеля")
+        ctk.CTkOptionMenu(dlg, variable=rv, height=30,
+                          values=["пользователь отеля", "администратор"]).pack(**pad)
+        ctk.CTkLabel(dlg, text="Отель", font=ctk.CTkFont(size=12)).pack(
+            anchor="w", pady=(8, 0), **pad)
+        hv = tk.StringVar(value=HOTEL_LABELS['tch'])
+        ctk.CTkOptionMenu(dlg, variable=hv, height=30,
+                          values=list(HOTEL_LABELS.values())).pack(**pad)
+
+        def ok():
+            role = 'admin' if rv.get() == 'администратор' else 'hotel'
+            hotel = None if role == 'admin' else \
+                [k for k, v in HOTEL_LABELS.items() if v == hv.get()][0]
+            with HistoryDB() as db:
+                if not db.add_user(lv.get().strip(), pv.get(), role, hotel):
+                    messagebox.showerror("Пользователи",
+                                         "Логин занят или поля пустые.", parent=dlg)
+                    return
+            self._refresh_users()
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="Создать", fg_color="green", height=32,
+                      command=ok).pack(pady=14, **pad)
+        dlg.grab_set()
+        autosize(dlg, 350)
+        dlg.lift()
+        dlg.focus_force()
+
+    def _change_pw(self):
+        uid = self._sel_user()
+        if uid is None:
+            messagebox.showinfo("Пользователи", "Выберите пользователя в списке.",
+                                parent=self)
+            return
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Новый пароль")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        pv = tk.StringVar()
+        ctk.CTkEntry(dlg, textvariable=pv, height=30, show="*",
+                     placeholder_text="Новый пароль").pack(padx=24, pady=(16, 6), fill="x")
+
+        def ok():
+            if not pv.get():
+                return
+            with HistoryDB() as db:
+                db.set_password(uid, pv.get())
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="Сохранить", fg_color="green", height=30,
+                      command=ok).pack(padx=24, fill="x", pady=(0, 14))
+        dlg.grab_set()
+        autosize(dlg, 300)
+        dlg.lift()
+        dlg.focus_force()
+
+    def _del_user(self):
+        uid = self._sel_user()
+        if uid is None:
+            messagebox.showinfo("Пользователи", "Выберите пользователя в списке.",
+                                parent=self)
+            return
+        login = self.users_tree.item(str(uid))['values'][0]
+        if not messagebox.askyesno("Удалить пользователя", f"Удалить «{login}»?",
+                                   parent=self):
+            return
+        with HistoryDB() as db:
+            if not db.del_user(uid):
+                messagebox.showerror("Пользователи",
+                                     "Нельзя удалить последнего администратора.",
+                                     parent=self)
+                return
+        self._refresh_users()
+
+    # ------------------------------------------------------------
     def ok(self):
         tax = {}
         for hid, _hname in self.HOTELS:
@@ -730,6 +867,17 @@ class SettingsDialog(ctk.CTkToplevel):
 # ================================================================
 # ДИАЛОГ НЕРАСПОЗНАННЫХ ИСТОЧНИКОВ
 # ================================================================
+HOTEL_LABELS = {'tch': 'Чайковский', 'dna': 'Дона', 'usd': 'Усадьба'}
+
+
+def autosize(win, width, min_h=120):
+    """Высота окна по содержимому (не больше экрана), ширина фиксированная."""
+    win.update_idletasks()
+    h = max(min_h, win.winfo_reqheight() + 4)
+    h = min(h, win.winfo_screenheight() - 60)
+    win.geometry(f"{width}x{h}")
+
+
 NEW_AGENT = "➕ Новый агент…"
 
 
@@ -741,6 +889,7 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.title("Нераспознанные источники")
         self.geometry("720x540")
+        self.resizable(False, True)
         self.transient(master)
         self.result = None
 
@@ -828,7 +977,6 @@ class LoginDialog(ctk.CTkToplevel):
     def __init__(self, master, db):
         super().__init__(master)
         self.title("Вход")
-        self.geometry("330x240")
         self.resizable(False, False)
         self.transient(master)
         self.db = db
@@ -854,6 +1002,7 @@ class LoginDialog(ctk.CTkToplevel):
                                      "смените пароль в «Пользователи»",
                          text_color="gray", font=ctk.CTkFont(size=9)).pack(pady=(4, 0))
         self.bind('<Return>', lambda e: self.ok())
+        autosize(self, 340)
         self.lift()
         self.focus_force()
         self.attributes("-topmost", True)
@@ -878,7 +1027,10 @@ class App(ctk.CTk):
         self.allowed_hotels = ({'tch', 'dna', 'usd'} if self.is_admin
                                else {user['hotel']})
         self.title("Турналог — обработка данных гостиниц")
-        self.geometry("960x620")
+        w, h = 960, 620
+        x = max(0, (self.winfo_screenwidth() - w) // 2)
+        y = max(0, (self.winfo_screenheight() - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(820, 540)
         self.cfg = load_config()
 
@@ -906,8 +1058,6 @@ class App(ctk.CTk):
         if 'usd' in self.allowed_hotels:
             self._build_usadba_page()
         self._build_history_page()
-        if self.is_admin:
-            self._build_users_page()
 
         # статус-бар
         self.status_var = tk.StringVar(value="Готово к работе")
@@ -915,7 +1065,7 @@ class App(ctk.CTk):
                      text_color="gray", height=22).grid(
             row=1, column=0, columnspan=2, sticky="ew", padx=14)
 
-        first = next(p for p in ('tch', 'dna', 'usd', 'hist', 'users')
+        first = next(p for p in ('tch', 'dna', 'usd', 'hist')
                      if p in self.pages)
         self.show_page(first)
 
@@ -935,8 +1085,6 @@ class App(ctk.CTk):
                                      ('usd', 'Усадьба'))
                  if p in self.allowed_hotels]
         items += [('hist', 'История')]
-        if self.is_admin:
-            items += [('users', 'Пользователи')]
         for pid, label in items:
             b = ctk.CTkButton(sb, text=label, anchor="w", fg_color="transparent",
                               text_color=("gray10", "gray90"),
@@ -1325,206 +1473,6 @@ class App(ctk.CTk):
                 db.delete_report(rid)
             self.refresh_history()
             self.show_history_dups()
-
-    # ================================================================
-    # СТРАНИЦА: ПОЛЬЗОВАТЕЛИ (только админ)
-    # ================================================================
-    HOTEL_LABELS = {'tch': 'Чайковский', 'dna': 'Дона', 'usd': 'Усадьба'}
-
-    def _build_users_page(self):
-        pg = ctk.CTkFrame(self.main, fg_color="transparent")
-        self.pages['users'] = pg
-
-        ctk.CTkLabel(pg, text="Пользователи и права доступа",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(
-            pady=(2, 0), anchor="w", padx=8)
-        ctk.CTkLabel(pg, text="Администратор видит все отели и настройки; "
-                              "пользователь отеля — только свой отель и его историю.",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack(
-            anchor="w", padx=8, pady=(0, 4))
-
-        bar = ctk.CTkFrame(pg, fg_color="transparent")
-        bar.pack(padx=10, fill="x")
-        ctk.CTkButton(bar, text="➕ Добавить", width=110, fg_color="green",
-                      command=self.add_user_dialog).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="Сменить пароль", width=130,
-                      command=self.change_password_dialog).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="✕ Удалить", width=100, fg_color="#B33",
-                      command=self.delete_user).pack(side="left", padx=3)
-
-        cols = ("login", "role", "hotel")
-        self.users_tree = ttk.Treeview(pg, columns=cols, show="headings", height=14)
-        for c, h, w in (("login", "Логин", 200), ("role", "Роль", 150),
-                        ("hotel", "Отель", 200)):
-            self.users_tree.heading(c, text=h)
-            self.users_tree.column(c, width=w, anchor="w")
-        self.users_tree.pack(padx=10, pady=8, fill="both", expand=True)
-        self.refresh_users()
-
-    def refresh_users(self):
-        for i in self.users_tree.get_children():
-            self.users_tree.delete(i)
-        with HistoryDB() as db:
-            for u in db.list_users():
-                self.users_tree.insert("", "end", iid=str(u["id"]), values=(
-                    u["login"],
-                    "администратор" if u["role"] == "admin" else "пользователь",
-                    self.HOTEL_LABELS.get(u["hotel"], "—")))
-
-    def _selected_user_id(self):
-        sel = self.users_tree.selection()
-        return int(sel[0]) if sel else None
-
-    def add_user_dialog(self):
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Новый пользователь")
-        dlg.geometry("330x290")
-        dlg.transient(self)
-        dlg.grab_set()
-
-        ctk.CTkLabel(dlg, text="Логин").pack(padx=50, anchor="w", pady=(14, 0))
-        lv = tk.StringVar()
-        ctk.CTkEntry(dlg, textvariable=lv, height=30).pack(padx=50, fill="x")
-        ctk.CTkLabel(dlg, text="Пароль").pack(padx=50, anchor="w", pady=(8, 0))
-        pv = tk.StringVar()
-        ctk.CTkEntry(dlg, textvariable=pv, height=30, show="*").pack(padx=50, fill="x")
-        ctk.CTkLabel(dlg, text="Роль").pack(padx=50, anchor="w", pady=(8, 0))
-        rv = tk.StringVar(value="пользователь отеля")
-        ctk.CTkOptionMenu(dlg, variable=rv, height=30,
-                          values=["пользователь отеля", "администратор"]).pack(padx=50, fill="x")
-        ctk.CTkLabel(dlg, text="Отель").pack(padx=50, anchor="w", pady=(8, 0))
-        hv = tk.StringVar(value="Чайковский")
-        ctk.CTkOptionMenu(dlg, variable=hv, height=30,
-                          values=list(self.HOTEL_LABELS.values())).pack(padx=50, fill="x")
-
-        def ok():
-            role = 'admin' if rv.get() == 'администратор' else 'hotel'
-            hotel = None if role == 'admin' else \
-                [k for k, v in self.HOTEL_LABELS.items() if v == hv.get()][0]
-            with HistoryDB() as db:
-                if not db.add_user(lv.get().strip(), pv.get(), role, hotel):
-                    messagebox.showerror("Пользователи",
-                                         "Логин занят или поля пустые.", parent=dlg)
-                    return
-            self.refresh_users()
-            dlg.destroy()
-
-        ctk.CTkButton(dlg, text="Создать", fg_color="green", height=32,
-                      command=ok).pack(pady=12, padx=50, fill="x")
-        dlg.lift()
-        dlg.focus_force()
-
-    def change_password_dialog(self):
-        uid = self._selected_user_id()
-        if uid is None:
-            messagebox.showinfo("Пользователи", "Выберите пользователя в списке.")
-            return
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Новый пароль")
-        dlg.geometry("300x140")
-        dlg.transient(self)
-        dlg.grab_set()
-        pv = tk.StringVar()
-        ctk.CTkEntry(dlg, textvariable=pv, height=30, show="*",
-                     placeholder_text="Новый пароль").pack(padx=50, pady=(20, 6), fill="x")
-
-        def ok():
-            if not pv.get():
-                return
-            with HistoryDB() as db:
-                db.set_password(uid, pv.get())
-            dlg.destroy()
-
-        ctk.CTkButton(dlg, text="Сохранить", fg_color="green", height=30,
-                      command=ok).pack(padx=50, fill="x")
-        dlg.lift()
-        dlg.focus_force()
-
-    def delete_user(self):
-        uid = self._selected_user_id()
-        if uid is None:
-            messagebox.showinfo("Пользователи", "Выберите пользователя в списке.")
-            return
-        login = self.users_tree.item(str(uid))['values'][0]
-        if not messagebox.askyesno("Удалить пользователя", f"Удалить «{login}»?"):
-            return
-        with HistoryDB() as db:
-            if not db.del_user(uid):
-                messagebox.showerror("Пользователи",
-                                     "Нельзя удалить последнего администратора.")
-                return
-        self.refresh_users()
-
-    # ================================================================
-    # ОБЩИЙ ЗАПУСК В ФОНЕ
-    # ================================================================
-    def _run_async(self, btn, work, on_done):
-        btn.configure(state="disabled")
-        self.set_status("Обработка…")
-
-        def runner():
-            try:
-                result = work()
-                err = None
-            except Exception as e:
-                log.exception("background work")
-                result, err = None, e
-            self.after(0, lambda: self._finish_async(btn, result, err, on_done))
-
-        threading.Thread(target=runner, daemon=True).start()
-
-    def _finish_async(self, btn, result, err, on_done):
-        btn.configure(state="normal")
-        if err:
-            self.set_status("Ошибка обработки")
-            messagebox.showerror("Ошибка", f"В процессе обработки произошла ошибка:\n{err}")
-            return
-        on_done(result)
-
-    def _ask_quarter(self, hotel):
-        dlg = QuarterDialog(self, hotel)
-        self.wait_window(dlg)
-        return dlg.result
-
-    def _start_history(self, hotel, quarter):
-        db = HistoryDB()
-        old = db.find_same(hotel, quarter)
-        if old:
-            replace = messagebox.askyesno(
-                "Отчёт уже есть в истории",
-                f"За квартал {quarter} уже обработан отчёт от {old['processed_at'][:10]}\n"
-                f"(файл: {old['original_name']}).\n\n"
-                f"Заменить его? «Да» — старый удалится, дубли не помечаются.\n"
-                f"«Нет» — старый останется, совпавшие брони будут помечены.")
-            if replace:
-                db.delete_report(old['id'])
-        return db, (lambda rows: db.check_duplicates(hotel, rows))
-
-    def _finish_history(self, db, hotel, quarter, input_paths, output_path,
-                        bookings):
-        orig_name, orig_blob = pack_originals(input_paths)
-        with open(output_path, 'rb') as f:
-            out_blob = f.read()
-        dups = sum(1 for b in bookings if b.get('dup_note'))
-        rid = db.add_report(hotel, quarter, orig_name, orig_blob,
-                            os.path.basename(output_path), out_blob,
-                            len(bookings), dups, "")
-        db.add_bookings(rid, bookings)
-        db.close()
-        self.refresh_history()
-        return dups
-
-    def _show_summary(self, summary, output_path):
-        total = sum(summary.values())
-        if total > 0:
-            msg = f"Файл сохранён, замечаний: {total}.\n\n"
-            for err_name, count in summary.items():
-                if count > 0:
-                    msg += f"• {err_name}: {count}\n"
-            msg += "\nПроблемные ячейки подсвечены цветом. Итоги добавлены в конец таблицы."
-            messagebox.showwarning("Готово (есть замечания)", msg)
-        else:
-            messagebox.showinfo("Успех", f"Файл успешно сохранён без замечаний!\n{output_path}")
 
     # ================================================================
     # ЗАПУСК: ЧАЙКОВСКИЙ
