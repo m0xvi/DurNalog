@@ -147,8 +147,10 @@ def test_tchaikovsky_end_to_end(tmp_path):
     assert summary["Отсутствует Стоимость (ГОЛУБОЙ)"] == 0  # "5 000,00" распознано
     ws = openpyxl.load_workbook(out)["1&2"]
     assert ws["D2"].value == 5000.0
-    assert ws["H2"].value == '=IF(G2>=5100,"ставка","мин.ставка")'
-    assert ws["O1"].value == "Примечание"
+    assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
+    assert ws["K2"].value == '=IF(J2>=5100,"ставка","мин.ставка")'
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+    assert ws["R1"].value == "Примечание"
     assert bookings[0]["price"] == 5000.0
 
 
@@ -292,7 +294,11 @@ def test_floating_rates_by_date():
 def test_agents_hotel_filter():
     from agents import default_agents, match_agent
     agents = default_agents()
-    assert match_agent("Ostrovok.ru", agents, hotel='tch')[1] is None
+    # агент Усадьбы не распознаётся в Доне и наоборот
+    assert match_agent("Комфорт Букинг", agents, hotel='dna')[1] is None
+    assert match_agent("Комфорт Букинг", agents, hotel='usd')[1] is not None
+    # у Чайковского свой Островок
+    assert match_agent("Ostrovok.ru", agents, hotel='tch')[1] is not None
     assert match_agent("Ostrovok.ru", agents, hotel='dna')[1] == 'Островок'
 
 

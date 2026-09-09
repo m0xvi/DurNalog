@@ -6,6 +6,7 @@ import re
 import io
 import os
 import sys
+import copy
 import json
 import shutil
 import zipfile
@@ -24,7 +25,7 @@ from tax import (tax_formula_daily_rate, tax_formula_method, tax_formula_tax,
 from db import HistoryDB, set_db_path, default_db_path
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 NOT_SET = "— не указано —"
 
 # Тема фиксированно светлая (по требованию пользователя)
@@ -1582,6 +1583,69 @@ class App(ctk.CTk):
             self.show_history_dups()
 
     # ================================================================
+    # НЕРЕРАСПОЗНАННЫЕ ИСТОЧНИКИ (общее для всех отелей)
+    # ================================================================
+    def _resolve_unrecognized(self, hotel, agents, sources):
+        """Показывает диалог по нераспознанным источникам отеля.
+        Возвращает (agents, source_map); (None, None) — пользователь отменил."""
+        agents = copy.deepcopy(agents)
+        counts = {}
+        for s in sources:
+            s = (s or '').strip()
+            if s:
+                counts[s] = counts.get(s, 0) + 1
+        items = [(s, c) for s, c in counts.items()
+                 if match_agent(s, agents, hotel=hotel)[1] is None]
+        source_map = {}
+        if not items:
+            return agents, source_map
+        log.info("%s: нераспознанных источников: %d", hotel, len(items))
+        names = [a['name'] for a in agents]
+        try:
+            dlg = UnrecognizedSourcesDialog(self, items, names)
+            self.wait_window(dlg)
+        except Exception as e:
+            log.exception("диалог нераспознанных источников")
+            messagebox.showerror("Ошибка",
+                                 f"Не удалось показать диалог источников:\n{e}")
+            return agents, source_map
+        if dlg.result is None:
+            return None, None
+        changed = False
+        for s, res in dlg.result.items():
+            if res[0] == 'agent':
+                for a in agents:
+                    if a['name'] == res[1]:
+                        if s not in a['aliases']:
+                            a['aliases'].append(s)
+                        if hotel not in a['hotels']:
+                            a['hotels'].append(hotel)
+                        changed = True
+                        break
+            elif res[0] == 'new':
+                agents.append({'name': res[1], 'aliases': [s], 'hotels': [hotel],
+                               'rates': [{'from': '', 'to': '', 'pct': res[2]}]})
+                source_map[s] = (res[2], res[1])
+                changed = True
+        if changed:
+            self.cfg['agents'] = agents
+            save_config(self.cfg)
+        return agents, source_map
+
+    @staticmethod
+    def _usadba_sources(path):
+        """Колонка «Организация-заказчик» из отчёта UCS Shelter."""
+        wb = App._load_workbook_safe(path)
+        ws = wb[wb.sheetnames[0]]
+        out = []
+        for r in range(1, ws.max_row + 1):
+            state = ws.cell(row=r, column=5).value
+            org = ws.cell(row=r, column=16).value
+            if org and state and str(state).strip() in ('Проживал', 'Сейчас проживает'):
+                out.append(str(org))
+        return out
+
+    # ================================================================
     # ЗАПУСК: ЧАЙКОВСКИЙ
     # ================================================================
     def run_tchaikovsky(self):
@@ -1595,6 +1659,21 @@ class App(ctk.CTk):
             return
         if not self.ensure_mapping('tch', 'rooms'):
             return
+        md, mr = s['data']['mapping'], s['rooms']['mapping']
+        ed = s['data'].get('extra', [])
+
+        try:
+            df_pre = read_table(data_path)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Файл не читается:\n{e}")
+            return
+        src_col = md.get('source')
+        sources = list(df_pre[src_col].fillna('').astype(str))             if src_col and src_col in df_pre.columns else []
+        res = self._resolve_unrecognized('tch', migrate_agents(self.cfg), sources)
+        if res[0] is None:
+            return
+        agents, source_map = res
+
         output_path = filedialog.asksaveasfilename(
             parent=self, title="Сохранить итоговый файл как...",
             defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")])
@@ -1603,15 +1682,14 @@ class App(ctk.CTk):
         quarter = self._ask_quarter("Чайковский")
         if not quarter:
             return
-        md, mr = s['data']['mapping'], s['rooms']['mapping']
-        ed = s['data'].get('extra', [])
         tax = self.cfg.get('tax', {}).get('tch')
 
         def work():
             db, checker = self._start_history("Чайковский", quarter)
             summary, bookings = self.process_tchaikovsky(
                 data_path, rooms_path, output_path, md, mr,
-                extra_data=ed, dup_checker=checker, tax=tax)
+                extra_data=ed, dup_checker=checker, tax=tax,
+                agents=agents, source_map=source_map)
             dups = self._finish_history(db, "Чайковский", quarter,
                                         [data_path, rooms_path], output_path, bookings)
             return summary, output_path, len(bookings), dups
@@ -1636,50 +1714,17 @@ class App(ctk.CTk):
             return
         md, ed = s['data']['mapping'], s['data'].get('extra', [])
 
-        # --- пре-скан источников: вопрос о нераспознанных ---
         try:
             df_pre = read_table(data_path)
         except Exception as e:
             messagebox.showerror("Ошибка", f"Файл не читается:\n{e}")
             return
-        import copy as _copy
-        agents = _copy.deepcopy(migrate_agents(self.cfg))
-        source_map = {}
         src_col = md.get('source')
-        if src_col and src_col in df_pre.columns:
-            counts = df_pre[src_col].fillna('').astype(str).str.strip().value_counts()
-            items = [(src, int(cnt)) for src, cnt in counts.items()
-                     if src and match_agent(src, agents, hotel='dna')[1] is None]
-            log.info("Дона: нераспознанных источников: %d", len(items))
-            if items:
-                names = [a['name'] for a in agents]
-                try:
-                    dlg = UnrecognizedSourcesDialog(self, items, names)
-                    self.wait_window(dlg)
-                except Exception as e:
-                    log.exception("диалог нераспознанных источников")
-                    messagebox.showerror("Ошибка",
-                                         f"Не удалось показать диалог источников:\n{e}")
-                    return
-                if dlg.result is None:
-                    return  # пользователь отменил обработку
-                changed = False
-                for src, res in dlg.result.items():
-                    if res[0] == 'agent':
-                        for a in agents:
-                            if a['name'] == res[1] and src not in a['aliases']:
-                                a['aliases'].append(src)
-                                changed = True
-                                break
-                    elif res[0] == 'new':
-                        agents.append({'name': res[1], 'aliases': [src],
-                                       'hotels': ['dna'],
-                                       'rates': [{'from': '', 'to': '', 'pct': res[2]}]})
-                        source_map[src] = (res[2], res[1])
-                        changed = True
-                if changed:
-                    self.cfg['agents'] = agents
-                    save_config(self.cfg)
+        sources = list(df_pre[src_col].fillna('').astype(str))             if src_col and src_col in df_pre.columns else []
+        res = self._resolve_unrecognized('dna', migrate_agents(self.cfg), sources)
+        if res[0] is None:
+            return
+        agents, source_map = res
 
         output_path = filedialog.asksaveasfilename(
             parent=self, title="Сохранить итоговый файл как...",
@@ -1715,6 +1760,16 @@ class App(ctk.CTk):
         if not report_path:
             messagebox.showerror("Ошибка", "Выберите файл отчёта «Доход по номеру»!")
             return
+        try:
+            sources = self._usadba_sources(report_path)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Файл не читается:\n{e}")
+            return
+        res = self._resolve_unrecognized('usd', migrate_agents(self.cfg), sources)
+        if res[0] is None:
+            return
+        agents, source_map = res
+
         output_path = filedialog.asksaveasfilename(
             parent=self, title="Сохранить итоговый файл как...",
             defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")])
@@ -1723,13 +1778,13 @@ class App(ctk.CTk):
         quarter = self._ask_quarter("Усадьба")
         if not quarter:
             return
-
         tax = self.cfg.get('tax', {}).get('usd')
 
         def work():
             db, checker = self._start_history("Усадьба", quarter)
             stats, bookings = self.process_usadba(report_path, output_path,
-                                                  dup_checker=checker, tax=tax)
+                                                  dup_checker=checker, tax=tax,
+                                                  agents=agents, source_map=source_map)
             dups = self._finish_history(db, "Усадьба", quarter, [report_path],
                                         output_path, bookings)
             return stats, output_path, dups
@@ -1747,6 +1802,8 @@ class App(ctk.CTk):
                 warnings_list.append(f"• Записей с нераспознанными датами: {stats['bad_dates']} (оранжевый)")
             if stats['still_living'] > 0:
                 warnings_list.append(f"• Гостей «Сейчас проживает»: {stats['still_living']}")
+            if stats.get('unknown_source', 0) > 0:
+                warnings_list.append(f"• Нераспознанный источник (жёлтый): {stats['unknown_source']}")
             if dups > 0:
                 warnings_list.append(f"• Переход кварталов (фиолетовые): {dups}")
             if warnings_list:
@@ -1762,7 +1819,8 @@ class App(ctk.CTk):
     # ================================================================
     def process_tchaikovsky(self, data_path, rooms_path, output_path,
                             map_data=None, map_rooms=None,
-                            extra_data=None, dup_checker=None, tax=None):
+                            extra_data=None, dup_checker=None, tax=None,
+                            agents=None, source_map=None):
         """Возвращает (errors_summary, bookings)."""
         tp = TaxParams(tax)
         log.info("Чайковский: %s / %s", data_path, rooms_path)
@@ -1826,7 +1884,7 @@ class App(ctk.CTk):
                 nights = max(1, (checkout.date() - checkin.date()).days)
 
             category = get(row, 'category')
-            category = '' if pd.isna(category) or category is None else str(category).strip()
+            category = '' if category is None or pd.isna(category) else str(category).strip()
             num_rooms = max(1, len([x for x in category.split('\n') if x.strip()])) if category else 1
 
             price = parse_price(get(row, 'price'))
@@ -1837,10 +1895,20 @@ class App(ctk.CTk):
             source_v = get(row, 'source')
             source = '' if source_v is None or pd.isna(source_v) else str(source_v).strip()
 
+            sm = (source_map or {}).get(source)
+            if sm:
+                commission, agent = float(sm[0]), sm[1]
+            else:
+                commission, agent = match_agent(
+                    source, agents or default_agents(),
+                    date=checkin.date() if checkin else None, hotel='tch')
+
             extra_vals = [row[c] if not pd.isna(row[c]) else '' for c in extra_data]
 
             records.append({
                 'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
+                'commission': commission, 'agent': agent,
+                'unknown_source': (not agent) and bool(source),
                 'checkin': checkin, 'nights': nights, 'checkout': checkout,
                 'source': source, 'category': category, 'room': find_room(guest),
                 'extra_vals': extra_vals, 'dup_note': None,
@@ -1862,17 +1930,20 @@ class App(ctk.CTk):
             "Не указан Гость (ЖЕЛТЫЙ)": 0,
             "Отсутствуют Даты (ОРАНЖЕВЫЙ)": 0,
             "Отсутствует Стоимость (ГОЛУБОЙ)": 0,
+            "Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)": 0,
             "Переход кварталов (ФИОЛЕТОВЫЙ)": 0,
         }
 
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
 
-        headers = ['№ брони', 'Номеров', 'Гость', 'Стоимость', 'Заезд', 'Ночей',
-                   'Сут.ставка', 'Метод', 'Налог', 'Выезд', 'Источник',
-                   'Категория номера', '№ комнаты', 'корпус', 'Примечание'] + extra_data
+        headers = ['№ брони', 'Номеров', 'Гость', 'Стоимость', 'Комиссия %', 'Агент',
+                   'Стоимость без комиссии', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
+                   'Налог', 'Выезд', 'Источник', 'Категория номера', '№ комнаты',
+                   'корпус', 'Примечание'] + extra_data
         n_cols = len(headers)
         font_bold = Font(bold=True)
+        base = 'G' if tp.use_full else 'D'
 
         def write_sheet(name, recs, count_errors=False):
             ws = wb.create_sheet(name)
@@ -1896,45 +1967,58 @@ class App(ctk.CTk):
                     c_price.fill = FILL_PRICE
                     if count_errors: errors_summary["Отсутствует Стоимость (ГОЛУБОЙ)"] += 1
 
-                c_in = ws.cell(row=r, column=5, value=rec['checkin'])
+                c_comm = ws.cell(row=r, column=5, value=rec['commission'])
+                c_comm.number_format = '0.##'
+                c_agent = ws.cell(row=r, column=6, value=rec['agent'] or '')
+                if rec['unknown_source']:
+                    c_comm.fill = FILL_GUEST
+                    c_agent.fill = FILL_GUEST
+                    if count_errors:
+                        errors_summary["Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)"] += 1
+
+                c_full = ws.cell(row=r, column=7,
+                                 value=f'=ROUND(D{r}/(100-E{r})*100,2)')
+                c_full.number_format = '#,##0.00'
+
+                c_in = ws.cell(row=r, column=8, value=rec['checkin'])
                 if rec['checkin']:
                     c_in.number_format = DATE_FMT
                 else:
                     c_in.fill = FILL_DATE
                     if count_errors: errors_summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-                ws.cell(row=r, column=6, value=rec['nights'])
-                c_rate = ws.cell(row=r, column=7, value=tp.f_daily('D', 'F', r))
+                ws.cell(row=r, column=9, value=rec['nights'])
+                c_rate = ws.cell(row=r, column=10, value=tp.f_daily(base, 'I', r))
                 c_rate.number_format = '#,##0.00'
-                ws.cell(row=r, column=8, value=tp.f_method('G', r))
-                c_tax = ws.cell(row=r, column=9, value=tp.f_tax('H', 'F', 'D', r))
+                ws.cell(row=r, column=11, value=tp.f_method('J', r))
+                c_tax = ws.cell(row=r, column=12, value=tp.f_tax('K', 'I', base, r))
                 c_tax.number_format = '#,##0.00'
 
-                c_out = ws.cell(row=r, column=10, value=rec['checkout'])
+                c_out = ws.cell(row=r, column=13, value=rec['checkout'])
                 if rec['checkout']:
                     c_out.number_format = DATE_FMT
                 else:
                     c_out.fill = FILL_DATE
                     if count_errors: errors_summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-                ws.cell(row=r, column=11, value=rec['source'])
-                cat = ws.cell(row=r, column=12, value=rec['category'])
+                ws.cell(row=r, column=14, value=rec['source'])
+                cat = ws.cell(row=r, column=15, value=rec['category'])
                 cat.alignment = Alignment(wrap_text=True, vertical='top')
 
-                c_room = ws.cell(row=r, column=13, value=rec['room'])
+                c_room = ws.cell(row=r, column=16, value=rec['room'])
                 if rec['room'] is None:
                     c_room.fill = FILL_ROOM
                     if count_errors: errors_summary["Отсутствует № комнаты (КРАСНЫЙ)"] += 1
                 else:
-                    ws.cell(row=r, column=14, value=f'=IF(M{r}<50,1,2)')
+                    ws.cell(row=r, column=17, value=f'=IF(P{r}<50,1,2)')
 
-                c_note = ws.cell(row=r, column=15, value=rec['dup_note'] or '')
+                c_note = ws.cell(row=r, column=18, value=rec['dup_note'] or '')
                 if rec['dup_note']:
                     c_note.fill = FILL_DUP
                     if count_errors: errors_summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] += 1
 
                 for k, v in enumerate(rec['extra_vals']):
-                    ws.cell(row=r, column=16 + k, value=v)
+                    ws.cell(row=r, column=19 + k, value=v)
 
             if recs:
                 last = len(recs) + 1
@@ -1942,15 +2026,17 @@ class App(ctk.CTk):
                 ws.cell(row=tr, column=3, value="ИТОГО:")
                 ws.cell(row=tr, column=2, value=f'=SUM(B2:B{last})')
                 ws.cell(row=tr, column=4, value=f'=SUM(D2:D{last})')
-                ws.cell(row=tr, column=6, value=f'=SUM(F2:F{last})')
+                ws.cell(row=tr, column=7, value=f'=SUM(G2:G{last})')
                 ws.cell(row=tr, column=9, value=f'=SUM(I2:I{last})')
+                ws.cell(row=tr, column=12, value=f'=SUM(L2:L{last})')
                 for c in range(1, n_cols + 1):
                     cell = ws.cell(row=tr, column=c)
                     cell.font = font_bold
                     cell.fill = FILL_TOTALS
 
-            widths = {'A': 24, 'B': 9, 'C': 35, 'D': 12, 'E': 17, 'F': 8, 'G': 11,
-                      'H': 12, 'I': 11, 'J': 17, 'K': 25, 'L': 35, 'M': 10, 'N': 8, 'O': 45}
+            widths = {'A': 24, 'B': 9, 'C': 35, 'D': 12, 'E': 10, 'F': 32, 'G': 20,
+                      'H': 17, 'I': 8, 'J': 11, 'K': 12, 'L': 11, 'M': 17, 'N': 25,
+                      'O': 30, 'P': 10, 'Q': 8, 'R': 45}
             for col, w in widths.items():
                 ws.column_dimensions[col].width = w
             return ws
@@ -1973,8 +2059,10 @@ class App(ctk.CTk):
             'guest': r['guest'], 'guest_norm': norm_name(r['guest']), 'bron': r['bron'],
             'checkin': r['checkin'].date().isoformat() if r['checkin'] else None,
             'checkout': r['checkout'].date().isoformat() if r['checkout'] else None,
-            'price': r['price'], 'price_full': None, 'nights': r['nights'],
-            'dup_note': r['dup_note'],
+            'price': r['price'],
+            'price_full': round(r['price'] / (100 - r['commission']) * 100, 2)
+                          if r['price'] is not None else None,
+            'nights': r['nights'], 'dup_note': r['dup_note'],
         } for r in records]
         return errors_summary, bookings
 
@@ -2206,7 +2294,8 @@ class App(ctk.CTk):
             buf.seek(0)
             return openpyxl.load_workbook(buf, data_only=True)
 
-    def process_usadba(self, report_path, output_path, dup_checker=None, tax=None):
+    def process_usadba(self, report_path, output_path, dup_checker=None,
+                       tax=None, agents=None, source_map=None):
         """Возвращает (stats, bookings)."""
         tp = TaxParams(tax)
         log.info("Усадьба: %s", report_path)
@@ -2231,7 +2320,8 @@ class App(ctk.CTk):
         records = []
         rooms = set()
         current_room = None
-        stats = {'rows': 0, 'rooms': 0, 'zero_price': 0, 'bad_dates': 0, 'still_living': 0}
+        stats = {'rows': 0, 'rooms': 0, 'zero_price': 0, 'bad_dates': 0,
+                 'still_living': 0, 'unknown_source': 0}
 
         for r in range(1, ws_in.max_row + 1):
             a_val = ws_in.cell(row=r, column=1).value
@@ -2250,6 +2340,7 @@ class App(ctk.CTk):
             price = parse_price(ws_in.cell(row=r, column=9).value)
             tariff = ws_in.cell(row=r, column=14).value
             org = ws_in.cell(row=r, column=16).value
+            org_s = '' if org is None else str(org).strip()
 
             dt_in = parse_dt(checkin_raw)
             dt_out = parse_dt(checkout_raw)
@@ -2265,14 +2356,26 @@ class App(ctk.CTk):
             if not price:
                 stats['zero_price'] += 1
 
+            sm = (source_map or {}).get(org_s)
+            if sm:
+                commission, agent = float(sm[0]), sm[1]
+            else:
+                commission, agent = match_agent(
+                    org_s, agents or default_agents(),
+                    date=dt_in.date() if dt_in else None, hotel='usd')
+            if not agent and org_s:
+                stats['unknown_source'] += 1
+
             records.append({
                 'fio': str(fio).strip(),
                 'checkin': dt_in if dt_in else (str(checkin_raw or '').strip()),
                 'checkout': dt_out if dt_out else (str(checkout_raw or '').strip()),
                 'nights': nights,
                 'price': price if price is not None else 0,
+                'commission': commission, 'agent': agent,
+                'unknown_source': (not agent) and bool(org_s),
                 'tariff': str(tariff).strip() if tariff else '',
-                'org': str(org).strip() if org else '',
+                'org': org_s,
                 'room': current_room,
                 'dup_note': None,
             })
@@ -2299,13 +2402,16 @@ class App(ctk.CTk):
         ws_out.title = 'Page 1'
 
         headers = ['Фамилия Имя Отчество', 'Заселение', 'ночей', 'Выселение ',
-                   'Стоимость', 'Сут.ставка', 'Метод', 'Налог', 'Тариф',
+                   'Стоимость', 'Комиссия %', 'Агент', 'Стоимость без комиссии',
+                   'Сут.ставка', 'Метод', 'Налог', 'Тариф',
                    'Организация\nзаказчик', 'Примечание']
         font_bold = Font(bold=True)
         for c, h in enumerate(headers, start=1):
             cell = ws_out.cell(row=1, column=c, value=h)
             cell.font = font_bold
             cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        base = 'H' if tp.use_full else 'E'
 
         for i, rec in enumerate(records):
             row = i + 2
@@ -2325,19 +2431,30 @@ class App(ctk.CTk):
             ws_out.cell(row=row, column=3, value=rec['nights'])
 
             c_price = ws_out.cell(row=row, column=5, value=rec['price'])
-            c_price.number_format = '#,##0.00\\ "₽"'
+            c_price.number_format = r'#,##0.00\ "₽"'
             if not rec['price']:
                 c_price.fill = FILL_PRICE
 
-            c_rate = ws_out.cell(row=row, column=6, value=tp.f_daily('E', 'C', row))
-            c_rate.number_format = '#,##0.00'
-            ws_out.cell(row=row, column=7, value=tp.f_method('F', row))
-            c_tax = ws_out.cell(row=row, column=8, value=tp.f_tax('G', 'C', 'E', row))
-            c_tax.number_format = '#,##0.00'
-            ws_out.cell(row=row, column=9, value=rec['tariff'])
-            ws_out.cell(row=row, column=10, value=rec['org'])
+            c_comm = ws_out.cell(row=row, column=6, value=rec['commission'])
+            c_comm.number_format = '0.##'
+            c_agent = ws_out.cell(row=row, column=7, value=rec['agent'] or '')
+            if rec['unknown_source']:
+                c_comm.fill = FILL_GUEST
+                c_agent.fill = FILL_GUEST
 
-            c_note = ws_out.cell(row=row, column=11, value=rec['dup_note'] or '')
+            c_full = ws_out.cell(row=row, column=8,
+                                 value=f'=ROUND(E{row}/(100-F{row})*100,2)')
+            c_full.number_format = '#,##0.00'
+
+            c_rate = ws_out.cell(row=row, column=9, value=tp.f_daily(base, 'C', row))
+            c_rate.number_format = '#,##0.00'
+            ws_out.cell(row=row, column=10, value=tp.f_method('I', row))
+            c_tax = ws_out.cell(row=row, column=11, value=tp.f_tax('J', 'C', base, row))
+            c_tax.number_format = '#,##0.00'
+            ws_out.cell(row=row, column=12, value=rec['tariff'])
+            ws_out.cell(row=row, column=13, value=rec['org'])
+
+            c_note = ws_out.cell(row=row, column=14, value=rec['dup_note'] or '')
             if rec['dup_note']:
                 c_note.fill = FILL_DUP
 
@@ -2345,15 +2462,16 @@ class App(ctk.CTk):
         total_row = last_row + 1
 
         ws_out.cell(row=total_row, column=1, value="ИТОГО:")
-        ws_out.cell(row=total_row, column=5, value=f'=SUM(E2:E{last_row})').number_format = '#,##0.00\\ "₽"'
+        ws_out.cell(row=total_row, column=5, value=f'=SUM(E2:E{last_row})').number_format = r'#,##0.00\ "₽"'
         ws_out.cell(row=total_row, column=8, value=f'=SUM(H2:H{last_row})')
-        for c in range(1, 12):
+        ws_out.cell(row=total_row, column=11, value=f'=SUM(K2:K{last_row})')
+        for c in range(1, 15):
             cell = ws_out.cell(row=total_row, column=c)
             cell.font = font_bold
             cell.fill = FILL_TOTALS
 
-        widths = {'A': 38, 'B': 18, 'C': 8, 'D': 18, 'E': 14, 'F': 12,
-                  'G': 12, 'H': 12, 'I': 10, 'J': 40, 'K': 45}
+        widths = {'A': 38, 'B': 18, 'C': 8, 'D': 18, 'E': 14, 'F': 10, 'G': 30,
+                  'H': 18, 'I': 12, 'J': 12, 'K': 12, 'L': 10, 'M': 40, 'N': 45}
         for col, w in widths.items():
             ws_out.column_dimensions[col].width = w
 
@@ -2381,10 +2499,13 @@ class App(ctk.CTk):
             'guest': rec['fio'], 'guest_norm': norm_name(rec['fio']), 'bron': '',
             'checkin': rec['checkin'].date().isoformat() if isinstance(rec['checkin'], datetime) else None,
             'checkout': rec['checkout'].date().isoformat() if isinstance(rec['checkout'], datetime) else None,
-            'price': rec['price'], 'price_full': None, 'nights': rec['nights'],
-            'dup_note': rec['dup_note'],
+            'price': rec['price'],
+            'price_full': round(rec['price'] / (100 - rec['commission']) * 100, 2)
+                          if rec['price'] else None,
+            'nights': rec['nights'], 'dup_note': rec['dup_note'],
         } for rec in records]
         return stats, bookings
+
 
 
 if __name__ == "__main__":
