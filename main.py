@@ -23,9 +23,10 @@ from agents import (match_dona_agent, match_agent, DONA_AGENTS, migrate_agents,
 from tax import (tax_formula_daily_rate, tax_formula_method, tax_formula_tax,
                  parse_price, TaxParams, DEFAULT_TAX)
 from db import HistoryDB, set_db_path, default_db_path
+import ui_theme as ui
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 
-APP_VERSION = "2.6"
+APP_VERSION = "3.0"
 NOT_SET = "— не указано —"
 
 # Тема фиксированно светлая (по требованию пользователя)
@@ -313,107 +314,202 @@ class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, master, cfg):
         super().__init__(master)
         self.title("Настройки")
-        self.geometry("780x640")
-        self.resizable(False, True)
+        self.geometry("980x700")
+        self.minsize(880, 580)
         self.transient(master)
         self.result = None
         self.cfg = cfg
         self.vars = {}
+        self.configure(fg_color=ui.COLORS['bg'])
 
-        ctk.CTkLabel(self, text="Настройки расчёта",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 2))
-        ctk.CTkLabel(self, text="Параметры и формулы налога — отдельно по каждому отелю.\n"
-                                "Применяются к новым обработкам.",
-                     text_color="gray").pack(padx=20)
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(14, 4))
+        ctk.CTkLabel(head, text="Настройки", font=ui.F_PAGE,
+                     text_color=ui.COLORS['text']).pack(side="left")
+        ctk.CTkLabel(head, text="применяются к новым обработкам",
+                     text_color=ui.COLORS['muted'],
+                     font=ui.F_SMALL).pack(side="left", padx=(12, 0), pady=(10, 0))
 
-        tv = ctk.CTkTabview(self)
-        tv.pack(fill="both", expand=True, padx=15, pady=10)
+        foot = ctk.CTkFrame(self, fg_color=ui.COLORS['card'], corner_radius=0,
+                            border_width=1, border_color=ui.COLORS['line'])
+        foot.pack(fill="x", side="bottom")
+        ctk.CTkButton(foot, text="Сохранить", width=150, height=38,
+                      fg_color=ui.COLORS['green'],
+                      hover_color=ui.COLORS['green_hover'],
+                      font=ui.F_UI, command=self.ok).pack(side="left", padx=14, pady=10)
+        ctk.CTkButton(foot, text="Отмена", width=120, height=38,
+                      fg_color="transparent", border_width=1,
+                      border_color=ui.COLORS['line'], text_color=ui.COLORS['muted'],
+                      hover_color=ui.COLORS['line2'],
+                      command=self.destroy).pack(side="left", padx=6, pady=10)
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14, pady=6)
+
+        nav = ctk.CTkFrame(body, width=196, corner_radius=12,
+                           fg_color=ui.COLORS['card'], border_width=1,
+                           border_color=ui.COLORS['line'])
+        nav.pack(side="left", fill="y", padx=(0, 8))
+        nav.pack_propagate(False)
+        self.nav_btns = {}
+
+        def group(title):
+            ctk.CTkLabel(nav, text=title, text_color=ui.COLORS['faint'],
+                         font=("Segoe UI", 10, "bold"),
+                         anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+
+        group("ОТЕЛИ")
         for hid, hname in self.HOTELS:
-            self._build_hotel_tab(tv.add(hname), hid)
-        self._build_agents_tab(tv.add("Агенты"))
+            self._nav_item(nav, hid, hname)
+        group("СПРАВОЧНИКИ")
+        self._nav_item(nav, 'agents', 'Агенты')
         if master.is_admin:
-            self._build_users_tab(tv.add("Пользователи"))
-            self._build_data_tab(tv.add("Данные"))
+            self._nav_item(nav, 'users', 'Пользователи')
+            group("СИСТЕМА")
+            self._nav_item(nav, 'data', 'База данных')
 
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(pady=(0, 12))
-        ctk.CTkButton(bar, text="Сохранить", width=140, fg_color="green",
-                      command=self.ok).pack(side="left", padx=6)
-        ctk.CTkButton(bar, text="Отмена", width=140, fg_color="gray",
-                      command=self.destroy).pack(side="left", padx=6)
+        self.pane = ctk.CTkFrame(body, fg_color="transparent")
+        self.pane.pack(side="left", fill="both", expand=True)
+
+        # секции строятся один раз, переключение — показом/скрытием
+        self.section_frames = {}
+        for hid, _h in self.HOTELS:
+            fr = ctk.CTkFrame(self.pane, fg_color="transparent")
+            self._build_hotel_tab(fr, hid)
+            self.section_frames[hid] = fr
+        fr = ctk.CTkFrame(self.pane, fg_color="transparent")
+        self._build_agents_tab(fr)
+        self.section_frames['agents'] = fr
+        if master.is_admin:
+            fr = ctk.CTkFrame(self.pane, fg_color="transparent")
+            self._build_users_tab(fr)
+            self.section_frames['users'] = fr
+            fr = ctk.CTkFrame(self.pane, fg_color="transparent")
+            self._build_data_tab(fr)
+            self.section_frames['data'] = fr
+
+        self.select_section(self.HOTELS[0][0])
         self.grab_set()
         self.lift()
         self.focus_force()
         self.attributes("-topmost", True)
+
+    def _nav_item(self, nav, sid, label):
+        b = ctk.CTkButton(nav, text=label, anchor="w", height=34,
+                          fg_color="transparent", text_color=ui.COLORS['text'],
+                          hover_color=ui.COLORS['line2'], font=ui.F_UI,
+                          command=lambda s=sid: self.select_section(s))
+        b.pack(fill="x", padx=8, pady=1)
+        self.nav_btns[sid] = b
+
+    def select_section(self, sid):
+        for fr in self.section_frames.values():
+            fr.pack_forget()
+        self.section_frames[sid].pack(fill="both", expand=True)
+        for s, b in self.nav_btns.items():
+            if s == sid:
+                b.configure(fg_color=ui.COLORS['accent_soft'],
+                            text_color=ui.COLORS['accent'])
+            else:
+                b.configure(fg_color="transparent",
+                            text_color=ui.COLORS['text'])
 
     # ------------------------------------------------------------
     def _build_hotel_tab(self, tab, hid):
         cur = TaxParams(self.cfg.get('tax', {}).get(hid))
         v = {}
         self.vars[hid] = v
+        wrap = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        wrap.pack(fill="both", expand=True)
 
-        sc = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        sc.pack(fill="both", expand=True)
+        ctk.CTkLabel(wrap, text=f"Отель «{dict(self.HOTELS)[hid]}» — параметры налога",
+                     font=ui.F_CARD,
+                     text_color=ui.COLORS['text']).pack(padx=6, pady=(4, 10), anchor="w")
 
-        def row(label, key, value, width=110):
-            fr = ctk.CTkFrame(sc, fg_color="transparent")
-            fr.pack(fill="x", pady=3, padx=6)
-            ctk.CTkLabel(fr, text=label, width=260, anchor="w",
-                         font=ctk.CTkFont(size=13)).pack(side="left")
-            var = tk.StringVar(value=str(value))
+        nums = ctk.CTkFrame(wrap, fg_color="transparent")
+        nums.pack(fill="x", padx=6, pady=2)
+        for i, (key, label, w) in enumerate((('rate', 'Ставка, %', 100),
+                                             ('min', 'Минимум за ночь, ₽', 140),
+                                             ('threshold', 'Порог, ₽/сутки', 140))):
+            f = ctk.CTkFrame(nums, fg_color="transparent")
+            f.grid(row=0, column=i, padx=(0, 20), sticky="w", pady=2)
+            ctk.CTkLabel(f, text=label, text_color=ui.COLORS['muted'],
+                         font=ui.F_SMALL, anchor="w").pack(anchor="w")
+            var = tk.StringVar(value=str(getattr(cur, key)))
             v[key] = var
-            ctk.CTkEntry(fr, textvariable=var, width=width).pack(side="left")
-            return fr
+            e = ctk.CTkEntry(f, textvariable=var, width=w, height=34, font=ui.F_UI)
+            e.pack()
+            if key == 'threshold':
+                v['threshold_entry'] = e
 
-        row("Ставка налога, %", 'rate', cur.rate)
-        row("Минимум за ночь, ₽", 'min', cur.min)
-        row("Порог метода «ставка» (сут. ставка)", 'threshold', cur.threshold)
+        for key, text in (('incl', 'Налог включён в стоимость (делитель 100+ставка)'),
+                          ('auto', 'Порог — автоматически: минимум×(100+ставка)/ставка'),
+                          ('use_full', 'Считать налог от стоимости БЕЗ комиссии (100%)')):
+            var = tk.BooleanVar(value=getattr(cur, key))
+            v[key] = var
+            ctk.CTkCheckBox(wrap, text=text, variable=var, font=ui.F_UI,
+                            fg_color=ui.COLORS['accent'],
+                            hover_color=ui.COLORS['line2'],
+                            command=self._sync_threshold if key == 'auto' else None
+                            ).pack(padx=8, pady=4, anchor="w")
+        self._sync_threshold(hid)
 
-        fr = ctk.CTkFrame(sc, fg_color="transparent")
-        fr.pack(fill="x", pady=3, padx=6)
-        v['incl'] = tk.BooleanVar(value=cur.incl)
-        ctk.CTkCheckBox(fr, text="Налог включён в стоимость (делитель 100+ставка)",
-                        variable=v['incl'], font=ctk.CTkFont(size=13)).pack(side="left")
-        fr = ctk.CTkFrame(sc, fg_color="transparent")
-        fr.pack(fill="x", pady=3, padx=6)
-        v['auto'] = tk.BooleanVar(value=cur.auto)
-        ctk.CTkCheckBox(fr, text="Порог — автоматически: минимум×(100+ставка)/ставка",
-                        variable=v['auto'], font=ctk.CTkFont(size=13)).pack(side="left")
-        fr = ctk.CTkFrame(sc, fg_color="transparent")
-        fr.pack(fill="x", pady=3, padx=6)
-        v['use_full'] = tk.BooleanVar(value=cur.use_full)
-        ctk.CTkCheckBox(fr, text="Считать налог от стоимости БЕЗ комиссии (100%)",
-                        variable=v['use_full'],
-                        font=ctk.CTkFont(size=13)).pack(side="left")
-
-        ctk.CTkLabel(sc, text="Шаблоны Excel-формул (правки для опытных):",
-                     anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(
-            padx=6, pady=(10, 2), fill="x")
-        for key, label, val in (('tpl_daily', "Сут. ставка", cur.tpl_daily),
-                                ('tpl_method', "Метод", cur.tpl_method),
-                                ('tpl_tax', "Налог", cur.tpl_tax)):
-            fr = ctk.CTkFrame(sc, fg_color="transparent")
-            fr.pack(fill="x", pady=2, padx=6)
+        fhead = ctk.CTkFrame(wrap, fg_color="transparent")
+        fhead.pack(fill="x", padx=6, pady=(14, 2))
+        btn = ctk.CTkButton(fhead, text="▸ Шаблоны Excel-формул", width=200, height=30,
+                            fg_color="transparent", border_width=1,
+                            border_color=ui.COLORS['line'],
+                            text_color=ui.COLORS['muted'], font=ui.F_SMALL,
+                            command=lambda h=hid: self._toggle_tpl(h))
+        btn.pack(side="left")
+        v['tpl_btn'] = btn
+        bodyf = ctk.CTkFrame(wrap, fg_color=ui.COLORS['line2'], corner_radius=10)
+        for key, label in (('tpl_daily', 'Сут. ставка'), ('tpl_method', 'Метод'),
+                           ('tpl_tax', 'Налог')):
+            fr = ctk.CTkFrame(bodyf, fg_color="transparent")
+            fr.pack(fill="x", pady=2, padx=8)
             ctk.CTkLabel(fr, text=label, width=90, anchor="w",
-                         font=ctk.CTkFont(size=12)).pack(side="left")
-            var = tk.StringVar(value=val)
+                         font=ui.F_SMALL).pack(side="left")
+            var = tk.StringVar(value=getattr(cur, key))
             v[key] = var
-            ctk.CTkEntry(fr, textvariable=var, height=30).pack(side="left", fill="x", expand=True)
+            ctk.CTkEntry(fr, textvariable=var, height=30,
+                         font=ui.F_MONO).pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(bodyf, text="Плейсхолдеры: {P} цена · {N} ночей · {R} сут.ставка · "
+                                 "{M} метод · {T} порог · {min} · {rate} · {div}",
+                     text_color=ui.COLORS['faint'], font=ui.F_TINY, anchor="w",
+                     justify="left").pack(padx=8, pady=(2, 6), fill="x")
+        bbar = ctk.CTkFrame(bodyf, fg_color="transparent")
+        bbar.pack(padx=8, pady=(0, 8))
+        ctk.CTkButton(bbar, text="Показать формулы", width=150, height=28,
+                      fg_color=ui.COLORS['accent'],
+                      hover_color=ui.COLORS['accent_hover'],
+                      command=lambda h=hid: self.show_preview(h)).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(bbar, text="Сбросить по умолчанию", width=180, height=28,
+                      fg_color="transparent", border_width=1,
+                      border_color=ui.COLORS['line'], text_color=ui.COLORS['muted'],
+                      hover_color=ui.COLORS['card'],
+                      command=lambda h=hid: self.reset_tab(h)).pack(side="left")
+        v['tpl_frame'] = bodyf
+        v['prev'] = ctk.CTkLabel(wrap, text="", justify="left", anchor="w",
+                                 font=ui.F_MONO, text_color=ui.COLORS['text'])
+        v['prev'].pack(padx=8, pady=(6, 8), fill="x")
 
-        ctk.CTkLabel(sc, text="Плейсхолдеры: {P} цена · {N} ночей · {R} сут.ставка · "
-                              "{M} метод · {T} порог · {min} минимум · {rate} ставка · {div} делитель",
-                     text_color="gray", font=ctk.CTkFont(size=11), anchor="w",
-                     justify="left").pack(padx=6, pady=2, fill="x")
+    def _sync_threshold(self, hid=None):
+        for h, v in self.vars.items():
+            if hid and h != hid:
+                continue
+            if 'threshold_entry' in v:
+                v['threshold_entry'].configure(
+                    state="disabled" if v['auto'].get() else "normal")
 
-        btns = ctk.CTkFrame(sc, fg_color="transparent")
-        btns.pack(fill="x", pady=6, padx=6)
-        ctk.CTkButton(btns, text="Показать формулы", width=150, fg_color="gray",
-                      command=lambda h=hid: self.show_preview(h)).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Сбросить по умолчанию", width=170, fg_color="gray",
-                      command=lambda h=hid: self.reset_tab(h)).pack(side="left", padx=4)
-        v['prev'] = ctk.CTkLabel(sc, text="", justify="left", anchor="w",
-                                 font=("Consolas", 12))
-        v['prev'].pack(padx=6, pady=(2, 8), fill="x")
+    def _toggle_tpl(self, hid):
+        v = self.vars[hid]
+        if v['tpl_frame'].winfo_manager():
+            v['tpl_frame'].pack_forget()
+            v['tpl_btn'].configure(text="▸ Шаблоны Excel-формул")
+        else:
+            v['tpl_frame'].pack(fill="x", padx=6, pady=4)
+            v['tpl_btn'].configure(text="▾ Шаблоны Excel-формул")
 
     def _cur_params(self, hid):
         v = self.vars[hid]
@@ -1044,6 +1140,7 @@ class DbLocationDialog(ctk.CTkToplevel):
         self.title("База данных")
         self.transient(master)
         self.resizable(False, False)
+        self.configure(fg_color=ui.COLORS['bg'])
         self.result = None
 
         ctk.CTkLabel(self, text="Где хранить базу данных?",
@@ -1085,6 +1182,7 @@ class LoginDialog(ctk.CTkToplevel):
         self.title("Вход")
         self.resizable(False, False)
         self.transient(master)
+        self.configure(fg_color=ui.COLORS['bg'])
         self.db = db
         self.user = None
 
@@ -1101,7 +1199,9 @@ class LoginDialog(ctk.CTkToplevel):
         self.err = ctk.CTkLabel(self, text="", text_color="#C33",
                                 font=ctk.CTkFont(size=11), height=16)
         self.err.pack()
-        ctk.CTkButton(self, text="Войти", fg_color="green", height=32,
+        ctk.CTkButton(self, text="Войти", fg_color=ui.COLORS['green'],
+                      hover_color=ui.COLORS['green_hover'], height=34,
+                      font=ui.F_UI,
                       command=self.ok).pack(padx=60, pady=4, fill="x")
         ctk.CTkLabel(self, text=f"БД: {default_db_path()}", text_color="gray",
                      font=ctk.CTkFont(size=8), wraplength=300).pack(pady=(2, 0))
@@ -1127,7 +1227,86 @@ class LoginDialog(ctk.CTkToplevel):
 # ================================================================
 # ПРИЛОЖЕНИЕ
 # ================================================================
+class FileZone(ctk.CTkFrame):
+    """Файл как объект: пустая зона → выбранный файл → ошибка чтения."""
+
+    def __init__(self, parent, title, hint, on_pick, on_clear=None, on_cols=None):
+        super().__init__(parent, corner_radius=10, border_width=1,
+                         border_color=ui.COLORS['zone_border'],
+                         fg_color=ui.COLORS['zone'])
+        self.grid_columnconfigure(0, weight=1)
+        self.on_clear = on_clear
+        self._title = title
+        self._hint = hint
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        top.grid_columnconfigure(0, weight=1)
+        self.tlabel = ctk.CTkLabel(top, text=title, font=("Segoe UI", 12, "bold"),
+                                   text_color=ui.COLORS['text'], anchor="w")
+        self.tlabel.grid(row=0, column=0, sticky="w")
+        self.clear_btn = ctk.CTkButton(top, text="✕", width=24, height=24,
+                                       fg_color="transparent",
+                                       text_color=ui.COLORS['faint'],
+                                       hover_color=ui.COLORS['red_soft'],
+                                       command=self._do_clear)
+        self.info = ctk.CTkLabel(self, text=hint, text_color=ui.COLORS['faint'],
+                                 font=ui.F_SMALL, anchor="w")
+        self.info.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 0))
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 10))
+        self.pick_btn = ctk.CTkButton(btns, text="Обзор…", width=96, height=30,
+                                      fg_color=ui.COLORS['accent'],
+                                      hover_color=ui.COLORS['accent_hover'],
+                                      font=ui.F_SMALL, command=on_pick)
+        self.pick_btn.pack(side="left")
+        if on_cols:
+            ctk.CTkButton(btns, text="Колонки", width=92, height=30,
+                          fg_color="transparent", border_width=1,
+                          border_color=ui.COLORS['line'],
+                          text_color=ui.COLORS['accent'],
+                          hover_color=ui.COLORS['accent_soft'],
+                          font=ui.F_SMALL, command=on_cols).pack(side="left", padx=(6, 0))
+        self.set_file(None)
+
+    def _do_clear(self):
+        if self.on_clear:
+            self.on_clear()
+
+    def set_file(self, path, info=""):
+        if path:
+            self.configure(fg_color=ui.COLORS['green_soft'],
+                           border_color=ui.COLORS['green_border'])
+            self.tlabel.configure(text=os.path.basename(path))
+            self.info.configure(text=info or self._hint,
+                                text_color=ui.COLORS['muted'])
+            self.pick_btn.configure(text="Заменить")
+            self.clear_btn.grid(row=0, column=1, sticky="e")
+        else:
+            self.configure(fg_color=ui.COLORS['zone'],
+                           border_color=ui.COLORS['zone_border'])
+            self.tlabel.configure(text=self._title)
+            self.info.configure(text=self._hint, text_color=ui.COLORS['faint'])
+            self.pick_btn.configure(text="Обзор…")
+            self.clear_btn.grid_forget()
+
+    def set_info(self, info, color=None):
+        self.info.configure(text=info, text_color=color or ui.COLORS['muted'])
+
+
 class App(ctk.CTk):
+    SLOT_DEFS = {
+        'tch': (('data', '«Данные» — брони',
+                 'Выгрузка броней: даты, сумма, источник, гости',
+                 'Колонки «Данные»'),
+                ('rooms', '«Номера» — расселение',
+                 'ФИО гостя + № комнаты', 'Колонки «Номера»')),
+        'dna': (('data', '«Данные» — брони',
+                 'Выгрузка броней с колонкой «Источник»', 'Колонки «Данные»'),),
+        'usd': (('rep', 'Отчёт «Доход по номеру»',
+                 'Выгрузка UCS Shelter, структура фиксированная', None),),
+    }
+
     def __init__(self, user):
         super().__init__()
         self.user = user
@@ -1135,91 +1314,124 @@ class App(ctk.CTk):
         self.allowed_hotels = ({'tch', 'dna', 'usd'} if self.is_admin
                                else {user['hotel']})
         self.title("Турналог — обработка данных гостиниц")
-        w, h = 960, 620
+        w, h = 1180, 780
         x = max(0, (self.winfo_screenwidth() - w) // 2)
         y = max(0, (self.winfo_screenheight() - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(820, 540)
+        self.minsize(1100, 700)
+        self.configure(fg_color=ui.COLORS['bg'])
+        ui.apply_treeview_style()
         self.cfg = load_config()
 
-        # состояние по отелям: пути, заголовки, сопоставления
-        self.slot_state = {
-            'tch': {'data': {}, 'rooms': {}},
-            'dna': {'data': {}},
-        }
+        self.slot_state = {}
+        for hid, slots in (('tch', ('data', 'rooms')), ('dna', ('data',)),
+                           ('usd', ('rep',))):
+            self.slot_state[hid] = {s: {'path_var': tk.StringVar()} for s in slots}
+        self.q_vars = {}
+        self.dup_vars = {}
+        self.zones = {}
+        self.cta_btns = {}
+        self.stat_lbs = {}
+        self.nav_btns = {}
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-
         self._build_sidebar()
 
-        self.main = ctk.CTkFrame(self, fg_color="transparent")
-        self.main.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
-        self.main.grid_columnconfigure(0, weight=1)
-        self.main.grid_rowconfigure(0, weight=1)
+        self.right = ctk.CTkFrame(self, fg_color="transparent")
+        self.right.grid(row=0, column=1, sticky="nsew", padx=12, pady=(10, 4))
+        self.right.grid_columnconfigure(0, weight=1)
+        self.right.grid_rowconfigure(0, weight=1)
 
         self.pages = {}
-        if 'tch' in self.allowed_hotels:
-            self._build_tchaikovsky_page()
-        if 'dna' in self.allowed_hotels:
-            self._build_dona_page()
-        if 'usd' in self.allowed_hotels:
-            self._build_usadba_page()
+        for pid in ('tch', 'dna', 'usd'):
+            if pid in self.allowed_hotels:
+                self._build_hotel_page(pid)
         self._build_history_page()
 
-        # статус-бар
+        sb = ctk.CTkFrame(self, fg_color=ui.COLORS['card'], corner_radius=0,
+                          border_width=1, border_color=ui.COLORS['line'])
+        sb.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ctk.CTkLabel(sb, text="●", text_color=ui.COLORS['green'],
+                     font=ui.F_SMALL).pack(side="left", padx=(12, 4))
         self.status_var = tk.StringVar(value="Готово к работе")
-        ctk.CTkLabel(self, textvariable=self.status_var, anchor="w",
-                     text_color="gray", height=22).grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=14)
+        ctk.CTkLabel(sb, textvariable=self.status_var, text_color=ui.COLORS['muted'],
+                     font=ui.F_SMALL, anchor="w").pack(side="left", fill="x", expand=True)
+        self.db_label = ctk.CTkLabel(sb, text=default_db_path(),
+                                     text_color=ui.COLORS['faint'], font=ui.F_TINY)
+        self.db_label.pack(side="right", padx=12)
 
-        first = next(p for p in ('tch', 'dna', 'usd', 'hist')
-                     if p in self.pages)
+        self.usd_var = self.slot_state['usd']['rep']['path_var']
+        first = next(p for p in ('tch', 'dna', 'usd', 'hist') if p in self.pages)
         self.show_page(first)
 
     # ------------------------------------------------------------
-    # Навигация
+    # сайдбар
     # ------------------------------------------------------------
     def _build_sidebar(self):
-        sb = ctk.CTkFrame(self, width=180, corner_radius=0)
+        sb = ctk.CTkFrame(self, width=232, corner_radius=0,
+                          fg_color=ui.COLORS['sidebar'])
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
-        ctk.CTkLabel(sb, text="ТУРНАЛОГ", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(14, 0))
-        ctk.CTkLabel(sb, text="налог по выгрузкам отелей", text_color="gray",
-                     font=ctk.CTkFont(size=10)).pack(pady=(0, 12))
+        ctk.CTkLabel(sb, text="ТУРНАЛОГ", font=("Segoe UI", 18, "bold"),
+                     text_color="white").pack(padx=16, pady=(18, 0), anchor="w")
+        ctk.CTkLabel(sb, text="налог по выгрузкам отелей", text_color="#8FA3C8",
+                     font=ui.F_TINY).pack(padx=16, pady=(0, 14), anchor="w")
 
-        self.nav_btns = {}
-        items = [(p, l) for p, l in (('tch', 'Чайковский'), ('dna', 'Дона'),
-                                     ('usd', 'Усадьба'))
-                 if p in self.allowed_hotels]
-        items += [('hist', 'История')]
-        for pid, label in items:
-            b = ctk.CTkButton(sb, text=label, anchor="w", fg_color="transparent",
-                              text_color=("gray10", "gray90"),
-                              hover_color=("gray75", "gray30"), height=34,
-                              font=ctk.CTkFont(size=13),
-                              command=lambda p=pid: self.show_page(p))
-            b.pack(fill="x", padx=6, pady=1)
+        ctk.CTkLabel(sb, text="ОТЕЛИ", text_color="#7286AC",
+                     font=("Segoe UI", 10, "bold")).pack(padx=16, pady=(4, 2), anchor="w")
+        for pid in ('tch', 'dna', 'usd'):
+            if pid not in self.allowed_hotels:
+                continue
+            rowf = ctk.CTkFrame(sb, fg_color="transparent")
+            rowf.pack(fill="x", padx=8, pady=1)
+            ctk.CTkLabel(rowf, text="●", text_color=ui.HOTEL_DOT[pid],
+                         font=ui.F_SMALL, width=16).pack(side="left", padx=(8, 0))
+            b = ctk.CTkButton(rowf, text=ui.HOTEL_NAME[pid], anchor="w",
+                              fg_color="transparent", text_color="#DCE6F5",
+                              hover_color=ui.COLORS['sidebar_hover'], height=36,
+                              font=ui.F_UI, command=lambda p=pid: self.show_page(p))
+            b.pack(side="left", fill="x", expand=True, padx=(0, 6))
             self.nav_btns[pid] = b
 
+        ctk.CTkFrame(sb, height=1, fg_color=ui.COLORS['sidebar_act']).pack(
+            fill="x", padx=16, pady=10)
+        b = ctk.CTkButton(sb, text="История", anchor="w", fg_color="transparent",
+                          text_color="#DCE6F5", hover_color=ui.COLORS['sidebar_hover'],
+                          height=36, font=ui.F_UI,
+                          command=lambda: self.show_page('hist'))
+        b.pack(fill="x", padx=8, pady=1)
+        self.nav_btns['hist'] = b
         if self.is_admin:
-            ctk.CTkButton(sb, text="⚙ Настройки", anchor="w", fg_color="transparent",
-                          hover_color=("gray75", "gray30"), height=34,
-                          text_color=("gray10", "gray90"),
-                          font=ctk.CTkFont(size=13),
-                          command=self.open_settings).pack(fill="x", padx=6, pady=(12, 2))
+            b = ctk.CTkButton(sb, text="⚙  Настройки", anchor="w",
+                              fg_color="transparent", text_color="#DCE6F5",
+                              hover_color=ui.COLORS['sidebar_hover'], height=36,
+                              font=ui.F_UI, command=self.open_settings)
+            b.pack(fill="x", padx=8, pady=1)
 
-        who = self.user['login'] + (' (админ)' if self.is_admin else '')
-        ctk.CTkLabel(sb, text=f"пользователь: {who}\nверсия {APP_VERSION}",
-                     text_color="gray", font=ctk.CTkFont(size=9),
-                     justify="left").pack(side="bottom", pady=8)
+        low = ctk.CTkFrame(sb, fg_color="transparent")
+        low.pack(side="bottom", fill="x", padx=14, pady=12)
+        ctk.CTkLabel(low, text=self.user['login'][0].upper(), width=34, height=34,
+                     corner_radius=17, fg_color=ui.COLORS['accent'],
+                     text_color="white", font=("Segoe UI", 14, "bold")).pack(side="left")
+        who = ctk.CTkFrame(low, fg_color="transparent")
+        who.pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(who, text=self.user['login'], text_color="white",
+                     font=ui.F_SMALL, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(who, text=("администратор" if self.is_admin
+                                else ui.HOTEL_NAME.get(self.user['hotel'], ''))
+                     + f" · v{APP_VERSION}",
+                     text_color="#8FA3C8", font=ui.F_TINY, anchor="w").pack(anchor="w")
 
     def show_page(self, pid):
         for p, fr in self.pages.items():
             fr.grid_forget()
         self.pages[pid].grid(row=0, column=0, sticky="nsew")
         for p, b in self.nav_btns.items():
-            b.configure(fg_color=("gray75", "gray28") if p == pid else "transparent")
+            if p == pid:
+                b.configure(fg_color=ui.COLORS['sidebar_act'], text_color="white")
+            else:
+                b.configure(fg_color="transparent", text_color="#DCE6F5")
         if pid == 'hist':
             self.refresh_history()
 
@@ -1227,47 +1439,140 @@ class App(ctk.CTk):
         self.status_var.set(text)
         self.update_idletasks()
 
-    def open_settings(self):
-        dlg = SettingsDialog(self, self.cfg)
-        self.wait_window(dlg)
-        if dlg.result:
-            self.cfg['tax'] = dlg.result['tax']
-            self.cfg['agents'] = dlg.result['agents']
-            save_config(self.cfg)
-            self.set_status("Настройки сохранены")
+    # ------------------------------------------------------------
+    # страница отеля
+    # ------------------------------------------------------------
+    def _build_hotel_page(self, pid):
+        pg = ctk.CTkScrollableFrame(self.right, fg_color="transparent",
+                                    scrollbar_button_color=ui.COLORS['line'])
+        self.pages[pid] = pg
+        now = datetime.now()
+
+        hdr = ctk.CTkFrame(pg, fg_color="transparent")
+        hdr.pack(fill="x", padx=6, pady=(4, 8))
+        ctk.CTkLabel(hdr, text=f"Отель «{ui.HOTEL_NAME[pid]}»", font=ui.F_PAGE,
+                     text_color=ui.COLORS['text']).pack(side="left")
+        bg, fg = ui.HOTEL_PILL[pid]
+        sub = {'tch': 'корпуса 1 и 2 · листы 1&2', 'dna': 'без корпусов · агенты',
+               'usd': 'без корпусов · UCS Shelter'}[pid]
+        ctk.CTkLabel(hdr, text=sub, font=ui.F_TINY, fg_color=bg, text_color=fg,
+                     corner_radius=6, height=22).pack(side="left", padx=(10, 0), pady=(8, 0))
+        tp = TaxParams(self.cfg.get('tax', {}).get(pid))
+        ctk.CTkLabel(hdr, text=f"ставка {tp.rate:g}% · минимум {tp.min:g} ₽ · порог {tp.threshold:g}",
+                     text_color=ui.COLORS['muted'], font=ui.F_SMALL).pack(side="right", pady=(8, 0))
+
+        steps = ctk.CTkFrame(pg, fg_color="transparent")
+        steps.pack(fill="x", padx=4, pady=4)
+        steps.grid_columnconfigure(0, weight=3, minsize=430)
+        steps.grid_columnconfigure(1, weight=2, minsize=320)
+
+        # --- шаг 1: файлы ---
+        c1 = ui.card(steps)
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
+        ctk.CTkLabel(c1, text="1 · Исходные файлы", font=ui.F_CARD,
+                     text_color=ui.COLORS['text']).pack(padx=16, pady=(14, 8), anchor="w")
+        for slot, title, hint, cols_label in self.SLOT_DEFS[pid]:
+            zone = FileZone(c1, title, hint,
+                            on_pick=lambda h=pid, s=slot: self.browse(h, s),
+                            on_clear=lambda h=pid, s=slot: self.clear_file(h, s),
+                            on_cols=(lambda h=pid, s=slot: self.open_mapping(h, s))
+                            if cols_label else None)
+            if cols_label:
+                zone.pick_btn.configure(text="Обзор…")
+            zone.pack(fill="x", padx=14, pady=5)
+            self.zones[(pid, slot)] = zone
+        ctk.CTkLabel(c1, text="", font=ui.F_TINY).pack()  # нижний отступ
+
+        # --- шаг 2: обработка ---
+        c2 = ui.card(steps)
+        c2.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
+        ctk.CTkLabel(c2, text="2 · Обработка", font=ui.F_CARD,
+                     text_color=ui.COLORS['text']).pack(padx=16, pady=(14, 8), anchor="w")
+
+        qrow = ctk.CTkFrame(c2, fg_color="transparent")
+        qrow.pack(fill="x", padx=16, pady=2)
+        ctk.CTkLabel(qrow, text="Квартал отчёта", text_color=ui.COLORS['muted'],
+                     font=ui.F_SMALL).pack(anchor="w")
+        qv = tk.StringVar(value=f"Q{(now.month - 1) // 3 + 1}")
+        yv = tk.StringVar(value=str(now.year))
+        self.q_vars[pid] = (yv, qv)
+        q2 = ctk.CTkFrame(c2, fg_color="transparent")
+        q2.pack(fill="x", padx=16, pady=(0, 6))
+        ctk.CTkSegmentedButton(q2, values=["Q1", "Q2", "Q3", "Q4"], variable=qv,
+                               width=190, height=32,
+                               fg_color=ui.COLORS['line2'],
+                               selected_color=ui.COLORS['accent'],
+                               selected_hover_color=ui.COLORS['accent_hover'],
+                               unselected_color=ui.COLORS['card'],
+                               unselected_hover_color=ui.COLORS['line2'],
+                               text_color=ui.COLORS['text'],
+                               font=ui.F_SMALL).pack(side="left")
+        ctk.CTkEntry(q2, textvariable=yv, width=70, height=32,
+                     font=ui.F_UI, justify="center").pack(side="left", padx=(8, 0))
+
+        self.dup_vars[pid] = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(c2, text="Проверять дубли по истории",
+                        variable=self.dup_vars[pid], font=ui.F_UI,
+                        fg_color=ui.COLORS['accent'],
+                        hover_color=ui.COLORS['line2']).pack(padx=16, pady=4, anchor="w")
+
+        hintf = ctk.CTkFrame(c2, fg_color=ui.COLORS['purple_soft'], corner_radius=10)
+        hintf.pack(fill="x", padx=16, pady=(6, 10))
+        ctk.CTkLabel(hintf, text="Бронь на стыке кварталов попадёт в два отчёта — "
+                                 "во втором она будет помечена фиолетовым.",
+                     text_color=ui.COLORS['purple_text'], font=ui.F_SMALL,
+                     justify="left", anchor="w").pack(padx=12, pady=8, fill="x")
+
+        run = {'tch': self.run_tchaikovsky, 'dna': self.run_dona,
+               'usd': self.run_usadba}[pid]
+        btn = ctk.CTkButton(c2, text="ОБРАБОТАТЬ И СОХРАНИТЬ", height=44,
+                            fg_color=ui.COLORS['green'],
+                            hover_color=ui.COLORS['green_hover'],
+                            disabled=True,
+                            font=("Segoe UI", 14, "bold"), command=run)
+        btn.pack(fill="x", padx=16, pady=(0, 16))
+        self.cta_btns[pid] = btn
+
+        # --- мини-карточки последней обработки ---
+        st = ctk.CTkFrame(pg, fg_color="transparent")
+        st.pack(fill="x", padx=4, pady=6)
+        self.stat_lbs[pid] = {}
+        for i, (key, label) in enumerate((('date', 'Последняя обработка'),
+                                          ('rows', 'Строк'), ('dups', 'Дублей'))):
+            c = ui.card(st)
+            c.pack(side="left", fill="x", expand=True,
+                   padx=(0 if i == 0 else 6, 0 if i == 2 else 6))
+            ctk.CTkLabel(c, text=label, text_color=ui.COLORS['muted'],
+                         font=ui.F_TINY).pack(padx=14, pady=(10, 0), anchor="w")
+            val = ctk.CTkLabel(c, text="—", text_color=ui.COLORS['text'],
+                               font=("Segoe UI", 15, "bold"))
+            val.pack(padx=14, pady=(0, 10), anchor="w")
+            self.stat_lbs[pid][key] = val
+        self.refresh_stats(pid)
+
+    def refresh_stats(self, pid):
+        try:
+            with HistoryDB() as db:
+                reps = db.list_reports(hotel=ui.HOTEL_NAME[pid])
+        except Exception:
+            reps = []
+        d = self.stat_lbs.get(pid)
+        if not d:
+            return
+        if reps:
+            r = reps[0]
+            d['date'].configure(text=r['processed_at'][:16].replace('T', ' '))
+            d['rows'].configure(text=str(r['rows']))
+            d['dups'].configure(text=str(r['dups']),
+                                text_color=ui.COLORS['amber'] if r['dups'] else ui.COLORS['green'])
+        else:
+            d['date'].configure(text="ещё не было")
+            d['rows'].configure(text="—")
+            d['dups'].configure(text="—")
 
     # ------------------------------------------------------------
-    # Карточки и строки выбора файлов
+    # файлы
     # ------------------------------------------------------------
-    @staticmethod
-    def card(parent, title, subtitle=None):
-        fr = ctk.CTkFrame(parent, corner_radius=8)
-        fr.pack(fill="x", padx=6, pady=4)
-        ctk.CTkLabel(fr, text=title, font=ctk.CTkFont(size=13, weight="bold"),
-                     anchor="w").pack(padx=12, pady=(8, 0), fill="x")
-        if subtitle:
-            ctk.CTkLabel(fr, text=subtitle, text_color="gray",
-                         font=ctk.CTkFont(size=10), anchor="w",
-                         justify="left").pack(padx=12, pady=(0, 4), fill="x")
-        return fr
-
-    def file_row(self, parent, hotel, slot, placeholder, on_change=None):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=2)
-        var = tk.StringVar()
-        self.slot_state[hotel][slot]['path_var'] = var
-        ctk.CTkEntry(row, textvariable=var, placeholder_text=placeholder,
-                     height=30, font=ctk.CTkFont(size=12)).pack(
-            side="left", fill="x", expand=True, padx=(0, 5))
-        ctk.CTkButton(row, text="Обзор…", width=76, height=30,
-                      font=ctk.CTkFont(size=12),
-                      command=lambda: self.browse(hotel, slot, on_change)).pack(side="left")
-        chip = ctk.CTkLabel(row, text="", text_color="gray", width=185, anchor="w",
-                            font=ctk.CTkFont(size=10))
-        chip.pack(side="left", padx=(6, 0))
-        self.slot_state[hotel][slot]['chip'] = chip
-        return row
-
     def browse(self, hotel, slot, on_change=None):
         path = filedialog.askopenfilename(
             parent=self, title="Выберите файл",
@@ -1276,59 +1581,52 @@ class App(ctk.CTk):
             return
         self.slot_state[hotel][slot]['path_var'].set(path)
         self.on_file_selected(hotel, slot)
-        if on_change:
-            on_change()
+
+    def clear_file(self, hotel, slot):
+        st = self.slot_state[hotel][slot]
+        st['path_var'].set('')
+        st['mapping'], st['extra'], st['headers'] = None, [], None
+        self.zones[(hotel, slot)].set_file(None)
+        self._update_cta(hotel)
+
+    def _update_cta(self, hotel):
+        need = ('data', 'rooms') if hotel == 'tch' else ('data',) if hotel == 'dna' else ('rep',)
+        ok = all(self.slot_state[hotel][s]['path_var'].get() for s in need)
+        self.cta_btns[hotel].configure(
+            state="normal" if ok else "disabled",
+            fg_color=ui.COLORS['green'] if ok else ui.COLORS['green_dis'])
 
     def on_file_selected(self, hotel, slot):
         st = self.slot_state[hotel][slot]
         path = st['path_var'].get()
-        chip = st['chip']
+        zone = self.zones[(hotel, slot)]
         try:
             headers = read_headers(path)
         except Exception as e:
             st['headers'] = None
-            chip.configure(text="⚠ не читается", text_color="#C33")
+            zone.set_file(path, "⚠ файл не читается — проверьте формат")
             log.warning("read_headers %s: %s", path, e)
+            self._update_cta(hotel)
             return
         st['headers'] = headers
         schema = self._schema(hotel, slot)
         saved = self.cfg.get(f"{hotel}_{slot}", {})
         if mapping_valid(saved.get('mapping'), headers, schema):
             st['mapping'], st['extra'] = saved['mapping'], saved.get('extra', [])
-            extra_note = ""
+            info = f"{len(headers)} колонок · сопоставлено ✓"
             if hotel == 'dna':
-                extra_note = self._dona_unknown_note(path, st['mapping'])
-            chip.configure(text=f"✓ {len(headers)} колонок, сопоставлено{extra_note}",
-                           text_color="green" if not extra_note else "orange")
+                info += self._dona_unknown_note(path, st['mapping'])
+            zone.set_file(path, info)
         else:
             st['mapping'], st['extra'] = None, []
-            chip.configure(text=f"{len(headers)} колонок — настройте ↓",
-                           text_color="orange")
-
-    def _dona_unknown_note(self, path, mapping):
-        """Сколько источников в файле не распознаются (видно сразу при выборе)."""
-        try:
-            scol = (mapping or {}).get('source')
-            if not scol:
-                return ""
-            dfc = read_table(path)
-            if scol not in dfc.columns:
-                return ""
-            cnt = dfc[scol].fillna('').astype(str).str.strip().value_counts()
-            agents = migrate_agents(self.cfg)
-            unk = [s for s, c in cnt.items()
-                   if s and match_agent(s, agents, hotel='dna')[1] is None]
-            return f" · нераспознанных: {len(unk)}" if unk else ""
-        except Exception:
-            log.exception("_dona_unknown_note")
-            return ""
+            zone.set_file(path, f"{len(headers)} колонок — нажмите «Колонки»")
+        self._update_cta(hotel)
 
     def _schema(self, hotel, slot):
         return {('tch', 'data'): TCH_DATA_SCHEMA, ('tch', 'rooms'): TCH_ROOMS_SCHEMA,
-                ('dna', 'data'): DNA_DATA_SCHEMA}[(hotel, slot)]
+                ('dna', 'data'): DNA_DATA_SCHEMA}[hotel, slot]
 
     def ensure_mapping(self, hotel, slot):
-        """Гарантирует сопоставление: из конфига или через диалог. False = отмена."""
         st = self.slot_state[hotel][slot]
         path = st['path_var'].get()
         if not path:
@@ -1350,8 +1648,8 @@ class App(ctk.CTk):
         st['mapping'], st['extra'] = dlg.result
         self.cfg[f"{hotel}_{slot}"] = {"mapping": dlg.result[0], "extra": dlg.result[1]}
         save_config(self.cfg)
-        st['chip'].configure(text=f"✓ {len(headers)} колонок, сопоставлено",
-                             text_color="green")
+        self.zones[(hotel, slot)].set_info(f"{len(headers)} колонок · сопоставлено ✓",
+                                           ui.COLORS['green'])
         return True
 
     def open_mapping(self, hotel, slot):
@@ -1361,173 +1659,132 @@ class App(ctk.CTk):
             return
         self.ensure_mapping(hotel, slot)
 
-    # ================================================================
-    # СТРАНИЦА: ЧАЙКОВСКИЙ
-    # ================================================================
-    def _build_tchaikovsky_page(self):
-        pg = ctk.CTkScrollableFrame(self.main, fg_color="transparent")
-        self.pages['tch'] = pg
+    def _dona_unknown_note(self, path, mapping):
+        try:
+            scol = (mapping or {}).get('source')
+            if not scol:
+                return ""
+            dfc = read_table(path)
+            if scol not in dfc.columns:
+                return ""
+            cnt = dfc[scol].fillna('').astype(str).str.strip().value_counts()
+            agents = migrate_agents(self.cfg)
+            unk = [s for s, c in cnt.items()
+                   if s and match_agent(s, agents, hotel='dna')[1] is None]
+            return f" · нераспознанных: {len(unk)}" if unk else ""
+        except Exception:
+            log.exception("_dona_unknown_note")
+            return ""
 
-        ctk.CTkLabel(pg, text="Отель «Чайковский»",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(2, 0), anchor="w", padx=8)
-        ctk.CTkLabel(pg, text="Турналог с разбивкой по корпусам (листы 1&2, 1, 2, «нет корпуса»)",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(0, 4))
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.cfg)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.cfg['tax'] = dlg.result['tax']
+            self.cfg['agents'] = dlg.result['agents']
+            save_config(self.cfg)
+            ui.toast(self, "Настройки сохранены")
+            self.set_status("Настройки сохранены")
+            self.db_label.configure(text=default_db_path())
+            for pid in self.pages:
+                if pid in self.stat_lbs:
+                    self.refresh_stats(pid)
 
-        c1 = self.card(pg, "Шаг 1 · Исходные файлы",
-                       "«Данные» — брони; «Номера» — расселение гостей по комнатам.")
-        self.file_row(c1, 'tch', 'data', "Файл «Данные» (.xlsx / .csv)")
-        self.file_row(c1, 'tch', 'rooms', "Файл «Номера» (.xlsx / .csv)")
-        mrow = ctk.CTkFrame(c1, fg_color="transparent")
-        mrow.pack(fill="x", padx=12, pady=(2, 8))
-        ctk.CTkButton(mrow, text="⚙ Колонки «Данные»", width=150, height=28,
-                      fg_color="gray", font=ctk.CTkFont(size=11),
-                      command=lambda: self.open_mapping('tch', 'data')).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(mrow, text="⚙ Колонки «Номера»", width=150, height=28,
-                      fg_color="gray", font=ctk.CTkFont(size=11),
-                      command=lambda: self.open_mapping('tch', 'rooms')).pack(side="left")
-
-        c2 = self.card(pg, "Шаг 2 · Обработка",
-                       "Файл результата, квартал отчёта, проверка дублей по истории "
-                       "(переход кварталов — фиолетовым).")
-        self.tch_run_btn = ctk.CTkButton(c2, text="▶  ОБРАБОТАТЬ И СОХРАНИТЬ",
-                                         height=36, fg_color="green",
-                                         hover_color="#2A7A2A",
-                                         font=ctk.CTkFont(size=13, weight="bold"),
-                                         command=self.run_tchaikovsky)
-        self.tch_run_btn.pack(fill="x", padx=12, pady=(4, 10))
-
-    # ================================================================
-    # СТРАНИЦА: ДОНА
-    # ================================================================
-    def _build_dona_page(self):
-        pg = ctk.CTkScrollableFrame(self.main, fg_color="transparent")
-        self.pages['dna'] = pg
-
-        ctk.CTkLabel(pg, text="Отель «Дона»",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(2, 0), anchor="w", padx=8)
-        ctk.CTkLabel(pg, text="Пересчёт стоимости агентов в 100% и турналог от полной суммы",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(0, 4))
-
-        c1 = self.card(pg, "Шаг 1 · Исходный файл",
-                       "«Данные» с колонкой «Источник»: распознаётся агент (50 встроено),\n"
-                       "комиссия 10–20%; в результат добавляется «Стоимость без комиссии».")
-        self.file_row(c1, 'dna', 'data', "Файл «Данные» (.xlsx / .csv)")
-        ctk.CTkButton(c1, text="⚙ Настроить колонки…", width=160, height=28,
-                      fg_color="gray", font=ctk.CTkFont(size=11),
-                      command=lambda: self.open_mapping('dna', 'data')).pack(
-            anchor="w", padx=12, pady=(2, 8))
-
-        c2 = self.card(pg, "Шаг 2 · Обработка")
-        self.dna_run_btn = ctk.CTkButton(c2, text="▶  ОБРАБОТАТЬ И СОХРАНИТЬ",
-                                         height=36, fg_color="green",
-                                         hover_color="#2A7A2A",
-                                         font=ctk.CTkFont(size=13, weight="bold"),
-                                         command=self.run_dona)
-        self.dna_run_btn.pack(fill="x", padx=12, pady=(4, 10))
-
-    # ================================================================
-    # СТРАНИЦА: УСАДЬБА
-    # ================================================================
-    def _build_usadba_page(self):
-        pg = ctk.CTkScrollableFrame(self.main, fg_color="transparent")
-        self.pages['usd'] = pg
-
-        ctk.CTkLabel(pg, text="Отель «Усадьба»",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(2, 0), anchor="w", padx=8)
-        ctk.CTkLabel(pg, text="Отчёт UCS Shelter «Доход по номеру» → турналог",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(0, 4))
-
-        c1 = self.card(pg, "Шаг 1 · Исходный файл",
-                       "Выгрузка UCS Shelter с блоками «Номер: N»; структура фиксированная —\n"
-                       "сопоставление колонок не требуется.")
-        row = ctk.CTkFrame(c1, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=(2, 8))
-        self.usd_var = tk.StringVar()
-        ctk.CTkEntry(row, textvariable=self.usd_var, height=30,
-                     font=ctk.CTkFont(size=12),
-                     placeholder_text="Отчёт «Доход по номеру» (.xlsx)").pack(
-            side="left", fill="x", expand=True, padx=(0, 5))
-        ctk.CTkButton(row, text="Обзор…", width=76, height=30,
-                      font=ctk.CTkFont(size=12), command=self.browse_usd).pack(side="left")
-
-        c2 = self.card(pg, "Шаг 2 · Обработка")
-        self.usd_run_btn = ctk.CTkButton(c2, text="▶  ОБРАБОТАТЬ И СОХРАНИТЬ",
-                                         height=36, fg_color="green",
-                                         hover_color="#2A7A2A",
-                                         font=ctk.CTkFont(size=13, weight="bold"),
-                                         command=self.run_usadba)
-        self.usd_run_btn.pack(fill="x", padx=12, pady=(4, 10))
-
-    def browse_usd(self):
-        path = filedialog.askopenfilename(
-            parent=self, title="Выберите отчёт",
-            filetypes=[("Excel файлы", "*.xlsx")])
-        if path:
-            self.usd_var.set(path)
-
-    # ================================================================
-    # СТРАНИЦА: ИСТОРИЯ
-    # ================================================================
+    # ------------------------------------------------------------
+    # история
+    # ------------------------------------------------------------
     def _build_history_page(self):
-        pg = ctk.CTkFrame(self.main, fg_color="transparent")
+        pg = ctk.CTkFrame(self.right, fg_color="transparent")
         self.pages['hist'] = pg
 
-        ctk.CTkLabel(pg, text="История обработанных отчётов",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(2, 0), anchor="w", padx=8)
-        ctk.CTkLabel(pg, text="Оригиналы и результаты хранятся в локальной БД; "
-                              "дубли на переходе кварталов — ниже.",
-                     text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(0, 4))
+        hdr = ctk.CTkFrame(pg, fg_color="transparent")
+        hdr.pack(fill="x", padx=6, pady=(4, 8))
+        ctk.CTkLabel(hdr, text="История отчётов", font=ui.F_PAGE,
+                     text_color=ui.COLORS['text']).pack(side="left")
+        self.hist_search = tk.StringVar()
+        self.hist_search.trace_add("write", lambda *a: self._apply_hist_filter())
+        ctk.CTkEntry(hdr, textvariable=self.hist_search, width=220, height=32,
+                     placeholder_text="Поиск: отель, квартал, файл…",
+                     font=ui.F_SMALL).pack(side="right", pady=(8, 0))
 
         bar = ctk.CTkFrame(pg, fg_color="transparent")
-        bar.pack(padx=10, fill="x")
-        ctk.CTkButton(bar, text="Обновить", width=90,
-                      command=self.refresh_history).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="Открыть оригинал", width=130,
-                      command=lambda: self.open_history_file('orig')).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="Открыть результат", width=130,
-                      command=lambda: self.open_history_file('out')).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="Удалить", width=90, fg_color="#B33",
-                      command=self.delete_history_report).pack(side="right", padx=3)
+        bar.pack(fill="x", padx=6, pady=(0, 6))
+        for label, cmd, color in (("Обновить", self.refresh_history, None),
+                                  ("Открыть оригинал",
+                                   lambda: self.open_history_file('orig'), None),
+                                  ("Открыть результат",
+                                   lambda: self.open_history_file('out'), None),
+                                  ("Удалить", self.delete_history_report,
+                                   ui.COLORS['red'])):
+            kw = dict(height=32, font=ui.F_SMALL)
+            if color:
+                kw.update(fg_color=color, hover_color="#C22F35")
+            else:
+                kw.update(fg_color=ui.COLORS['card'], border_width=1,
+                          border_color=ui.COLORS['line'],
+                          text_color=ui.COLORS['text'],
+                          hover_color=ui.COLORS['line2'])
+            ctk.CTkButton(bar, text=label, command=cmd, **kw).pack(side="left", padx=(0, 6))
 
+        wrap = ui.card(pg)
+        wrap.pack(fill="both", expand=True, padx=6, pady=2)
         cols = ("id", "hotel", "quarter", "processed_at", "rows", "dups",
                 "original_name", "output_name")
-        wrap = ctk.CTkFrame(pg, fg_color="transparent")
-        wrap.pack(padx=10, pady=(6, 0), fill="both", expand=True)
-        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings", height=12)
+        self.history_tree = ttk.Treeview(wrap, columns=cols, show="headings", height=14)
         heads = {"id": "№", "hotel": "Отель", "quarter": "Квартал",
                  "processed_at": "Обработан", "rows": "Строк", "dups": "Дубли",
                  "original_name": "Оригинал", "output_name": "Результат"}
-        widths = {"id": 35, "hotel": 90, "quarter": 70, "processed_at": 130,
-                  "rows": 50, "dups": 50, "original_name": 160, "output_name": 160}
+        widths = {"id": 35, "hotel": 100, "quarter": 75, "processed_at": 130,
+                  "rows": 55, "dups": 55, "original_name": 170, "output_name": 170}
         for c in cols:
             self.history_tree.heading(c, text=heads[c])
             self.history_tree.column(c, width=widths[c], anchor="w")
+        for pid, color in ui.HOTEL_DOT.items():
+            self.history_tree.tag_configure(f"h_{pid}", foreground=color)
+        self.history_tree.tag_configure("dup", foreground=ui.COLORS['amber'])
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.history_tree.yview)
         self.history_tree.configure(yscrollcommand=sb.set)
-        self.history_tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        self.history_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        sb.pack(side="right", fill="y", pady=8)
         self.history_tree.bind("<<TreeviewSelect>>", lambda e: self.show_history_dups())
+        self._hist_all = []
 
-        ctk.CTkLabel(pg, text="Брони с переходом кварталов в выбранном отчёте:",
-                     anchor="w").pack(padx=12, pady=(8, 2), fill="x")
+        ctk.CTkLabel(pg, text="Брони с переходом кварталов в выбранном отчёте",
+                     text_color=ui.COLORS['muted'], font=ui.F_SMALL,
+                     anchor="w").pack(padx=10, pady=(10, 4), fill="x")
         self.dup_text = tk.Text(pg, height=5, wrap="word", state="disabled",
-                                font=("Segoe UI", 10))
-        self.dup_text.pack(padx=10, pady=(0, 10), fill="x")
+                                bg=ui.COLORS['card'], relief="flat",
+                                highlightthickness=1,
+                                highlightbackground=ui.COLORS['line'],
+                                fg=ui.COLORS['text'], font=("Segoe UI", 10))
+        self.dup_text.tag_configure("muted", foreground=ui.COLORS['faint'])
+        self.dup_text.pack(padx=6, pady=(0, 8), fill="x")
+        self.refresh_history()
 
     def refresh_history(self):
+        hotel = None if self.is_admin else ui.HOTEL_NAME[self.user['hotel']]
+        try:
+            with HistoryDB() as db:
+                self._hist_all = [tuple(r) for r in db.list_reports(hotel)]
+        except Exception:
+            log.exception("refresh_history")
+            self._hist_all = []
+        self._apply_hist_filter()
+
+    def _apply_hist_filter(self):
         if not hasattr(self, 'history_tree'):
             return
         for i in self.history_tree.get_children():
             self.history_tree.delete(i)
-        try:
-            with HistoryDB() as db:
-                for r in db.list_reports(
-                        None if self.is_admin else self.user['hotel']):
-                    self.history_tree.insert("", "end", iid=str(r["id"]), values=(
-                        r["id"], r["hotel"], r["quarter"], r["processed_at"],
-                        r["rows"], r["dups"], r["original_name"], r["output_name"]))
-        except Exception:
-            log.exception("refresh_history")
+        q = (self.hist_search.get() or '').strip().lower()
+        for r in self._hist_all:
+            if q and q not in ' '.join(str(x) for x in r).lower():
+                continue
+            hid = {v: k for k, v in ui.HOTEL_NAME.items()}.get(r[1])
+            tags = (f"h_{hid}",) if hid else ()
+            if r[5]:
+                tags += ("dup",)
+            self.history_tree.insert("", "end", iid=str(r[0]), values=r, tags=tags)
 
     def _selected_report_id(self):
         sel = self.history_tree.selection()
@@ -1537,15 +1794,21 @@ class App(ctk.CTk):
         self.dup_text.configure(state="normal")
         self.dup_text.delete("1.0", "end")
         rid = self._selected_report_id()
+        rows = []
         if rid is not None:
             try:
                 with HistoryDB() as db:
-                    for b in db.dup_bookings(rid):
-                        self.dup_text.insert("end",
-                            f"{b['guest'] or '(без ФИО)'}: {b['checkin'] or '—'} … "
-                            f"{b['checkout'] or '—'} — {b['dup_note']}\n")
+                    rows = db.dup_bookings(rid)
             except Exception:
                 log.exception("show_history_dups")
+        if rows:
+            for b in rows:
+                self.dup_text.insert("end",
+                    f"{b['guest'] or '(без ФИО)'}: {b['checkin'] or '—'} … "
+                    f"{b['checkout'] or '—'} — {b['dup_note']}\n")
+        else:
+            self.dup_text.insert("end", "Выберите отчёт в таблице — здесь появятся "
+                                        "строки, пересекающие границу квартала.", "muted")
         self.dup_text.configure(state="disabled")
 
     def open_history_file(self, kind):
@@ -1583,67 +1846,70 @@ class App(ctk.CTk):
             self.show_history_dups()
 
     # ================================================================
-    # НЕРЕРАСПОЗНАННЫЕ ИСТОЧНИКИ (общее для всех отелей)
+    # ОБЩИЙ ЗАПУСК В ФОНЕ
     # ================================================================
-    def _resolve_unrecognized(self, hotel, agents, sources):
-        """Показывает диалог по нераспознанным источникам отеля.
-        Возвращает (agents, source_map); (None, None) — пользователь отменил."""
-        agents = copy.deepcopy(agents)
-        counts = {}
-        for s in sources:
-            s = (s or '').strip()
-            if s:
-                counts[s] = counts.get(s, 0) + 1
-        items = [(s, c) for s, c in counts.items()
-                 if match_agent(s, agents, hotel=hotel)[1] is None]
-        source_map = {}
-        if not items:
-            return agents, source_map
-        log.info("%s: нераспознанных источников: %d", hotel, len(items))
-        names = [a['name'] for a in agents]
-        try:
-            dlg = UnrecognizedSourcesDialog(self, items, names)
-            self.wait_window(dlg)
-        except Exception as e:
-            log.exception("диалог нераспознанных источников")
-            messagebox.showerror("Ошибка",
-                                 f"Не удалось показать диалог источников:\n{e}")
-            return agents, source_map
-        if dlg.result is None:
-            return None, None
-        changed = False
-        for s, res in dlg.result.items():
-            if res[0] == 'agent':
-                for a in agents:
-                    if a['name'] == res[1]:
-                        if s not in a['aliases']:
-                            a['aliases'].append(s)
-                        if hotel not in a['hotels']:
-                            a['hotels'].append(hotel)
-                        changed = True
-                        break
-            elif res[0] == 'new':
-                agents.append({'name': res[1], 'aliases': [s], 'hotels': [hotel],
-                               'rates': [{'from': '', 'to': '', 'pct': res[2]}]})
-                source_map[s] = (res[2], res[1])
-                changed = True
-        if changed:
-            self.cfg['agents'] = agents
-            save_config(self.cfg)
-        return agents, source_map
+    def _run_async(self, btn, work, on_done):
+        btn.configure(state="disabled")
+        self.set_status("Обработка…")
 
-    @staticmethod
-    def _usadba_sources(path):
-        """Колонка «Организация-заказчик» из отчёта UCS Shelter."""
-        wb = App._load_workbook_safe(path)
-        ws = wb[wb.sheetnames[0]]
-        out = []
-        for r in range(1, ws.max_row + 1):
-            state = ws.cell(row=r, column=5).value
-            org = ws.cell(row=r, column=16).value
-            if org and state and str(state).strip() in ('Проживал', 'Сейчас проживает'):
-                out.append(str(org))
-        return out
+        def runner():
+            try:
+                result = work()
+                err = None
+            except Exception as e:
+                log.exception("background work")
+                result, err = None, e
+            self.after(0, lambda: self._finish_async(btn, result, err, on_done))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_async(self, btn, result, err, on_done):
+        btn.configure(state="normal")
+        if err:
+            self.set_status("Ошибка обработки")
+            messagebox.showerror("Ошибка", f"В процессе обработки произошла ошибка:\n{err}")
+            return
+        on_done(result)
+
+    def _start_history(self, hotel, quarter):
+        db = HistoryDB()
+        old = db.find_same(hotel, quarter)
+        if old:
+            replace = messagebox.askyesno(
+                "Отчёт уже есть в истории",
+                f"За квартал {quarter} уже обработан отчёт от {old['processed_at'][:10]}\n"
+                f"(файл: {old['original_name']}).\n\n"
+                f"Заменить его? «Да» — старый удалится, дубли не помечаются.\n"
+                f"«Нет» — старый останется, совпавшие брони будут помечены.")
+            if replace:
+                db.delete_report(old['id'])
+        return db, (lambda rows: db.check_duplicates(hotel, rows))
+
+    def _finish_history(self, db, hotel, quarter, input_paths, output_path,
+                        bookings):
+        orig_name, orig_blob = pack_originals(input_paths)
+        with open(output_path, 'rb') as f:
+            out_blob = f.read()
+        dups = sum(1 for b in bookings if b.get('dup_note'))
+        rid = db.add_report(hotel, quarter, orig_name, orig_blob,
+                            os.path.basename(output_path), out_blob,
+                            len(bookings), dups, "")
+        db.add_bookings(rid, bookings)
+        db.close()
+        self.refresh_history()
+        return dups
+
+    def _show_summary(self, summary, output_path):
+        total = sum(summary.values())
+        if total > 0:
+            msg = f"Файл сохранён, замечаний: {total}.\n\n"
+            for err_name, count in summary.items():
+                if count > 0:
+                    msg += f"• {err_name}: {count}\n"
+            msg += "\nПроблемные ячейки подсвечены цветом. Итоги добавлены в конец таблицы."
+            messagebox.showwarning("Готово (есть замечания)", msg)
+        else:
+            messagebox.showinfo("Успех", f"Файл успешно сохранён без замечаний!\n{output_path}")
 
     # ================================================================
     # ЗАПУСК: ЧАЙКОВСКИЙ
@@ -1679,13 +1945,13 @@ class App(ctk.CTk):
             defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")])
         if not output_path:
             return
-        quarter = self._ask_quarter("Чайковский")
-        if not quarter:
-            return
+        quarter = f"{self.q_vars['tch'][0].get()}-{self.q_vars['tch'][1].get()}"
         tax = self.cfg.get('tax', {}).get('tch')
 
         def work():
             db, checker = self._start_history("Чайковский", quarter)
+            if not self.dup_vars['tch'].get():
+                checker = None
             summary, bookings = self.process_tchaikovsky(
                 data_path, rooms_path, output_path, md, mr,
                 extra_data=ed, dup_checker=checker, tax=tax,
@@ -1697,9 +1963,10 @@ class App(ctk.CTk):
         def done(res):
             summary, out, n, dups = res
             self.set_status(f"Чайковский: готово, строк {n}, дублей {dups} → {os.path.basename(out)}")
+            self.refresh_stats('tch')
             self._show_summary(summary, out)
 
-        self._run_async(self.tch_run_btn, work, done)
+        self._run_async(self.cta_btns['tch'], work, done)
 
     # ================================================================
     # ЗАПУСК: ДОНА
@@ -1731,13 +1998,13 @@ class App(ctk.CTk):
             defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")])
         if not output_path:
             return
-        quarter = self._ask_quarter("Дона")
-        if not quarter:
-            return
+        quarter = f"{self.q_vars['dna'][0].get()}-{self.q_vars['dna'][1].get()}"
         tax = self.cfg.get('tax', {}).get('dna')
 
         def work():
             db, checker = self._start_history("Дона", quarter)
+            if not self.dup_vars['dna'].get():
+                checker = None
             summary, bookings = self.process_dona(
                 data_path, output_path, md, extra_data=ed, dup_checker=checker,
                 tax=tax, agents=agents, source_map=source_map)
@@ -1748,9 +2015,10 @@ class App(ctk.CTk):
         def done(res):
             summary, out, n, dups = res
             self.set_status(f"Дона: готово, строк {n}, дублей {dups} → {os.path.basename(out)}")
+            self.refresh_stats('dna')
             self._show_summary(summary, out)
 
-        self._run_async(self.dna_run_btn, work, done)
+        self._run_async(self.cta_btns['dna'], work, done)
 
     # ================================================================
     # ЗАПУСК: УСАДЬБА
@@ -1775,13 +2043,13 @@ class App(ctk.CTk):
             defaultextension=".xlsx", filetypes=[("Excel файлы", "*.xlsx")])
         if not output_path:
             return
-        quarter = self._ask_quarter("Усадьба")
-        if not quarter:
-            return
+        quarter = f"{self.q_vars['usd'][0].get()}-{self.q_vars['usd'][1].get()}"
         tax = self.cfg.get('tax', {}).get('usd')
 
         def work():
             db, checker = self._start_history("Усадьба", quarter)
+            if not self.dup_vars['usd'].get():
+                checker = None
             stats, bookings = self.process_usadba(report_path, output_path,
                                                   dup_checker=checker, tax=tax,
                                                   agents=agents, source_map=source_map)
@@ -1792,6 +2060,7 @@ class App(ctk.CTk):
         def done(res):
             stats, out, dups = res
             self.set_status(f"Усадьба: готово, строк {stats['rows']}, дублей {dups}")
+            self.refresh_stats('usd')
             msg = (f"Файл успешно сохранён!\n{out}\n\n"
                    f"Обработано записей: {stats['rows']}\n"
                    f"Номеров (комнат): {stats['rooms']}")
@@ -1812,7 +2081,7 @@ class App(ctk.CTk):
             else:
                 messagebox.showinfo("Успех", msg)
 
-        self._run_async(self.usd_run_btn, work, done)
+        self._run_async(self.cta_btns['usd'], work, done)
 
     # ================================================================
     # ЛОГИКА: ЧАЙКОВСКИЙ
