@@ -26,7 +26,7 @@ from db import HistoryDB, set_db_path, default_db_path
 import ui_theme as ui
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.0.1"
 NOT_SET = "— не указано —"
 
 # Тема фиксированно светлая (по требованию пользователя)
@@ -1528,7 +1528,6 @@ class App(ctk.CTk):
         btn = ctk.CTkButton(c2, text="ОБРАБОТАТЬ И СОХРАНИТЬ", height=44,
                             fg_color=ui.COLORS['green'],
                             hover_color=ui.COLORS['green_hover'],
-                            disabled=True,
                             font=("Segoe UI", 14, "bold"), command=run)
         btn.pack(fill="x", padx=16, pady=(0, 16))
         self.cta_btns[pid] = btn
@@ -1549,6 +1548,7 @@ class App(ctk.CTk):
             val.pack(padx=14, pady=(0, 10), anchor="w")
             self.stat_lbs[pid][key] = val
         self.refresh_stats(pid)
+        self._update_cta(pid)
 
     def refresh_stats(self, pid):
         try:

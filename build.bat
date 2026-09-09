@@ -1,6 +1,10 @@
 @echo off
 setlocal
 
+rem --- 0. Clean old artifacts (protection against stale builds) ---
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+
 echo ============================================
 echo   Building the "TurNalog" application
 echo ============================================
