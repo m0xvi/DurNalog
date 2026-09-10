@@ -13,6 +13,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from dialogs import ColumnMapDialog
+from login import LoginWindow
 from settings_window import SettingsWindow
 from theme import COLORS, FONTS, HOTEL_DOT, HOTELS, DB_PATH_DEMO, setup_fonts
 from views import HistoryView, ProcessView
@@ -23,20 +24,29 @@ class TurNalogApp(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=COLORS["bg"])
         setup_fonts()
-
-        self.title("Турналог — обработка данных гостиниц")
-        self.minsize(1100, 700)
-        self.geometry("1240x780")
+        self.withdraw()
+        self.user = None
         self.current_hotel = "chai"
         self._settings = None
         self.nav_items = {}
+        LoginWindow(self)
 
+    def start_main(self, user: dict) -> None:
+        """После успешного входа — собрать главное окно."""
+        self.user = user
+        self.title("Турналог — обработка данных гостиниц")
+        self.minsize(1100, 700)
+        self.geometry("1240x780")
         self._center()
         self._build_sidebar()
         self._build_status()
         self._build_main()
-        self.show_process("chai")
+        first = user.get("hotel_id") or "chai"
+        self.show_process(first)
         self.set_status("Готово к работе")
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     def _center(self) -> None:
         self.update_idletasks()
@@ -85,12 +95,14 @@ class TurNalogApp(ctk.CTk):
         av.pack(side="left")
         meta = ctk.CTkFrame(foot, fg_color="transparent")
         meta.pack(side="left", padx=10)
+        login = (self.user or {}).get("login", "admin")
+        role = (self.user or {}).get("role", "администратор")
         ctk.CTkLabel(
-            meta, text="admin", anchor="w", font=FONTS["sm_b"], text_color="#FFFFFF"
+            meta, text=login, anchor="w", font=FONTS["sm_b"], text_color="#FFFFFF"
         ).pack(anchor="w")
         ctk.CTkLabel(
             meta,
-            text="администратор · GUI",
+            text=f"{role} · GUI",
             anchor="w",
             font=FONTS["xs"],
             text_color="#8FA3C0",
@@ -104,7 +116,10 @@ class TurNalogApp(ctk.CTk):
             text_color=COLORS["sidebar_muted"],
         ).pack(fill="x", padx=20, pady=(16, 6))
 
+        allowed = (self.user or {}).get("hotel_id")
         for hid, h in HOTELS.items():
+            if allowed and hid != allowed:
+                continue
             self._nav_hotel(hid, h["name"], HOTEL_DOT[hid])
 
         sep = ctk.CTkFrame(self.sidebar, height=1, fg_color="#2C3E5C")
@@ -116,12 +131,13 @@ class TurNalogApp(ctk.CTk):
             icon_image("history", COLORS["sidebar_text"]),
             self.show_history,
         )
-        self._nav_action(
-            "settings",
-            "Настройки",
-            icon_image("settings", COLORS["sidebar_text"]),
-            self.open_settings,
-        )
+        if (self.user or {}).get("role") == "администратор":
+            self._nav_action(
+                "settings",
+                "Настройки",
+                icon_image("settings", COLORS["sidebar_text"]),
+                self.open_settings,
+            )
 
     def _nav_hotel(self, hid: str, name: str, color: str) -> None:
         btn = ctk.CTkButton(
@@ -284,6 +300,16 @@ class TurNalogApp(ctk.CTk):
     def hook_save_columns(self, kind: str, mapping: dict) -> None:
         # В бою — сериализация в json/sqlite по отелю.
         _ = (kind, mapping)
+
+    def hook_authenticate(self, login: str, password: str) -> dict | None:
+        """Сюда проверка sqlite/хеша из 2.6. Сейчас: admin/admin."""
+        if login == "admin" and password == "admin":
+            return {"login": "admin", "role": "администратор", "hotel_id": None}
+        if login == "chai_buh" and password == "chai":
+            return {"login": "chai_buh", "role": "отель", "hotel_id": "chai"}
+        if login == "dona_buh" and password == "dona":
+            return {"login": "dona_buh", "role": "отель", "hotel_id": "dona"}
+        return None
 
 
 def main() -> None:

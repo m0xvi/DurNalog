@@ -499,9 +499,51 @@
     font-size: 12.5px; background: #F3F6FA; border: 1px solid var(--line);
     border-radius: 8px; padding: 10px 12px; margin: 8px 0 12px;
   }
+
+  .login-screen {
+    position: absolute; inset: 0; z-index: 50;
+    background: #9AA7B8;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .login-screen.gone { display: none; }
+  .login-win {
+    width: 420px;
+    background: var(--bg);
+    border-radius: 10px;
+    box-shadow: 0 20px 60px rgba(20,30,50,.35);
+    overflow: hidden;
+  }
+  .login-win .titlebar { position: relative; }
+  .login-body { padding: 36px 40px 28px; text-align: center; }
+  .login-body h1 { font-size: 22px; letter-spacing: .12em; font-weight: 700; }
+  .login-body .sub { margin: 6px 0 22px; font-size: 13px; color: var(--muted); }
+  .login-body .input { margin-bottom: 10px; height: 42px; border-radius: 10px; }
+  .login-body .btn-green { width: 100%; height: 42px; margin-top: 6px; border-radius: 10px; font-size: 14px; }
+  .login-db { margin-top: 16px; font-size: 11.5px; color: var(--faint); }
+  .login-hint { margin-top: 8px; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
 </style>
 </head>
 <body>
+<div class="login-screen" id="loginScreen">
+  <div class="login-win">
+    <div class="titlebar">
+      <div class="tb-icon">
+        <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M2 9.5V3.2c0-.4.3-.7.7-.7h2.2c.2 0 .4.1.5.2L7 4h2.3c.4 0 .7.3.7.7v4.8c0 .4-.3.7-.7.7H2.7A.7.7 0 0 1 2 9.5z" fill="#8EC8FF"/></svg>
+      </div>
+      <div class="tb-title">Вход</div>
+      <div class="tb-btns"><span></span><span></span><span></span></div>
+    </div>
+    <div class="login-body">
+      <h1>ТУРНАЛОГ</h1>
+      <div class="sub">Вход в систему</div>
+      <input class="input" id="loginName" placeholder="Логин" />
+      <input class="input" id="loginPass" type="password" placeholder="Пароль" />
+      <button class="btn btn-green" type="button" onclick="doLogin()">Войти</button>
+      <div class="login-db">БД: F:\Desktop\TurNalog\turnalog_history.db</div>
+      <div class="login-hint">Первый запуск: login admin, пароль admin — смените пароль в «Пользователи»</div>
+    </div>
+  </div>
+</div>
 <div class="window" id="app">
   <div class="titlebar">
     <div class="tb-icon">
@@ -1106,7 +1148,16 @@
 
   document.addEventListener("keydown", e => {
     if (e.key === "Escape") { closeSettings(); closeMap(); }
+    if (e.key === "Enter" && !document.getElementById("loginScreen").classList.contains("gone")) doLogin();
   });
+
+  function doLogin() {
+    const u = document.getElementById("loginName").value.trim();
+    const p = document.getElementById("loginPass").value;
+    if (!u || !p) { toast("Введите логин и пароль"); return; }
+    if (!(u === "admin" && p === "admin")) { toast("Неверный логин или пароль"); return; }
+    document.getElementById("loginScreen").classList.add("gone");
+  }
 </script>
 </body>
 </html>
