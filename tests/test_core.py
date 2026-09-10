@@ -104,7 +104,7 @@ def test_db_duplicates(tmp_path):
 def test_dona_end_to_end(tmp_path):
     import pandas as pd
     import openpyxl
-    import main
+    import core
 
     src = os.path.join(str(tmp_path), "dona.csv")
     out = os.path.join(str(tmp_path), "dona.xlsx")
@@ -119,7 +119,7 @@ def test_dona_end_to_end(tmp_path):
         return ["Переход кварталов: тест" if r["guest_norm"] == "иванов иван" else None
                 for r in rows]
 
-    summary, bookings = main.App.process_dona(src, out, dup_checker=checker)
+    summary, bookings = core.process_dona(src, out, dup_checker=checker)
     assert summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] == 2
     assert all(b["dup_note"] for b in bookings)
     ws = openpyxl.load_workbook(out)["Дона"]
@@ -132,7 +132,7 @@ def test_dona_end_to_end(tmp_path):
 def test_tchaikovsky_end_to_end(tmp_path):
     import pandas as pd
     import openpyxl
-    import main
+    import core
 
     src = os.path.join(str(tmp_path), "tch.csv")
     rooms = os.path.join(str(tmp_path), "rooms.csv")
@@ -143,7 +143,7 @@ def test_tchaikovsky_end_to_end(tmp_path):
                 "Категория номера", "№ брони", "Ночей"]).to_csv(src, index=False)
     pd.DataFrame([["Иванов Иван", 12]], columns=["ФИО", "№ комнаты"]).to_csv(rooms, index=False)
 
-    summary, bookings = main.App.process_tchaikovsky(None, src, rooms, out)
+    summary, bookings = core.process_tchaikovsky(src, rooms, out)
     assert summary["Отсутствует Стоимость (ГОЛУБОЙ)"] == 0  # "5 000,00" распознано
     ws = openpyxl.load_workbook(out)["1&2"]
     assert ws["D2"].value == 5000.0
@@ -156,7 +156,7 @@ def test_tchaikovsky_end_to_end(tmp_path):
 
 def test_guess_mapping_renamed_headers():
     from schemas import TCH_DATA_SCHEMA
-    from main import guess_mapping, mapping_valid
+    from core import guess_mapping, mapping_valid
     headers = ["ФИО гостя", "Сумма", "Дата заезда", "Дата выезда",
                "Источник бронирования", "Категория", "ID брони", "Кол-во ночей",
                "Лишняя колонка"]
@@ -174,7 +174,7 @@ def test_guess_mapping_renamed_headers():
 def test_dona_extra_columns_and_custom_mapping(tmp_path):
     import pandas as pd
     import openpyxl
-    import main
+    import core
 
     src = os.path.join(str(tmp_path), "dona2.csv")
     out = os.path.join(str(tmp_path), "dona2.xlsx")
@@ -186,7 +186,7 @@ def test_dona_extra_columns_and_custom_mapping(tmp_path):
     mapping = {"guest": "Гость", "price": "Цена", "checkin": "Прибытие",
                "checkout": "Убытие", "source": "Канал", "category": None,
                "bron": None, "nights": None}
-    summary, bookings = main.App.process_dona(src, out, map_data=mapping,
+    summary, bookings = core.process_dona(src, out, map_data=mapping,
                                               extra_data=["Менеджер"])
     ws = openpyxl.load_workbook(out)["Дона"]
     assert ws["Q1"].value == "Менеджер"          # доп. колонка в шапке
@@ -221,13 +221,13 @@ def test_agent_overrides():
 def test_dona_custom_tax_in_output(tmp_path):
     import pandas as pd
     import openpyxl
-    import main
+    import core
     src = os.path.join(str(tmp_path), "d3.csv")
     out = os.path.join(str(tmp_path), "d3.xlsx")
     pd.DataFrame([["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "островок"]],
                  columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник"]
                  ).to_csv(src, index=False)
-    _, _ = main.App.process_dona(src, out, tax={'rate': 3})
+    _, _ = core.process_dona(src, out, tax={'rate': 3})
     ws = openpyxl.load_workbook(out)["Дона"]
     assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/103*3),2)'
 
@@ -343,13 +343,13 @@ def test_users_db(tmp_path):
 def test_use_full_off(tmp_path):
     import pandas as pd
     import openpyxl
-    import main
+    import core
     src = os.path.join(str(tmp_path), "uf.csv")
     out = os.path.join(str(tmp_path), "uf.xlsx")
     pd.DataFrame([["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "островок"]],
                  columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник"]
                  ).to_csv(src, index=False)
-    _, _ = main.App.process_dona(src, out, tax={'use_full': False})
+    _, _ = core.process_dona(src, out, tax={'use_full': False})
     ws = openpyxl.load_workbook(out)["Дона"]
     # налог от исходной стоимости D, а не от пересчитанной G
     assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,D2/102*2),2)'

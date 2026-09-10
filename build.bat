@@ -63,7 +63,7 @@ echo.
 
 rem --- 5. PyInstaller build ---
 echo [5/5] Building exe (may take a few minutes) ...
-pyinstaller --noconfirm --clean --onedir --windowed --name "TurNalog" --add-data "%CTK_PATH%;customtkinter" --collect-submodules openpyxl main.py
+pyinstaller --noconfirm --clean --onedir --windowed --name "TurNalog" --add-data "%CTK_PATH%;customtkinter" --collect-submodules openpyxl --paths TurNalog_ui main.py
 
 if errorlevel 1 (
     echo.
