@@ -8,7 +8,11 @@ import copy
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, 'frozen', False):
     APP_DIR = os.path.dirname(sys.executable)
-sys.path.insert(0, os.path.join(APP_DIR, 'TurNalog_ui'))
+_GUI_DIR = os.path.join(APP_DIR, 'TurNalog_ui')
+if not os.path.isdir(_GUI_DIR) and getattr(sys, 'frozen', False):
+    # в собранном EXE папка лежит внутри _internal
+    _GUI_DIR = os.path.join(getattr(sys, '_MEIPASS', APP_DIR), 'TurNalog_ui')
+sys.path.insert(0, _GUI_DIR)
 
 import logging
 logging.basicConfig(filename=os.path.join(APP_DIR, 'turnalog.log'),

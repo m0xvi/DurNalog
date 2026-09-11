@@ -37,7 +37,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --onedir --windowed --name "TurNalog"
           --add-data "${{ steps.ctk.outputs.ctk_path }};customtkinter"
-          --collect-submodules openpyxl main.py
+          --collect-submodules openpyxl --paths TurNalog_ui --add-data "TurNalog_ui;TurNalog_ui" main.py
 
       - name: Pack dist
         shell: pwsh
