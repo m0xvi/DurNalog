@@ -75,12 +75,14 @@ class RealAgentsPane(AgentsPane):
             self._select(self.current)
 
     def _by_name(self, name):
-        for a in self.data:
+        for a in getattr(self, 'data', None) or []:
             if a['name'] == name:
                 return a
         return None
 
     def _load_current(self):
+        if not getattr(self, 'data', None):
+            return  # базовый __init__ вызвал метод раньше, чем мы заполнили data
         a = self._by_name(self.current) if self.current else None
         self.name_ent.delete(0, "end")
         if a:
