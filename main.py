@@ -581,15 +581,19 @@ class RealApp(TurNalogApp):
             s = (s or '').strip()
             if s:
                 counts[s] = counts.get(s, 0) + 1
+        decided_none = set(self.cfg.get('source_none', []))
         items = [(s, c) for s, c in counts.items()
-                 if match_agent(s, agents, hotel=code)[1] is None]
+                 if s not in decided_none
+                 and match_agent(s, agents, hotel=code)[1] is None]
+        # ранее оставленные «без подсветки» — сразу в карту с комиссией 0%
+        source_map = {s: (0, '') for s in counts if s in decided_none}
         if not items:
-            return agents, {}
+            return agents, source_map
         dlg = UnrecognizedSourcesDialog(self, items, [a['name'] for a in agents])
         self.wait_window(dlg)
         if dlg.result is None:
             return None, None
-        source_map, changed = {}, False
+        changed = False
         for s, res in dlg.result.items():
             if res[0] == 'agent':
                 for a in agents:
@@ -605,8 +609,16 @@ class RealApp(TurNalogApp):
                                'rates': [{'from': '', 'to': '', 'pct': res[2]}]})
                 source_map[s] = (res[2], res[1])
                 changed = True
+            elif res[0] == 'none':
+                # «— не указано —» = комиссия 0% без подсветки; запоминаем,
+                # чтобы диалог больше не спрашивал про этот источник
+                source_map[s] = (0, '')
+                if s not in decided_none:
+                    decided_none.add(s)
+                    changed = True
         if changed:
             self.cfg['agents'] = agents
+            self.cfg['source_none'] = sorted(decided_none)
             save_config(self.cfg)
         return agents, source_map
 

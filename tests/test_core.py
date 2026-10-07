@@ -356,6 +356,31 @@ def test_use_full_off(tmp_path):
     assert ws["J2"].value == '=D2/I2'
 
 
+def test_source_map_none_no_highlight(tmp_path):
+    """Источник, оставленный «— не указано —» (source_map с 0%), и пустой
+    источник не должны подсвечиваться жёлтым как нераспознанные."""
+    import pandas as pd
+    import openpyxl
+    import core
+    src = os.path.join(str(tmp_path), "dnone.csv")
+    out = os.path.join(str(tmp_path), "dnone.xlsx")
+    pd.DataFrame([
+        ["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "Mystery Channel"],
+        ["Петров Петр", 9000, "01.08.2026", "04.08.2026", ""],
+    ], columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник"]
+    ).to_csv(src, index=False)
+    sm = {"Mystery Channel": (0, "")}
+    summary, _ = core.process_dona(src, out, source_map=sm)
+    assert summary["Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)"] == 0
+    ws = openpyxl.load_workbook(out)["Дона"]
+    for row in (2, 3):
+        assert ws.cell(row=row, column=5).fill.start_color.rgb in (
+            None, "00000000")
+    # а без source_map тот же неизвестный источник подсвечивается
+    summary2, _ = core.process_dona(src, out)
+    assert summary2["Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)"] == 1
+
+
 def test_db_path_override(tmp_path):
     from db import HistoryDB, set_db_path, default_db_path
     p = os.path.join(str(tmp_path), "shared", "x.db")

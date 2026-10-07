@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import zipfile
 from datetime import datetime
 
@@ -100,7 +101,11 @@ def open_in_system(path):
             subprocess.Popen(['xdg-open', path])
     except Exception as e:
         log.exception("open_in_system")
-        messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+        try:
+            from tkinter import messagebox  # лениво: core импортируется и без GUI
+            messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
+        except Exception:
+            pass
 
 
 def pack_originals(paths):
@@ -206,7 +211,8 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
             'commission': commission, 'agent': agent,
-            'unknown_source': (not agent) and bool(source),
+            'unknown_source': ((not agent) and bool(source)
+                               and source not in (source_map or {})),
             'checkin': checkin, 'nights': nights, 'checkout': checkout,
             'source': source, 'category': category, 'room': find_room(guest),
             'extra_vals': extra_vals, 'dup_note': None,
@@ -426,7 +432,9 @@ def process_dona(data_path, output_path, map_data=None,
 
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
-            'commission': commission, 'agent': agent, 'unknown_source': not agent,
+            'commission': commission, 'agent': agent,
+            'unknown_source': ((not agent) and bool(source)
+                               and source not in (source_map or {})),
             'checkin': checkin, 'nights': nights, 'checkout': checkout,
             'source': source, 'category': category,
             'extra_vals': extra_vals, 'dup_note': None,
@@ -666,7 +674,8 @@ def process_usadba( report_path, output_path, dup_checker=None,
             'nights': nights,
             'price': price if price is not None else 0,
             'commission': commission, 'agent': agent,
-            'unknown_source': (not agent) and bool(org_s),
+            'unknown_source': ((not agent) and bool(org_s)
+                               and org_s not in (source_map or {})),
             'tariff': str(tariff).strip() if tariff else '',
             'org': org_s,
             'room': current_room,

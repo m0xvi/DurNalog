@@ -8,6 +8,7 @@ import customtkinter as ctk
 import ui_theme as ui
 
 NOT_SET = "— не указано —"
+NEW_AGENT = "+ новый агент"
 
 class MappingDialog(ctk.CTkToplevel):
     """Выбор соответствия «поле приложения -> колонка файла» + доп. колонки."""
@@ -79,6 +80,7 @@ class MappingDialog(ctk.CTkToplevel):
         self.attributes("-topmost", True)
 
     def auto(self):
+        from core import guess_mapping  # локально: core ничего не знает о диалогах
         g = guess_mapping(self.headers, self.schema)
         for key, var in self.vars.items():
             var.set(g.get(key) or NOT_SET)
