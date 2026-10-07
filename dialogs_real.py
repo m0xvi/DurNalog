@@ -7,8 +7,7 @@ import customtkinter as ctk
 
 import ui_theme as ui
 
-NOT_SET = "— не указано —"
-NEW_AGENT = "+ новый агент"
+from dialogs_common import NOT_SET, NEW_AGENT  # noqa: F401  (реэкспорт)
 
 class MappingDialog(ctk.CTkToplevel):
     """Выбор соответствия «поле приложения -> колонка файла» + доп. колонки."""
@@ -102,7 +101,8 @@ class MappingDialog(ctk.CTkToplevel):
 
 class UnrecognizedSourcesDialog(ctk.CTkToplevel):
     """Для каждого нераспознанного источника: сопоставить с агентом,
-    создать нового агента (сохранится глобально) или оставить 0%."""
+    создать нового агента (сохранится глобально) или оставить 0%.
+    Поле со списком — с живым поиском: начните вводить название."""
 
     def __init__(self, master, items, agent_names):
         super().__init__(master)
@@ -111,18 +111,19 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         self.resizable(False, True)
         self.transient(master)
         self.result = None
+        self.agent_names = list(agent_names)
 
         ctk.CTkLabel(self, text="Нераспознанные источники",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 2))
         ctk.CTkLabel(self, text="Укажите, к кому отнести источники. Выбор сохранится "
                                 "и в следующий раз вопрос не появится.\n«— не указано —» "
-                                "= комиссия 0% без подсветки ошибки.",
+                                "= комиссия 0% без подсветки ошибки. "
+                                "Начните вводить название — список отфильтруется.",
                      text_color="gray").pack(padx=20)
 
         sc = ctk.CTkScrollableFrame(self, fg_color=("gray88", "gray17"))
         sc.pack(fill="both", expand=True, padx=15, pady=8)
 
-        opts = [NOT_SET] + agent_names + [NEW_AGENT]
         self.rows = {}
         for src, cnt in items:
             fr = ctk.CTkFrame(sc, fg_color="transparent")
@@ -130,8 +131,14 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
             ctk.CTkLabel(fr, text=f"{src}   (строк: {cnt})", width=330, anchor="w",
                          justify="left", font=ctk.CTkFont(size=12)).pack(side="left")
             var = tk.StringVar(value=NOT_SET)
-            ctk.CTkOptionMenu(fr, variable=var, values=opts, width=230,
-                              command=lambda v, s=src: self._toggle(s)).pack(side="left", padx=6)
+            combo = ctk.CTkComboBox(fr, variable=var, width=230,
+                                    values=self._full_opts(),
+                                    command=lambda v, s=src: self._picked(s))
+            combo.pack(side="left", padx=6)
+            # ввод идёт во внутреннее Entry (есть в 5.x и 6.x) — биндимся на него,
+            # т.к. события клавиш не всплывают до фрейма комбобокса
+            entry = getattr(combo, "_entry", combo)
+            entry.bind("<KeyRelease>", lambda e, s=src: self._on_type(s, e))
             new_fr = ctk.CTkFrame(fr, fg_color="transparent")
             name_var = tk.StringVar()
             comm_var = tk.StringVar()
@@ -141,7 +148,7 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
             ctk.CTkEntry(new_fr, textvariable=comm_var, width=50, height=26,
                          placeholder_text="%",
                          font=ctk.CTkFont(size=11)).pack(side="left")
-            self.rows[src] = dict(var=var, new_fr=new_fr,
+            self.rows[src] = dict(var=var, combo=combo, new_fr=new_fr,
                                   name_var=name_var, comm_var=comm_var)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -155,6 +162,33 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         self.focus_force()
         self.attributes("-topmost", True)
 
+    def _full_opts(self):
+        return [NOT_SET] + self.agent_names + [NEW_AGENT]
+
+    def _picked(self, src):
+        """Выбор пункта из списка: вернуть полный список и показать/скрыть
+        поля нового агента."""
+        self.rows[src]['combo'].configure(values=self._full_opts())
+        self._toggle(src)
+
+    def _on_type(self, src, event):
+        """Живой поиск при вводе: фильтрует список и раскрывает его."""
+        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Escape', 'Return',
+                            'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
+                            'Alt_L', 'Alt_R', 'Caps_Lock'):
+            return
+        from dialogs_common import filter_agent_options
+        r = self.rows[src]
+        r['combo'].configure(
+            values=filter_agent_options(r['var'].get(), self.agent_names))
+        try:
+            # приватный API, одинаковый в customtkinter 5.x и 6.x;
+            # если не сработает — пользователь раскроет список стрелкой
+            r['combo']._open_dropdown_menu()
+        except Exception:
+            pass
+        self._toggle(src)
+
     def _toggle(self, src):
         r = self.rows[src]
         if r['var'].get() == NEW_AGENT:
@@ -163,12 +197,13 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
             r['new_fr'].pack_forget()
 
     def ok(self):
+        from dialogs_common import resolve_agent_choice
         result = {}
         for src, r in self.rows.items():
-            choice = r['var'].get()
-            if choice == NOT_SET:
+            res = resolve_agent_choice(r['var'].get(), self.agent_names)
+            if res[0] == 'none':
                 result[src] = ('none',)
-            elif choice == NEW_AGENT:
+            elif res[0] == 'new':
                 name = r['name_var'].get().strip()
                 if not name:
                     messagebox.showerror("Новый агент",
@@ -183,8 +218,14 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
                                          parent=self)
                     return
                 result[src] = ('new', name, comm)
+            elif res[0] == 'agent':
+                result[src] = ('agent', res[1])
             else:
-                result[src] = ('agent', choice)
+                messagebox.showerror(
+                    "Нераспознанные источники",
+                    f"«{res[1]}» нет в списке агентов.\n"
+                    f"Выберите агента из списка или «{NEW_AGENT}».",
+                    parent=self)
+                return
         self.result = result
         self.destroy()
-

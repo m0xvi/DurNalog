@@ -381,6 +381,27 @@ def test_source_map_none_no_highlight(tmp_path):
     assert summary2["Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)"] == 1
 
 
+def test_source_dialog_search():
+    from dialogs_common import (NOT_SET, NEW_AGENT, filter_agent_options,
+                                resolve_agent_choice)
+    names = ['Островок', 'Отель Онлайн', 'Броневик', 'Яндекс']
+    # фильтр: подстрока без учёта регистра, служебные пункты на месте
+    assert filter_agent_options('', names) == [NOT_SET] + names + [NEW_AGENT]
+    assert filter_agent_options('ост', names) == [NOT_SET, 'Островок', NEW_AGENT]
+    assert filter_agent_options('ОТЕЛ', names) == [NOT_SET, 'Отель Онлайн', NEW_AGENT]
+    assert filter_agent_options('xxx', names) == [NOT_SET, NEW_AGENT]
+    # разрешение выбора
+    assert resolve_agent_choice(NOT_SET, names) == ('none',)
+    assert resolve_agent_choice('  ', names) == ('none',)
+    assert resolve_agent_choice(NEW_AGENT, names) == ('new',)
+    assert resolve_agent_choice('Броневик', names) == ('agent', 'Броневик')
+    assert resolve_agent_choice('броневик', names) == ('agent', 'Броневик')
+    assert resolve_agent_choice('Яндекс', names) == ('agent', 'Яндекс')
+    assert resolve_agent_choice('бронь', names)[0] == 'unknown'
+    # «о» подходит сразу нескольким -> неоднозначность, а не угадайка
+    assert resolve_agent_choice('о', ['Островок', 'Броневик'])[0] == 'unknown'
+
+
 def test_db_path_override(tmp_path):
     from db import HistoryDB, set_db_path, default_db_path
     p = os.path.join(str(tmp_path), "shared", "x.db")
