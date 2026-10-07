@@ -1,4 +1,4 @@
-# DurNalog (TurNalog) — v3.1
+# DurNalog (TurNalog) — v3.2
 
 Интерфейс — дизайнерский пакет `TurNalog_ui/` (customtkinter),
 боевая логика — `core.py`/`db.py`/`agents.py`/`tax.py`, связка — `main.py`

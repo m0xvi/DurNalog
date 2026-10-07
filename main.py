@@ -38,7 +38,7 @@ from core import (read_table, read_headers, guess_mapping, mapping_valid,
 from dialogs_real import MappingDialog, UnrecognizedSourcesDialog
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
