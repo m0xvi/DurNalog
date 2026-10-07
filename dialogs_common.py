@@ -5,15 +5,15 @@ NOT_SET = "— не указано —"
 NEW_AGENT = "+ новый агент"
 
 
-def filter_agent_options(query, agent_names):
+def filter_agent_options(query, agent_names, limit=30):
     """Живой поиск для диалога источников: подстрока без учёта регистра.
-    Пустой запрос -> полный список.
-    Возвращает [NOT_SET] + совпадения + [NEW_AGENT]."""
+    Пустой запрос -> полный список (без лимита).
+    Возвращает [NOT_SET] + совпадения (не более limit) + [NEW_AGENT]."""
     q = (query or '').strip().lower()
     if not q or q == NOT_SET.lower():
         hits = list(agent_names)
     else:
-        hits = [n for n in agent_names if q in n.lower()]
+        hits = [n for n in agent_names if q in n.lower()][:limit]
     return [NOT_SET] + hits + [NEW_AGENT]
 
 

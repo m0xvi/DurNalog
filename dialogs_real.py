@@ -118,7 +118,8 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="Укажите, к кому отнести источники. Выбор сохранится "
                                 "и в следующий раз вопрос не появится.\n«— не указано —» "
                                 "= комиссия 0% без подсветки ошибки. "
-                                "Начните вводить название — список отфильтруется.",
+                                "Начните вводить название и откройте список стрелкой или клавишей ↓ — "
+                                "он уже отфильтрован.",
                      text_color="gray").pack(padx=20)
 
         sc = ctk.CTkScrollableFrame(self, fg_color=("gray88", "gray17"))
@@ -172,26 +173,73 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         self._toggle(src)
 
     def _on_type(self, src, event):
-        """Живой поиск при вводе: фильтрует список и раскрывает его."""
-        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Escape', 'Return',
-                            'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
-                            'Alt_L', 'Alt_R', 'Caps_Lock'):
+        """Ввод в поле: ↓ открывает отфильтрованный список, остальные
+        печатаемые клавиши — обновляют фильтр с задержкой (debounce).
+        Меню НЕ переоткрывается при вводе: на Windows открытое меню
+        перехватывает клавиатуру, и поле «виснет» после первого символа."""
+        if event.keysym == 'Down':
+            self._cancel_filter(src)
+            self._open_menu(src)
             return
-        from dialogs_common import filter_agent_options
+        if event.keysym in ('Up', 'Left', 'Right', 'Escape', 'Return',
+                            'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
+                            'Alt_L', 'Alt_R', 'Caps_Lock', 'Num_Lock',
+                            'Home', 'End', 'Prior', 'Next'):
+            return
         r = self.rows[src]
-        r['combo'].configure(
-            values=filter_agent_options(r['var'].get(), self.agent_names))
+        self._cancel_filter(src)
         try:
-            # приватный API, одинаковый в customtkinter 5.x и 6.x;
-            # если не сработает — пользователь раскроет список стрелкой
-            r['combo']._open_dropdown_menu()
+            r['filter_job'] = self.after(120, lambda: self._apply_filter(src))
         except Exception:
             pass
         self._toggle(src)
 
+    def _cancel_filter(self, src):
+        r = self.rows.get(src) or {}
+        job = r.pop('filter_job', None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+
+    def _apply_filter(self, src):
+        """Применить фильтр к списку, не трогая фокус и не открывая меню."""
+        r = self.rows.get(src)
+        if r is None:
+            return
+        r.pop('filter_job', None)
+        try:
+            from dialogs_common import filter_agent_options
+            if not self.winfo_exists():
+                return
+            r['combo'].configure(
+                values=filter_agent_options(r['var'].get(), self.agent_names))
+        except Exception:
+            pass
+
+    def _open_menu(self, src):
+        """Раскрыть список с текущим фильтром (для клавиши ↓)."""
+        r = self.rows.get(src)
+        if r is None:
+            return
+        try:
+            from dialogs_common import filter_agent_options
+            r['combo'].configure(
+                values=filter_agent_options(r['var'].get(), self.agent_names))
+            opener = getattr(r['combo'], '_open_dropdown_menu', None)
+            if opener is not None:
+                opener()  # приватный API, одинаковый в 5.x и 6.x
+        except Exception:
+            pass
+
     def _toggle(self, src):
         r = self.rows[src]
-        if r['var'].get() == NEW_AGENT:
+        show = r['var'].get() == NEW_AGENT
+        if show == r.get('new_shown', False):
+            return  # уже в нужном состоянии — не дёргаем layout
+        r['new_shown'] = show
+        if show:
             r['new_fr'].pack(side="left")
         else:
             r['new_fr'].pack_forget()

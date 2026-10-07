@@ -263,16 +263,26 @@ def test_direct_channels_and_custom_agents():
     assert m("Бронирование из шахматки (По звонку)") == (0, direct)
     assert m("Бронирование из шахматки (Email)") == (0, direct)
     # действительно неизвестные — остаются нераспознанными (пойдут в диалог)
-    assert m("Ozon (new)")[1] is None
-    assert m("HotelBook")[1] is None
-    assert m("Acase.ru (ООО \"АОН.РУ\")")[1] is None
-    assert m("Roomlink (Zabroniryi.ru)")[1] is None
-    assert m("OneTwoTrip")[1] is None
-    assert m("Trip.com Group")[1] is None
+    # агенты из отчёта Q3 2026 — встроены в таблицу Доны
+    assert m("Ozon (new)") == (15, 'Ozon Travel')
+    assert m("Ozon Travel") == (15, 'Ozon Travel')
+    assert m("HotelBook") == (15, 'HotelBook')
+    assert m('Acase.ru (ООО "АОН.РУ")') == (20, 'Академсервис')
+    assert m("Roomlink (Zabroniryi.ru)") == (18, 'Эй энд Эй (ЦБП)')
+    assert m("OneTwoTrip") == (15, 'OneTwoTrip')
+    assert m("Trip.com Group") == (15, 'Trip.com')
+    assert m("Агрегатор каналов Comfort Booking") == (15, 'Туту.ру')
+    # юрнаименования из того же отчёта — синонимы существующих агентов
+    assert m('ООО "Система Алеан"') == (15, 'Алеан Отдых')
+    assert m('ООО "Пегас СПб"') == (15, 'Хомлин Лэнд (Pegas)')
+    assert m('ООО "Туроператор Дельфин"') == (15, 'Дельфин')
+    assert m('ООО "Бронирование гостиниц"') == (15, 'Островок')
+    assert m('ООО "Компания Броневик"') == (20, 'Броневик')
+    assert m('ООО "Академ Онлайн"') == (20, 'Академсервис')
     assert m("Бронирование из шахматки (Туроператор)")[1] is None
     # кастомный агент, добавленный пользователем
-    cust = [{'name': 'Ozon Travel', 'commission': 15, 'aliases': ['ozon']}]
-    assert m("Ozon (new)", None, None, cust) == (15, 'Ozon Travel')
+    cust = [{'name': 'Extra Channel', 'commission': 12, 'aliases': ['extraxyz']}]
+    assert m("ExtraXYZ booking", None, None, cust) == (12, 'Extra Channel')
 
 
 def test_floating_rates_by_date():
@@ -295,8 +305,10 @@ def test_agents_hotel_filter():
     from agents import default_agents, match_agent
     agents = default_agents()
     # агент Усадьбы не распознаётся в Доне и наоборот
-    assert match_agent("Комфорт Букинг", agents, hotel='dna')[1] is None
-    assert match_agent("Комфорт Букинг", agents, hotel='usd')[1] is not None
+    assert match_agent("Свена Тур", agents, hotel='dna')[1] is None
+    assert match_agent("Свена Тур", agents, hotel='usd')[1] is not None
+    # а «Комфорт Букинг» в Доне резолвится через Туту.ру (агрегатор каналов)
+    assert match_agent("Комфорт Букинг", agents, hotel='dna')[1] == 'Туту.ру'
     # у Чайковского свой Островок
     assert match_agent("Ostrovok.ru", agents, hotel='tch')[1] is not None
     assert match_agent("Ostrovok.ru", agents, hotel='dna')[1] == 'Островок'
@@ -305,7 +317,7 @@ def test_agents_hotel_filter():
 def test_import_export_roundtrip(tmp_path):
     from agents import default_agents, export_agents, import_agents
     agents = default_agents()
-    agents.append({'name': 'Ozon Travel', 'aliases': ['ozon'], 'hotels': ['dna'],
+    agents.append({'name': 'Extra Channel', 'aliases': ['extraxyz'], 'hotels': ['dna'],
                    'rates': [{'from': '', 'to': '31.03.2026', 'pct': 12},
                              {'from': '01.04.2026', 'to': '', 'pct': 15}]})
     p_x = str(tmp_path / "agents.xlsx")
@@ -314,9 +326,9 @@ def test_import_export_roundtrip(tmp_path):
     export_agents(agents, p_c)
     for p in (p_x, p_c):
         back = import_agents(p)
-        oz = next(a for a in back if a['name'] == 'Ozon Travel')
+        oz = next(a for a in back if a['name'] == 'Extra Channel')
         assert len(oz['rates']) == 2 and oz['rates'][1]['pct'] == 15
-        assert 'ozon' in oz['aliases']
+        assert 'extraxyz' in oz['aliases']
         ost = next(a for a in back if a['name'] == 'Островок')
         assert ost['rates'][0]['pct'] == 15
 
@@ -390,6 +402,9 @@ def test_source_dialog_search():
     assert filter_agent_options('ост', names) == [NOT_SET, 'Островок', NEW_AGENT]
     assert filter_agent_options('ОТЕЛ', names) == [NOT_SET, 'Отель Онлайн', NEW_AGENT]
     assert filter_agent_options('xxx', names) == [NOT_SET, NEW_AGENT]
+    many = ['Агент %03d' % i for i in range(100)]
+    assert filter_agent_options('агент', many) == [NOT_SET] + many[:30] + [NEW_AGENT]
+    assert filter_agent_options('', many) == [NOT_SET] + many + [NEW_AGENT]
     # разрешение выбора
     assert resolve_agent_choice(NOT_SET, names) == ('none',)
     assert resolve_agent_choice('  ', names) == ('none',)
