@@ -71,6 +71,12 @@ HOTELS = {
         "rate": "2.0",
         "min_night": "100.0",
         "threshold": "5100.0",
+        "tax_in_price": True,
+        "auto_threshold": True,
+        "tax_no_commission": False,
+        "formula_daily": "={P}/{N}",
+        "formula_method": "=IF({R}>={T},\"ставка\",\"мин.ставка\")",
+        "formula_tax": "=ROUND(IF({M}=\"мин.ставка\",{N}*{min},{P}/{div}*{rate}),2)",
     },
     "dona": {
         "id": "dona",
@@ -91,6 +97,12 @@ HOTELS = {
         "rate": "2.0",
         "min_night": "100.0",
         "threshold": "5100.0",
+        "tax_in_price": True,
+        "auto_threshold": True,
+        "tax_no_commission": False,
+        "formula_daily": "={P}/{N}",
+        "formula_method": "=IF({R}>={T},\"ставка\",\"мин.ставка\")",
+        "formula_tax": "=ROUND(IF({M}=\"мин.ставка\",{N}*{min},{P}/{div}*{rate}),2)",
     },
     "usadba": {
         "id": "usadba",
@@ -111,6 +123,12 @@ HOTELS = {
         "rate": "2.0",
         "min_night": "100.0",
         "threshold": "5100.0",
+        "tax_in_price": True,
+        "auto_threshold": True,
+        "tax_no_commission": False,
+        "formula_daily": "={P}/{N}",
+        "formula_method": "=IF({R}>={T},\"ставка\",\"мин.ставка\")",
+        "formula_tax": "=ROUND(IF({M}=\"мин.ставка\",{N}*{min},{P}/{div}*{rate}),2)",
     },
 }
 

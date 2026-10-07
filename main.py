@@ -38,7 +38,7 @@ from core import (read_table, read_headers, guess_mapping, mapping_valid,
 from dialogs_real import MappingDialog, UnrecognizedSourcesDialog
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -454,10 +454,12 @@ class RealApp(TurNalogApp):
             h['rate'] = f"{tp.rate:g}"
             h['min_night'] = f"{tp.min:g}"
             h['threshold'] = f"{tp.threshold:g}"
-        tp = TaxParams(self.cfg.get('tax', {}).get('chai'))
-        theme.FORMULAS['daily'] = tp.tpl_daily
-        theme.FORMULAS['method'] = tp.tpl_method
-        theme.FORMULAS['tax'] = tp.tpl_tax
+            h['tax_in_price'] = tp.incl
+            h['auto_threshold'] = tp.auto
+            h['tax_no_commission'] = tp.use_full
+            h['formula_daily'] = tp.tpl_daily
+            h['formula_method'] = tp.tpl_method
+            h['formula_tax'] = tp.tpl_tax
         theme.AGENTS[:] = [a['name'] for a in migrate_agents(self.cfg)]
 
     def _build_main(self):

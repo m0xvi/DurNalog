@@ -54,9 +54,9 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
             grid, 2, "Порог метода «ставка»", "суточная ставка, ₽", h["threshold"]
         )
 
-        self.tax_in_price = tk.BooleanVar(value=True)
-        self.auto_threshold = tk.BooleanVar(value=True)
-        self.tax_no_commission = tk.BooleanVar(value=True)
+        self.tax_in_price = tk.BooleanVar(value=h.get("tax_in_price", True))
+        self.auto_threshold = tk.BooleanVar(value=h.get("auto_threshold", True))
+        self.tax_no_commission = tk.BooleanVar(value=h.get("tax_no_commission", False))
 
         for var, title, sub in (
             (
@@ -72,7 +72,7 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
             (
                 self.tax_no_commission,
                 "Считать налог от стоимости без комиссии",
-                "База = 100% цены до агентского процента",
+                "Только для файлов с нетто-ценами (база = 100% цены гостя)",
             ),
         ):
             row = ctk.CTkFrame(
@@ -115,11 +115,11 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
             border_width=1,
             border_color=COLORS["line"],
         )
-        box, self.f_daily = labeled_entry(self.adv, "Сут. ставка", FORMULAS["daily"], mono=True)
+        box, self.f_daily = labeled_entry(self.adv, "Сут. ставка", h.get("formula_daily", FORMULAS["daily"]), mono=True)
         box.pack(fill="x", padx=14, pady=(12, 6))
-        box, self.f_method = labeled_entry(self.adv, "Метод", FORMULAS["method"], mono=True)
+        box, self.f_method = labeled_entry(self.adv, "Метод", h.get("formula_method", FORMULAS["method"]), mono=True)
         box.pack(fill="x", padx=14, pady=6)
-        box, self.f_tax = labeled_entry(self.adv, "Налог", FORMULAS["tax"], mono=True)
+        box, self.f_tax = labeled_entry(self.adv, "Налог", h.get("formula_tax", FORMULAS["tax"]), mono=True)
         box.pack(fill="x", padx=14, pady=6)
         ctk.CTkLabel(
             self.adv,

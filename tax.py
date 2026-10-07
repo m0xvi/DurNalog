@@ -87,7 +87,9 @@ DEFAULT_TAX = {
     'min_per_night': 100, # минимальный налог, руб/сутки
     'threshold': 5100,    # порог суточной ставки для метода «ставка»
     'incl': True,         # налог включён в стоимость (делитель 100+rate)
-    'use_full': True,     # налог от стоимости БЕЗ комиссии (пересчитанной в 100%)
+    'use_full': False,    # ВЫКЛ: налог от стоимости как в документе (цена гостя).
+                          # Включать, только если файл содержит НЕТТО-цены, —
+                          # тогда база восстанавливается до 100% (Стоимость/(100-К)*100)
     'auto_threshold': True,  # порог считается автоматически
     # Шаблоны Excel-формул. Плейсхолдеры: {P} цена, {N} ночей, {R} сут.ставка,
     # {M} метод, {T} порог, {min} минимум, {rate} ставка, {div} делитель.
@@ -111,7 +113,7 @@ class TaxParams:
         self.min = float(d['min_per_night'])
         self.incl = bool(d['incl'])
         self.auto = bool(d['auto_threshold'])
-        self.use_full = bool(d.get('use_full', True))
+        self.use_full = bool(d.get('use_full', False))
         self.threshold = (self.auto_threshold() if self.auto
                           else float(d['threshold']))
         self.tpl_daily = d['tpl_daily']
