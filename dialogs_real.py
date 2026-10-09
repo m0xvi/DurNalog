@@ -119,7 +119,7 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="Укажите, к кому отнести источники. Выбор сохранится "
                                 "и в следующий раз вопрос не появится.\n«— не указано —» "
                                 "= комиссия 0% без подсветки ошибки. "
-                                "«+ новый агент»: имя подставится из источника — впишите только %.\n"
+                                "«+ новый агент»: имя возьмётся из левой колонки — впишите только %.\n"
                                 "Начните вводить название и откройте список стрелкой или клавишей ↓ — "
                                 "он уже отфильтрован.",
                      text_color="gray", wraplength=900).pack(padx=20)
@@ -145,18 +145,13 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
             entry = getattr(combo, "_entry", combo)
             entry.bind("<KeyRelease>", lambda e, s=src: self._on_type(s, e))
             new_fr = ctk.CTkFrame(fr, fg_color="transparent")
-            name_var = tk.StringVar(value=src)
             comm_var = tk.StringVar()
-            ctk.CTkEntry(new_fr, textvariable=name_var, width=140, height=26,
-                         placeholder_text="Имя агента",
-                         font=ctk.CTkFont(size=11)).pack(side="left", padx=(6, 3))
-            comm_entry = ctk.CTkEntry(new_fr, textvariable=comm_var, width=50, height=26,
+            comm_entry = ctk.CTkEntry(new_fr, textvariable=comm_var, width=60, height=26,
                                       placeholder_text="%",
                                       font=ctk.CTkFont(size=11))
-            comm_entry.pack(side="left")
+            comm_entry.pack(side="left", padx=(6, 0))
             self.rows[src] = dict(var=var, combo=combo, new_fr=new_fr,
-                                  name_var=name_var, comm_var=comm_var,
-                                  comm_entry=comm_entry)
+                                  comm_var=comm_var, comm_entry=comm_entry)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(pady=(0, 12))
@@ -264,7 +259,7 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
                 result[src] = ('none',)
             elif res[0] == 'new':
                 good, name, comm, err = validate_new_agent(
-                    src, r['name_var'].get(), r['comm_var'].get())
+                    src, src, r['comm_var'].get())
                 if not good:
                     messagebox.showerror("Новый агент", err, parent=self)
                     return

@@ -28,10 +28,13 @@ def test_empty_name_mentions_source():
     assert ok is False and 'ООО "Интернет решения"' in err
 
 
-def test_number_as_name_gives_smart_hint():
-    ok, _, _, err = v('src', '17', '')
-    assert ok is False
-    assert 'похоже на комиссию' in err and '«%»' in err
+def test_name_is_source_no_field_mentioned():
+    # диалог передаёт источник как имя; в ошибках нет ссылок на поле имени
+    ok, name, comm, _ = v('ООО Ромашка', 'ООО Ромашка', '17')
+    assert (ok, name, comm) == (True, 'ООО Ромашка', 17.0)
+    ok, _, _, err = v('17', '17', '')
+    assert ok is False and 'укажите комиссию числом' in err
+    assert 'Имя агента' not in err
 
 
 def test_garbage_commission():
