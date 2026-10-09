@@ -192,7 +192,7 @@ def test_dona_extra_columns_and_custom_mapping(tmp_path):
     assert ws["Q1"].value == "Менеджер"          # доп. колонка в шапке
     assert ws["Q2"].value == "Менеджер"          # значение перенесено
     assert ws["D2"].value == 8500
-    assert ws["E2"].value == 15                  # островок распознан
+    assert ws["E2"].value == 16  # островок распознан: 16% с 01.08.2026 (заезд 01.08)
     assert summary["Отсутствует Стоимость (ГОЛУБОЙ)"] == 0
 
 
@@ -273,9 +273,9 @@ def test_direct_channels_and_custom_agents():
     assert m("Trip.com Group") == (15, 'Trip.com')
     assert m("Агрегатор каналов Comfort Booking") == (15, 'Туту.ру')
     # юрнаименования из того же отчёта — синонимы существующих агентов
-    assert m('ООО "Система Алеан"') == (15, 'Алеан Отдых')
-    assert m('ООО "Пегас СПб"') == (15, 'Хомлин Лэнд (Pegas)')
-    assert m('ООО "Туроператор Дельфин"') == (15, 'Дельфин')
+    assert m('ООО "Система Алеан"') == (0, 'Алеан Отдых')  # СКИДКА
+    assert m('ООО "Пегас СПб"') == (0, 'Хомлин Лэнд (Pegas)')  # СКИДКА
+    assert m('ООО "Туроператор Дельфин"') == (0, 'Туроператор Дельфин')  # СКИДКА
     assert m('ООО "Бронирование гостиниц"') == (15, 'Островок')
     assert m('ООО "Компания Броневик"') == (20, 'Броневик')
     assert m('ООО "Академ Онлайн"') == (20, 'Академсервис')
@@ -436,6 +436,32 @@ def test_default_tax_base_is_full_price(tmp_path):
     assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
     assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
     assert ws["J2"].value == '=G2/I2'
+
+
+def test_discount_zero_and_ostrovok_float():
+    """СКИДКА по договору -> 0% во всех отелях; Островок +1 п.п. с 01.08.2026."""
+    from agents import default_agents, match_agent
+    from datetime import date
+    agents = default_agents()
+    assert match_agent("Pegas", agents, hotel="dna") == (0, "Хомлин Лэнд (Pegas)")
+    assert match_agent("Пегас", agents, hotel="tch")[0] == 0
+    assert match_agent("PEGAS", agents, hotel="usd") == (0, "PEGAS [Усадьба]")
+    assert match_agent("Алеан", agents, hotel="dna") == (0, "Алеан Отдых")
+    assert match_agent("Алеан", agents, hotel="tch")[0] == 0
+    assert match_agent("Алеан", agents, hotel="usd") == (0, "ООО Система Алеан [Усадьба]")
+    assert match_agent("ООО Туроператор Дельфин", agents, hotel="dna") == (0, "Туроператор Дельфин")
+    assert match_agent("ООО Туроператор Дельфин", agents, hotel="tch")[0] == 0
+    assert match_agent("Дельфин", agents, hotel="usd") == (0, "ООО Туроператор Дельфин [Усадьба]")
+    # обычный Дельфин (Дельфин-Центр) остался платным
+    assert match_agent("Дельфин", agents, hotel="dna") == (15, "Дельфин")
+    assert match_agent("Дельфин-Центр", agents, hotel="tch") == (15, 'ООО "Дельфин-Центр" [Чайковский]')
+    # Островок: 15 до 31.07.2026, 16 с 01.08.2026 (Дона и Чайковский)
+    assert match_agent("Ostrovok.ru", agents, date=date(2026, 7, 31), hotel="dna") == (15, "Островок")
+    assert match_agent("Ostrovok.ru", agents, date=date(2026, 8, 1), hotel="dna") == (16, "Островок")
+    assert match_agent("Ostrovok.ru", agents, date=date(2026, 7, 15), hotel="tch")[0] == 15
+    assert match_agent("Ostrovok.ru", agents, date=date(2026, 8, 15), hotel="tch")[0] == 16
+    # Усадьба — свой договор 18%, документ его не меняет
+    assert match_agent("Ostrovok.ru", agents, date=date(2026, 8, 15), hotel="usd")[0] == 18
 
 
 def test_db_path_override(tmp_path):
