@@ -107,8 +107,9 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
     def __init__(self, master, items, agent_names):
         super().__init__(master)
         self.title("Нераспознанные источники")
-        self.geometry("720x540")
-        self.resizable(False, True)
+        self.geometry("940x560")
+        self.resizable(True, True)
+        self.minsize(720, 420)
         self.transient(master)
         self.result = None
         self.agent_names = list(agent_names)
@@ -118,9 +119,10 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="Укажите, к кому отнести источники. Выбор сохранится "
                                 "и в следующий раз вопрос не появится.\n«— не указано —» "
                                 "= комиссия 0% без подсветки ошибки. "
+                                "«+ новый агент»: имя подставится из источника — впишите только %.\n"
                                 "Начните вводить название и откройте список стрелкой или клавишей ↓ — "
                                 "он уже отфильтрован.",
-                     text_color="gray").pack(padx=20)
+                     text_color="gray", wraplength=900).pack(padx=20)
 
         sc = ctk.CTkScrollableFrame(self, fg_color=("gray88", "gray17"))
         sc.pack(fill="both", expand=True, padx=15, pady=8)
@@ -129,28 +131,32 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         for src, cnt in items:
             fr = ctk.CTkFrame(sc, fg_color="transparent")
             fr.pack(fill="x", pady=3, padx=6)
-            ctk.CTkLabel(fr, text=f"{src}   (строк: {cnt})", width=330, anchor="w",
-                         justify="left", font=ctk.CTkFont(size=12)).pack(side="left")
+            fr.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(fr, text=f"{src}   (строк: {cnt})", anchor="w",
+                         justify="left",
+                         font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky="ew")
             var = tk.StringVar(value=NOT_SET)
             combo = ctk.CTkComboBox(fr, variable=var, width=230,
                                     values=self._full_opts(),
                                     command=lambda v, s=src: self._picked(s))
-            combo.pack(side="left", padx=6)
+            combo.grid(row=0, column=1, padx=6, sticky="e")
             # ввод идёт во внутреннее Entry (есть в 5.x и 6.x) — биндимся на него,
             # т.к. события клавиш не всплывают до фрейма комбобокса
             entry = getattr(combo, "_entry", combo)
             entry.bind("<KeyRelease>", lambda e, s=src: self._on_type(s, e))
             new_fr = ctk.CTkFrame(fr, fg_color="transparent")
-            name_var = tk.StringVar()
+            name_var = tk.StringVar(value=src)
             comm_var = tk.StringVar()
             ctk.CTkEntry(new_fr, textvariable=name_var, width=140, height=26,
                          placeholder_text="Имя агента",
                          font=ctk.CTkFont(size=11)).pack(side="left", padx=(6, 3))
-            ctk.CTkEntry(new_fr, textvariable=comm_var, width=50, height=26,
-                         placeholder_text="%",
-                         font=ctk.CTkFont(size=11)).pack(side="left")
+            comm_entry = ctk.CTkEntry(new_fr, textvariable=comm_var, width=50, height=26,
+                                      placeholder_text="%",
+                                      font=ctk.CTkFont(size=11))
+            comm_entry.pack(side="left")
             self.rows[src] = dict(var=var, combo=combo, new_fr=new_fr,
-                                  name_var=name_var, comm_var=comm_var)
+                                  name_var=name_var, comm_var=comm_var,
+                                  comm_entry=comm_entry)
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(pady=(0, 12))
@@ -171,6 +177,11 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
         поля нового агента."""
         self.rows[src]['combo'].configure(values=self._full_opts())
         self._toggle(src)
+        if self.rows[src].get('new_shown'):
+            try:
+                self.rows[src]['comm_entry'].focus_set()
+            except Exception:
+                pass
 
     def _on_type(self, src, event):
         """Ввод в поле: ↓ открывает отфильтрованный список, остальные
@@ -240,30 +251,22 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
             return  # уже в нужном состоянии — не дёргаем layout
         r['new_shown'] = show
         if show:
-            r['new_fr'].pack(side="left")
+            r['new_fr'].grid(row=0, column=2, sticky="e")
         else:
-            r['new_fr'].pack_forget()
+            r['new_fr'].grid_remove()
 
     def ok(self):
-        from dialogs_common import resolve_agent_choice
+        from dialogs_common import resolve_agent_choice, validate_new_agent
         result = {}
         for src, r in self.rows.items():
             res = resolve_agent_choice(r['var'].get(), self.agent_names)
             if res[0] == 'none':
                 result[src] = ('none',)
             elif res[0] == 'new':
-                name = r['name_var'].get().strip()
-                if not name:
-                    messagebox.showerror("Новый агент",
-                                         f"Для «{src}» укажите имя нового агента.",
-                                         parent=self)
-                    return
-                try:
-                    comm = float(r['comm_var'].get().strip().replace(',', '.'))
-                except ValueError:
-                    messagebox.showerror("Новый агент",
-                                         f"Для «{name}» укажите комиссию числом.",
-                                         parent=self)
+                good, name, comm, err = validate_new_agent(
+                    src, r['name_var'].get(), r['comm_var'].get())
+                if not good:
+                    messagebox.showerror("Новый агент", err, parent=self)
                     return
                 result[src] = ('new', name, comm)
             elif res[0] == 'agent':

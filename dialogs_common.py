@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Общая логика диалогов без GUI-зависимостей (можно тестировать без tkinter)."""
+import re
 
 NOT_SET = "— не указано —"
 NEW_AGENT = "+ новый агент"
@@ -36,3 +37,35 @@ def resolve_agent_choice(choice, agent_names):
     if len(sub) == 1:
         return ('agent', sub[0])
     return ('unknown', c)
+
+
+def _looks_number(text):
+    return re.fullmatch(r'\d+([.,]\d+)?', (text or '').strip()) is not None
+
+
+def validate_new_agent(src, name, comm_raw):
+    """Проверка полей «+ новый агент».
+
+    Возвращает (ok, имя, комиссия, текст_ошибки).
+    ok=True  -> (True, имя, комиссия_float, '')
+    ok=False -> (False, '', 0.0, сообщение для messagebox)
+    """
+    src = (src or '').strip()
+    name = (name or '').strip()
+    raw = (comm_raw or '').strip()
+    if raw.endswith('%'):
+        raw = raw[:-1].strip()
+    if not name:
+        return False, '', 0.0, f'Для «{src}» укажите имя нового агента.'
+    try:
+        comm = float(raw.replace(',', '.'))
+    except ValueError:
+        if raw == '' and _looks_number(name):
+            return False, '', 0.0, (
+                f'«{name}» похоже на комиссию, а не на название.\n'
+                f'Введите название агента в поле «Имя агента», '
+                f'а {name} — в поле «%».')
+        return False, '', 0.0, f'Для «{name}» укажите комиссию числом.'
+    if not 0 <= comm <= 100:
+        return False, '', 0.0, f'Комиссия «{name}» должна быть от 0 до 100%.'
+    return True, name, comm, ''
