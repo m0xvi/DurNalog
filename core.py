@@ -6,12 +6,15 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import openpyxl
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils.datetime import from_excel
 
 from agents import default_agents, match_agent, norm_key
 from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
@@ -38,6 +41,283 @@ def clean_guest_names(text):
     return re.sub(r'\d+\.\s*', '', str(text)).strip()
 
 
+class WorkbookReadError(Exception):
+    """Файл Excel не читается: понятное пользователю описание + что делать."""
+
+
+# Кэш починок: abspath -> (mtime, fixed_path, notes). Временные копии лежат
+# в системном temp, переиспользуются, пока исходник не изменился, и не
+# удаляются (их чистит сама ОС) — repair может вызываться многократно.
+_REPAIR_CACHE = {}
+
+_ILLEGAL_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def _fix_short_rgb(text):
+    def fix_rgb(m):
+        v = m.group(1)
+        return f'rgb="{v.rjust(8, "0")}"' if len(v) < 8 else m.group(0)
+    return re.sub(r'rgb="([0-9A-Fa-f]{1,8})"', fix_rgb, text)
+
+
+def _build_styles(numfmts, numfmt_ids):
+    """Минимальный валидный styles.xml с заданными форматами чисел.
+
+    Чтение ЗНАЧЕНИЙ (включая распознавание дат) зависит только от
+    соответствия xf -> numFmtId, поэтому точность данных сохраняется.
+    numfmts: [(id>=164, raw_formatCode)], numfmt_ids: [numFmtId по порядку xf].
+    """
+    numfmts_xml = ''.join(
+        f'<numFmt numFmtId="{i}" formatCode="{c}"/>' for i, c in numfmts)
+    cellxfs_xml = ''.join(
+        f'<xf numFmtId="{n}" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        for n in numfmt_ids)
+    out = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<numFmts count="{len(numfmts)}">{numfmts_xml}</numFmts>'
+        '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/>'
+        '</border></borders>'
+        '<cellStyleXfs count="1">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        f'<cellXfs count="{len(numfmt_ids)}">{cellxfs_xml}</cellXfs>'
+        '<cellStyles count="1">'
+        '<cellStyle name="Обычный" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>')
+    ET.fromstring(out)
+    return out.encode('utf-8')
+
+
+def _max_sheet_xf(work):
+    """Максимальный индекс стиля s="N" в ячейках листов (для tier 4–5)."""
+    top = 0
+    for n, data in work.items():
+        if n.startswith('xl/worksheets/') and n.endswith('.xml'):
+            try:
+                txt = data.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+            for mm in re.finditer(r'<c\b[^>]*?\ss="(\d+)"', txt):
+                top = max(top, int(mm.group(1)))
+    return min(top, 4096)
+
+
+def _salvage_parts(styles_text):
+    """Вытянуть из битого styles.xml (numfmts, numfmt_ids) или None."""
+    m = re.search(r'<cellXfs[^>]*>(.*?)</cellXfs>', styles_text, re.S)
+    if not m:
+        return None
+    xf_attrs = re.findall(r'<xf\b([^>]*?)/?>', m.group(1))
+    if not xf_attrs:
+        return None
+    numfmt_ids = []
+    for a in xf_attrs:
+        mm = re.search(r'numFmtId="(\d+)"', a)
+        numfmt_ids.append(int(mm.group(1)) if mm else 0)
+    numfmts = []
+    for fm in re.finditer(r'<numFmt\b([^>]*?)/?>', styles_text):
+        idm = re.search(r'numFmtId="(\d+)"', fm.group(1))
+        cdm = re.search(r'formatCode="([^"]*)"', fm.group(1))
+        # встроенные форматы (<164) openpyxl знает сам, спасаем только свои
+        if idm and cdm and int(idm.group(1)) >= 164:
+            numfmts.append((int(idm.group(1)), cdm.group(1)))
+    return numfmts, numfmt_ids
+
+
+def repair_workbook(path):
+    """Вернуть (читаемый_путь, notes) для битого xlsx.
+
+    Уровни (каждый следующий включает предыдущие правки):
+    1. короткий rgb в цветах; 2. чистка styles.xml от управляющих символов;
+    3. чистка всех xml-частей; 4. пересборка styles.xml с сохранением
+    форматов чисел/дат; 5. минимальные стили (даты могли пострадать).
+    Уровни 1–3 без потерь и молчаливые (только в лог), 4–5 дают заметку
+    пользователю. Бросает WorkbookReadError, если файл безнадёжен.
+    """
+    apath = os.path.abspath(path)
+    try:
+        mtime = os.path.getmtime(apath)
+    except OSError:
+        raise WorkbookReadError(
+            f'Файл «{os.path.basename(path)}» не найден или недоступен.')
+    cached = _REPAIR_CACHE.get(apath)
+    if cached and cached[0] == mtime and os.path.exists(cached[1]):
+        return cached[1], cached[2]
+    if not zipfile.is_zipfile(apath):
+        raise WorkbookReadError(
+            f'Файл «{os.path.basename(path)}» не является книгой Excel (.xlsx): '
+            'внутри нет zip-архива. Возможно, это старый .xls, HTML-выгрузка или CSV '
+            'с расширением .xlsx. Откройте файл в Excel и сохраните как '
+            '«Книга Excel (*.xlsx)», затем повторите.')
+    try:
+        with zipfile.ZipFile(apath) as z:
+            items = {n: z.read(n) for n in z.namelist()}
+    except Exception as e:
+        raise WorkbookReadError(
+            f'Не удалось открыть «{os.path.basename(path)}» как архив: {e}')
+    base = os.path.basename(path)
+    first_err = None
+
+    def probe(items_map):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+            for name, data in items_map.items():
+                z.writestr(name, data)
+        raw = buf.getvalue()
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        wb.close()
+        return raw
+
+    def finish(raw, notes):
+        fd, tmp = tempfile.mkstemp(prefix='Turnalog_fix_', suffix='.xlsx')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+        res = (tmp, notes)
+        _REPAIR_CACHE[apath] = (mtime, tmp, notes)
+        return res
+
+    def attempt(work):
+        nonlocal first_err
+        try:
+            return probe(work)
+        except Exception as e:
+            first_err = first_err or e
+            return None
+
+    sname = next((n for n in items if n.lower().endswith('styles.xml')), None)
+    work = dict(items)
+
+    # Tier 1: короткий rgb (старый кейс PMS-выгрузок).
+    if sname:
+        try:
+            work[sname] = _fix_short_rgb(work[sname].decode('utf-8')).encode('utf-8')
+        except UnicodeDecodeError:
+            pass
+    raw = attempt(work)
+    if raw is not None:
+        log.info('Починка %s: короткий rgb', base)
+        return finish(raw, [])
+
+    # Tier 2: запрещённые управляющие символы в styles.xml.
+    if sname:
+        try:
+            txt = work[sname].decode('utf-8')
+        except UnicodeDecodeError:
+            txt = None
+        if txt is not None:
+            work[sname] = _ILLEGAL_XML_CHARS.sub('', txt).encode('utf-8')
+            raw = attempt(work)
+            if raw is not None:
+                log.info('Починка %s: чистка styles.xml', base)
+                return finish(raw, [])
+
+    # Tier 3: чистка всех xml-частей архива.
+    for n in list(work):
+        if n.lower().endswith('.xml'):
+            try:
+                work[n] = _ILLEGAL_XML_CHARS.sub(
+                    '', work[n].decode('utf-8')).encode('utf-8')
+            except UnicodeDecodeError:
+                pass
+    raw = attempt(work)
+    if raw is not None:
+        log.info('Починка %s: чистка всех xml', base)
+        return finish(raw, [])
+
+    # Tier 4: пересборка styles.xml с сохранением форматов чисел/дат.
+    if sname:
+        try:
+            parts = _salvage_parts(items[sname].decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            parts = None
+        if parts is not None:
+            numfmts, ids = parts
+            need = _max_sheet_xf(work) + 1
+            if len(ids) < need:  # страховка от рассинхрона индексов
+                ids = ids + [0] * (need - len(ids))
+            try:
+                work[sname] = _build_styles(numfmts, ids)
+            except Exception as e:
+                first_err = first_err or e
+                work[sname] = items[sname]
+                raw = None
+            else:
+                raw = attempt(work)
+            if raw is not None:
+                log.warning('Починка %s: стили пересобраны', base)
+                return finish(raw, [
+                    f'Файл «{base}» открыт после восстановления '
+                    '(стили были повреждены). Даты и числа сохранены; '
+                    'рекомендуем пересохранить файл в Excel.'])
+
+    # Tier 5: минимальные стили — даты могли прочитаться как числа.
+    if sname:
+        need = _max_sheet_xf(work) + 1
+        work[sname] = _build_styles([], [0] * need)
+        raw = attempt(work)
+        if raw is not None:
+            log.warning('Починка %s: минимальные стили', base)
+            return finish(raw, [
+                f'Файл «{base}» СИЛЬНО повреждён: открыт с потерей стилей, '
+                'даты могли прочитаться как числа — ПРОВЕРЬТЕ результат. Обязательно '
+                'пересохраните файл в Excel (Файл → Сохранить как) и обработайте заново.'])
+
+    raise WorkbookReadError(
+        f'Файл «{base}» повреждён и не открывается. Откройте его в Excel — обычно Excel '
+        'предлагает восстановить такой файл, — сохраните заново (Файл → Сохранить как → '
+        f'Книга Excel *.xlsx) и повторите. Подробности: {first_err}')
+
+
+def repair_notes_for(paths):
+    """Заметки о восстановлении файлов (для финального диалога)."""
+    out = []
+    for p in paths:
+        try:
+            apath = os.path.abspath(p)
+        except Exception:
+            continue
+        cached = _REPAIR_CACHE.get(apath)
+        if cached:
+            for n in cached[2]:
+                if n not in out:
+                    out.append(n)
+    return out
+
+
+def excel_serial_to_dt(v):
+    """Excel-сериал (float при сломанных стилях) -> datetime.
+
+    Нечисла возвращаются как есть; числа вне диапазона 2015–2035
+    считаются мусором и дают None.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return v
+    try:
+        dt = from_excel(float(v))
+    except Exception:
+        return None
+    return dt if 2015 <= dt.year <= 2035 else None
+
+
+def parse_usd_dt(v):
+    """Дата ячейки усадебного отчёта: datetime / Excel-сериал / текст."""
+    if isinstance(v, datetime):
+        return v
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return excel_serial_to_dt(v)
+    s = str(v).strip()
+    for fmt in ('%d.%m.%Y %H:%M', '%d.%m.%Y %H:%M:%S', '%d.%m.%Y'):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def read_table(path, nrows=None):
     """Чтение .xlsx/.csv с автоподбором кодировки для CSV."""
     if str(path).lower().endswith('.csv'):
@@ -48,7 +328,13 @@ def read_table(path, nrows=None):
             except UnicodeDecodeError as e:
                 last_err = e
         raise ValueError(f"Не удалось определить кодировку CSV: {last_err}")
-    return pd.read_excel(path, nrows=nrows)
+    try:
+        return pd.read_excel(path, nrows=nrows)
+    except WorkbookReadError:
+        raise
+    except Exception:
+        fixed, _notes = repair_workbook(path)
+        return pd.read_excel(fixed, nrows=nrows)
 
 
 def read_headers(path):
@@ -171,8 +457,10 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     for _, row in df_data.iterrows():
         guest = clean_guest_names(get(row, 'guest'))
 
-        checkin = pd.to_datetime(get(row, 'checkin'), dayfirst=True, errors='coerce')
-        checkout = pd.to_datetime(get(row, 'checkout'), dayfirst=True, errors='coerce')
+        checkin = pd.to_datetime(excel_serial_to_dt(get(row, 'checkin')),
+                                 dayfirst=True, errors='coerce')
+        checkout = pd.to_datetime(excel_serial_to_dt(get(row, 'checkout')),
+                                  dayfirst=True, errors='coerce')
         checkin = None if pd.isna(checkin) else checkin.to_pydatetime()
         checkout = None if pd.isna(checkout) else checkout.to_pydatetime()
 
@@ -393,8 +681,10 @@ def process_dona(data_path, output_path, map_data=None,
     for _, row in df_data.iterrows():
         guest = clean_guest_names(get(row, 'guest'))
 
-        checkin = pd.to_datetime(get(row, 'checkin'), dayfirst=True, errors='coerce')
-        checkout = pd.to_datetime(get(row, 'checkout'), dayfirst=True, errors='coerce')
+        checkin = pd.to_datetime(excel_serial_to_dt(get(row, 'checkin')),
+                                 dayfirst=True, errors='coerce')
+        checkout = pd.to_datetime(excel_serial_to_dt(get(row, 'checkout')),
+                                  dayfirst=True, errors='coerce')
         checkin = None if pd.isna(checkin) else checkin.to_pydatetime()
         checkout = None if pd.isna(checkout) else checkout.to_pydatetime()
 
@@ -573,26 +863,11 @@ def process_dona(data_path, output_path, map_data=None,
 def load_workbook_safe(path):
     try:
         return openpyxl.load_workbook(path, data_only=True)
+    except WorkbookReadError:
+        raise
     except Exception:
-        with zipfile.ZipFile(path) as z:
-            items = {n: z.read(n) for n in z.namelist()}
-        styles_name = 'xl/styles.xml'
-        if styles_name in items:
-            styles = items[styles_name].decode('utf-8')
-
-            def fix_rgb(m):
-                v = m.group(1)
-                return f'rgb="{v.rjust(8, "0")}"' if len(v) < 8 else m.group(0)
-
-            styles = re.sub(r'rgb="([0-9A-Fa-f]{1,8})"', fix_rgb, styles)
-            items[styles_name] = styles.encode('utf-8')
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
-            for name, data in items.items():
-                z.writestr(name, data)
-        buf.seek(0)
-        return openpyxl.load_workbook(buf, data_only=True)
+        fixed, _notes = repair_workbook(path)
+        return openpyxl.load_workbook(fixed, data_only=True)
 
 
 def process_usadba( report_path, output_path, dup_checker=None,
@@ -605,18 +880,6 @@ def process_usadba( report_path, output_path, dup_checker=None,
 
     valid_states = ('Проживал', 'Сейчас проживает')
 
-    def parse_dt(v):
-        if isinstance(v, datetime):
-            return v
-        if v is None:
-            return None
-        s = str(v).strip()
-        for fmt in ('%d.%m.%Y %H:%M', '%d.%m.%Y %H:%M:%S', '%d.%m.%Y'):
-            try:
-                return datetime.strptime(s, fmt)
-            except ValueError:
-                continue
-        return None
 
     records = []
     rooms = set()
@@ -643,8 +906,8 @@ def process_usadba( report_path, output_path, dup_checker=None,
         org = ws_in.cell(row=r, column=16).value
         org_s = '' if org is None else str(org).strip()
 
-        dt_in = parse_dt(checkin_raw)
-        dt_out = parse_dt(checkout_raw)
+        dt_in = parse_usd_dt(checkin_raw)
+        dt_out = parse_usd_dt(checkout_raw)
 
         if dt_in and dt_out:
             nights = max(1, (dt_out.date() - dt_in.date()).days)

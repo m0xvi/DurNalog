@@ -35,14 +35,15 @@ from db import HistoryDB, set_db_path, default_db_path
 from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
-                  process_dona, process_usadba, usadba_sources)
+                  process_dona, process_usadba, usadba_sources,
+                  repair_notes_for)
 from dialogs_real import MappingDialog, UnrecognizedSourcesDialog
 from updater import (UpdateError, check_for_updates, download_release,
                      is_frozen, launch_install, plan_install, staging_dir,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.11"
+APP_VERSION = "3.12"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -801,9 +802,14 @@ class RealApp(TurNalogApp):
             self.history_view.refresh()
             self.set_status(f"{hname}: готово → {os.path.basename(dest_path)}")
             total = sum(summary.values()) if isinstance(summary, dict) else 0
-            if total > 0:
-                msg = f"Файл сохранён, замечаний: {total}.\n\n"
-                msg += "\n".join(f"• {k}: {v}" for k, v in summary.items() if v)
+            rep = repair_notes_for([p for p in (data_path, rooms_path) if p])
+            if total > 0 or rep:
+                msg = f"Файл сохранён, замечаний: {total}.\n\n" if total > 0 \
+                    else "Файл сохранён.\n\n"
+                if total > 0:
+                    msg += "\n".join(f"• {k}: {v}" for k, v in summary.items() if v)
+                if rep:
+                    msg += ("\n\n" if total > 0 else "") + "\n".join(f"• {n}" for n in rep)
                 messagebox.showwarning("Готово (есть замечания)", msg, parent=self)
             else:
                 self.toast("Файл сохранён без замечаний")
