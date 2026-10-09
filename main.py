@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import copy
+from datetime import datetime
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, 'frozen', False):
@@ -36,9 +37,12 @@ from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources)
 from dialogs_real import MappingDialog, UnrecognizedSourcesDialog
+from updater import (UpdateError, check_for_updates, download_release,
+                     is_frozen, launch_install, plan_install, staging_dir,
+                     verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.10"
+APP_VERSION = "3.11"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -442,6 +446,9 @@ class RealApp(TurNalogApp):
     def __init__(self):
         super().__init__()
         self.cfg = load_config()
+        self.app_version = APP_VERSION
+        self._update_info = None
+        self._update_plan = None
         self.slot_state = {}
         self._sync_theme()
 
@@ -468,7 +475,83 @@ class RealApp(TurNalogApp):
         self.process_view = RealProcessView(self.main, self)
         self.history_view = RealHistoryView(self.main, self)
 
+    # ---------- автообновление ----------
+    def start_main(self, user):
+        super().start_main(user)
+        try:
+            if self.cfg.get("updates", {}).get("auto_check", True):
+                self.after(2500, self._auto_update_check)
+        except Exception:
+            pass
+
+    def _auto_update_check(self):
+        threading.Thread(target=self._auto_update_worker, daemon=True).start()
+
+    def _auto_update_worker(self):
+        try:
+            info = check_for_updates(self.app_version)
+            err = None
+        except UpdateError as e:
+            info, err = None, str(e)
+        except Exception as e:  # noqa: BLE001
+            info, err = None, f"Неожиданная ошибка: {e}"
+        try:
+            self.after(0, lambda: self._auto_update_done(info, err))
+        except Exception:
+            pass
+
+    def _auto_update_done(self, info, err):
+        if err or info is None:
+            return  # тихая проверка: молчим и при ошибке, и при «нет обновлений»
+        self._update_info = info
+        uc = self.cfg.setdefault("updates", {})
+        uc["last_check"] = datetime.now().isoformat(timespec="seconds")
+        uc["last_version"] = info.version
+        save_config(self.cfg)
+        self.set_status(f"Доступна версия {info.version} — Настройки → Обновления")
+        try:
+            self.toast(f"Доступна версия {info.version}")
+        except Exception:
+            pass
+        if uc.get("auto_download") and is_frozen() and os.name == "nt":
+            threading.Thread(target=self._auto_download_worker,
+                             args=(info,), daemon=True).start()
+
+    def _auto_download_worker(self, info):
+        try:
+            zp = download_release(info, staging_dir(info.tag))
+            verify_package(zp)
+            plan = plan_install(zp)
+            err = None
+        except UpdateError as e:
+            plan, err = None, str(e)
+        except Exception as e:  # noqa: BLE001
+            plan, err = None, f"Неожиданная ошибка: {e}"
+        try:
+            self.after(0, lambda: self._auto_download_done(info, plan, err))
+        except Exception:
+            pass
+
+    def _auto_download_done(self, info, plan, err):
+        if err or plan is None:
+            self.set_status(f"Автообновление не удалось: {err}")
+            return
+        self._update_plan = plan
+        self.set_status(f"Версия {info.version} загружена — Настройки → Обновления")
+        if messagebox.askyesno(
+                "Обновление загружено",
+                f"Версия {info.version} загружена автоматически.\n\n"
+                "Установить сейчас? Приложение перезапустится.",
+                parent=self):
+            try:
+                launch_install(plan)
+            except UpdateError as e:
+                messagebox.showerror("Обновление", str(e), parent=self)
+                return
+            self.destroy()
+
     # ---------- данные истории ----------
+
     def history_rows(self):
         hotel = None if self.user.get('role') == 'администратор' \
             else theme.HOTELS[self.user['hotel_id']]['name']

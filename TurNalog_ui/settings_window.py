@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import tkinter as tk
 import tkinter.ttk as ttk
+import webbrowser
 from tkinter import filedialog, messagebox
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -24,6 +27,17 @@ from widgets import DangerGhost
 
 if TYPE_CHECKING:
     from app import TurNalogApp
+
+
+try:  # в живом приложении корневые модули импортируются; в стенде GUI — нет
+    from updater import (REPO, UpdateError, app_dir as _upd_app_dir,
+                         check_for_updates, download_release, is_frozen,
+                         launch_install, plan_install, staging_dir,
+                         verify_package)
+    _UPDATER_OK = True
+except Exception:
+    _UPDATER_OK = False
+    REPO = "m0xvi/DurNalog"
 
 
 def _f(name: str):
@@ -526,6 +540,306 @@ class DataPane(ctk.CTkFrame):
         self.path_ent.insert(0, DB_PATH_DEMO)
         self.path_ent.configure(state="disabled")
 
+class UpdatesPane(ctk.CTkFrame):
+    """Проверка и установка обновлений с GitHub Releases."""
+
+    def __init__(self, master, app: "TurNalogApp"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self._info = None
+        self._plan = None
+        self._busy = False
+
+        ctk.CTkLabel(self, text="Обновления приложения", anchor="w",
+                     font=_f("h2"), text_color=COLORS["text"]).pack(anchor="w", pady=(0, 10))
+
+        card = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=10,
+                            border_width=1, border_color=COLORS["line"])
+        card.pack(fill="x", pady=(0, 12))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=12)
+
+        cur = getattr(app, "app_version", "?")
+        frozen = _UPDATER_OK and is_frozen()
+        build = "собранная версия (EXE)" if frozen else "запуск из исходников"
+        ctk.CTkLabel(inner, text=f"Текущая версия:  {cur}   ·   {build}",
+                     anchor="w", font=_f("ui"), text_color=COLORS["text"]).pack(anchor="w")
+        self.status_lbl = ctk.CTkLabel(inner, text="Нажмите «Проверить сейчас».",
+                                       anchor="w", font=_f("sm"), text_color=COLORS["muted"])
+        self.status_lbl.pack(anchor="w", pady=(4, 0))
+        last = (self._upd_cfg().get("last_check") or "")[:16].replace("T", " ")
+        if last:
+            ctk.CTkLabel(inner, text=f"Последняя проверка: {last}",
+                         anchor="w", font=_f("xs"),
+                         text_color=COLORS["muted"]).pack(anchor="w")
+
+        ctk.CTkLabel(self, text="Что нового в найденной версии:", anchor="w",
+                     font=_f("xs_b"), text_color=COLORS["muted"]).pack(anchor="w", pady=(0, 4))
+        self.notes = ctk.CTkTextbox(self, height=90, wrap="word",
+                                    border_color=COLORS["line"], fg_color="#FFFFFF")
+        self.notes.pack(fill="x", pady=(0, 12))
+        self.notes.insert("0.0", "—")
+        self.notes.configure(state="disabled")
+
+        self.prog = ctk.CTkProgressBar(self, height=10)
+        self.prog.set(0)
+        self.prog_lbl = ctk.CTkLabel(self, text="", anchor="w",
+                                     font=_f("xs"), text_color=COLORS["muted"])
+
+        self.btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_row.pack(fill="x", pady=(0, 12))
+        self.check_btn = PrimaryButton(self.btn_row, "Проверить сейчас",
+                                       command=self._check, width=170)
+        self.check_btn.pack(side="left", padx=(0, 8))
+        self.install_btn = GreenButton(self.btn_row, "Скачать и установить",
+                                       command=self._install, width=210, height=32)
+        self.install_btn.pack(side="left", padx=8)
+        self.install_btn.configure(state="disabled")
+        GhostButton(self.btn_row, "Страница релиза",
+                    command=self._open_page, width=150).pack(side="left", padx=8)
+
+        opts = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=10,
+                            border_width=1, border_color=COLORS["line"])
+        opts.pack(fill="x")
+        oinner = ctk.CTkFrame(opts, fg_color="transparent")
+        oinner.pack(fill="x", padx=16, pady=12)
+        cfg = self._upd_cfg()
+        self.auto_check_var = tk.BooleanVar(value=cfg.get("auto_check", True))
+        self.auto_dl_var = tk.BooleanVar(value=cfg.get("auto_download", False))
+        first = True
+        for var, title, sub in (
+            (self.auto_check_var, "Проверять обновления при запуске",
+             "Тихая проверка; при находке — уведомление в приложении"),
+            (self.auto_dl_var, "Скачивать обновление автоматически",
+             "Файл загрузится сам, установка — кнопкой после перезапуска"),
+        ):
+            ctk.CTkCheckBox(oinner, text=title, variable=var, font=_f("ui_b"),
+                            text_color=COLORS["text"], fg_color=COLORS["accent"],
+                            border_color=COLORS["line"],
+                            command=self._save_opts).pack(anchor="w", pady=(0 if first else 8, 0))
+            first = False
+            ctk.CTkLabel(oinner, text=sub, anchor="w", font=_f("xs"),
+                         text_color=COLORS["muted"]).pack(anchor="w", padx=(28, 0))
+        if not _UPDATER_OK:
+            self._status("Модуль обновления недоступен в этом окружении.", err=True)
+            self.check_btn.configure(state="disabled")
+        elif not frozen:
+            ctk.CTkLabel(self, text="Установка из приложения доступна только в собранной EXE-версии.",
+                         anchor="w", font=_f("xs"),
+                         text_color=COLORS["muted"]).pack(anchor="w", pady=(8, 0))
+
+    # ----- конфиг -----
+    def _upd_cfg(self):
+        cfg = getattr(self.app, "cfg", None)
+        if not isinstance(cfg, dict):
+            return {}
+        return cfg.setdefault("updates", {})
+
+    def _save_cfg(self):
+        cfg = getattr(self.app, "cfg", None)
+        if not isinstance(cfg, dict):
+            return
+        try:
+            from config_io import save_config
+        except Exception:
+            return
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+
+    def _save_opts(self):
+        if not isinstance(getattr(self.app, "cfg", None), dict):
+            return
+        uc = self._upd_cfg()
+        uc["auto_check"] = bool(self.auto_check_var.get())
+        uc["auto_download"] = bool(self.auto_dl_var.get())
+        self._save_cfg()
+
+    def _touch_last_check(self, version=None):
+        if not isinstance(getattr(self.app, "cfg", None), dict):
+            return
+        from datetime import datetime
+        uc = self._upd_cfg()
+        uc["last_check"] = datetime.now().isoformat(timespec="seconds")
+        if version:
+            uc["last_version"] = version
+        self._save_cfg()
+
+    # ----- UI-хелперы (только из главного потока) -----
+    def _status(self, text, err=False):
+        try:
+            self.status_lbl.configure(
+                text=text, text_color=COLORS["red"] if err else COLORS["muted"])
+        except Exception:
+            pass
+
+    def _set_notes(self, text):
+        try:
+            self.notes.configure(state="normal")
+            self.notes.delete("0.0", "end")
+            self.notes.insert("0.0", (text or "").strip()[:2000] or "—")
+            self.notes.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _show_progress(self, show):
+        try:
+            if show:
+                self.prog.pack(fill="x", pady=(0, 4), before=self.btn_row)
+                self.prog_lbl.pack(fill="x", pady=(0, 8), before=self.btn_row)
+            else:
+                self.prog.pack_forget()
+                self.prog_lbl.pack_forget()
+        except Exception:
+            pass
+
+    def _ui(self, fn):
+        def wrap():
+            try:
+                if self.winfo_exists():
+                    fn()
+            except Exception:
+                pass
+        try:
+            self.after(0, wrap)
+        except Exception:
+            pass
+
+    # ----- проверка -----
+    def _check(self):
+        if self._busy or not _UPDATER_OK:
+            return
+        self._busy = True
+        self.check_btn.configure(state="disabled")
+        self.install_btn.configure(state="disabled")
+        self._status("Проверка обновлений…")
+        cur = getattr(self.app, "app_version", "?")
+        threading.Thread(target=self._check_worker, args=(cur,), daemon=True).start()
+
+    def _check_worker(self, cur):
+        try:
+            info = check_for_updates(cur)
+            err = None
+        except UpdateError as e:
+            info, err = None, str(e)
+        except Exception as e:  # noqa: BLE001
+            info, err = None, f"Неожиданная ошибка: {e}"
+        self._ui(lambda: self._check_done(info, err))
+
+    def _check_done(self, info, err):
+        self._busy = False
+        self.check_btn.configure(state="normal")
+        if err:
+            self._status(err, err=True)
+            return
+        self._touch_last_check(info.version if info else None)
+        if info is None:
+            self._status("У вас последняя версия.")
+            self._set_notes("—")
+            return
+        self._info = info
+        self._plan = None
+        self.install_btn.configure(text="Скачать и установить")
+        self._set_notes(info.notes)
+        try:
+            writable = os.access(_upd_app_dir(), os.W_OK)
+        except Exception:
+            writable = True
+        if not (is_frozen() and os.name == "nt"):
+            self._status(f"Доступна версия {info.version} ({info.tag}). "
+                         "Установка — только в EXE-версии.")
+        elif not writable:
+            self._status(f"Доступна версия {info.version}, но нет прав на запись "
+                         "в папку программы.", err=True)
+        else:
+            self._status(f"Доступна версия {info.version} ({info.tag}).")
+            self.install_btn.configure(state="normal")
+
+    # ----- установка -----
+    def _install(self):
+        if self._busy or self._info is None:
+            return
+        if self._plan is not None:
+            self._ask_restart()
+            return
+        self._busy = True
+        self.check_btn.configure(state="disabled")
+        self.install_btn.configure(state="disabled")
+        self._show_progress(True)
+        self.prog.set(0)
+        self.prog_lbl.configure(text="")
+        threading.Thread(target=self._dl_worker, args=(self._info,), daemon=True).start()
+
+    def _dl_worker(self, info):
+        try:
+            zp = download_release(
+                info, staging_dir(info.tag),
+                progress=lambda d, t: self._ui(lambda: self._on_progress(d, t)))
+            verify_package(zp)
+            plan = plan_install(zp)
+            err = None
+        except UpdateError as e:
+            plan, err = None, str(e)
+        except Exception as e:  # noqa: BLE001
+            plan, err = None, f"Неожиданная ошибка: {e}"
+        self._ui(lambda: self._dl_done(plan, err))
+
+    def _on_progress(self, done, total):
+        try:
+            if total:
+                self.prog.set(min(1.0, done / total))
+                self.prog_lbl.configure(text=f"{done / 1e6:.1f} / {total / 1e6:.1f} МБ")
+            else:
+                self.prog_lbl.configure(text=f"{done / 1e6:.1f} МБ")
+            self._status("Скачивание обновления…")
+        except Exception:
+            pass
+
+    def _dl_done(self, plan, err):
+        self._busy = False
+        self.check_btn.configure(state="normal")
+        self._show_progress(False)
+        if err:
+            self._status(err, err=True)
+            return
+        self._plan = plan
+        self.install_btn.configure(text="Перезапустить и установить", state="normal")
+        self._ask_restart()
+
+    def _ask_restart(self):
+        top = self.winfo_toplevel()
+        ver = self._info.version if self._info else ""
+        if not messagebox.askyesno(
+                "Обновление загружено",
+                f"Версия {ver} готова к установке.\n\n"
+                "Приложение закроется, файлы обновятся и программа запустится снова.\n"
+                "Ваши данные (настройки, история) сохранятся.\n\nУстановить сейчас?",
+                parent=top):
+            self._status(f"Версия {ver} загружена. Нажмите «Перезапустить и установить», "
+                         "когда будете готовы.")
+            return
+        try:
+            launch_install(self._plan)
+        except UpdateError as e:
+            messagebox.showerror("Обновление", str(e), parent=top)
+            return
+        try:
+            top.destroy()
+        except Exception:
+            pass
+        try:
+            self.app.destroy()
+        except Exception:
+            pass
+
+    def _open_page(self):
+        url = self._info.page_url if self._info else f"https://github.com/{REPO}/releases"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self._status(f"Не удалось открыть браузер: {e}", err=True)
+
 
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, app: "TurNalogApp"):
@@ -593,6 +907,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self._nav_label("СИСТЕМА")
         self.panes["data"] = DataPane(self.host, app)
         self._nav_btn("data", "База данных")
+        self.panes["updates"] = UpdatesPane(self.host, app)
+        self._nav_btn("updates", "Обновления")
 
         self._show("chai")
         self.geometry("1020x680")
