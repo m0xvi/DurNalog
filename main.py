@@ -32,7 +32,7 @@ from views import ProcessView, HistoryView
 from agents import migrate_agents, match_agent
 from tax import TaxParams
 from db import HistoryDB, set_db_path, default_db_path
-from schemas import TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA, DNA_DATA_SCHEMA
+from schemas import SCHEMAS, needs_mapping
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources,
@@ -43,15 +43,13 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.12"
+APP_VERSION = "3.13"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
 NAME2ID = {'Чайковский': 'chai', 'Дона': 'dona', 'Усадьба': 'usadba'}
 ROMAN = {'I': 'Q1', 'II': 'Q2', 'III': 'Q3', 'IV': 'Q4'}
 ROMAN_REV = {'Q1': 'I', 'Q2': 'II', 'Q3': 'III', 'Q4': 'IV'}
-SCHEMAS = {('tch', 'data'): TCH_DATA_SCHEMA, ('tch', 'rooms'): TCH_ROOMS_SCHEMA,
-           ('dna', 'data'): DNA_DATA_SCHEMA}
 
 from config_io import load_config, save_config  # noqa: E402
 
@@ -636,7 +634,7 @@ class RealApp(TurNalogApp):
         pid = self.current_hotel
         code = ID2CODE[pid]
         slot = 'data' if kind == 'data' else 'rooms'
-        if (code, slot) not in SCHEMAS:
+        if not needs_mapping(code, slot):
             messagebox.showinfo("Колонки",
                                 "У этого отеля структура отчёта фиксированная.", parent=self)
             return
@@ -721,6 +719,8 @@ class RealApp(TurNalogApp):
             for slot, path in (('data', data_path), ('rooms', rooms_path)):
                 if not path:
                     continue
+                if not needs_mapping(code, slot):
+                    continue  # фиксированная структура (Усадьба)
                 headers = read_headers(path)
                 saved = self.cfg.get(f"{code}_{slot}", {})
                 if mapping_valid(saved.get('mapping'), headers, SCHEMAS[(code, slot)]):

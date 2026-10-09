@@ -42,3 +42,13 @@ DNA_DATA_SCHEMA = [
 # Поля без обязательных (для отображения «*» в диалоге)
 def required_keys(schema):
     return [f['key'] for f in schema if f['required']]
+
+# Слоты с настраиваемым сопоставлением колонок.
+# Усадьбы здесь нет: структура её отчёта фиксированная.
+SCHEMAS = {('tch', 'data'): TCH_DATA_SCHEMA, ('tch', 'rooms'): TCH_ROOMS_SCHEMA,
+           ('dna', 'data'): DNA_DATA_SCHEMA}
+
+
+def needs_mapping(code, slot):
+    """Нужен ли диалог сопоставления колонок для (отель, слот)."""
+    return (code, slot) in SCHEMAS
