@@ -143,8 +143,7 @@ def test_tchaikovsky_end_to_end(tmp_path):
                 "Категория номера", "№ брони", "Ночей"]).to_csv(src, index=False)
     pd.DataFrame([["Иванов Иван", 12]], columns=["ФИО", "№ комнаты"]).to_csv(rooms, index=False)
 
-    summary, bookings = core.process_tchaikovsky(src, rooms, out,
-                                                 tax={'use_full': True})
+    summary, bookings = core.process_tchaikovsky(src, rooms, out)
     assert summary["Отсутствует Стоимость (ГОЛУБОЙ)"] == 0  # "5 000,00" распознано
     ws = openpyxl.load_workbook(out)["1&2"]
     assert ws["D2"].value == 5000.0
@@ -228,7 +227,7 @@ def test_dona_custom_tax_in_output(tmp_path):
     pd.DataFrame([["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "островок"]],
                  columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник"]
                  ).to_csv(src, index=False)
-    _, _ = core.process_dona(src, out, tax={'rate': 3, 'use_full': True})
+    _, _ = core.process_dona(src, out, tax={'rate': 3})
     ws = openpyxl.load_workbook(out)["Дона"]
     assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/103*3),2)'
 
@@ -418,13 +417,13 @@ def test_source_dialog_search():
     assert resolve_agent_choice('о', ['Островок', 'Броневик'])[0] == 'unknown'
 
 
-def test_default_tax_base_is_document_price(tmp_path):
-    """Дефолт: налог от стоимости как в документе (без накрутки до 100%)."""
+def test_default_tax_base_is_full_price(tmp_path):
+    """Дефолт: цена в файле — нетто; налог от 100%-й «Стоимости с комиссией»."""
     import pandas as pd
     import openpyxl
     import core
     from tax import TaxParams
-    assert TaxParams().use_full is False
+    assert TaxParams().use_full is True
     src = os.path.join(str(tmp_path), "dd.csv")
     out = os.path.join(str(tmp_path), "dd.xlsx")
     pd.DataFrame([["Иванов Иван", 8500, "01.08.2026", "04.08.2026", "островок"]],
@@ -432,8 +431,11 @@ def test_default_tax_base_is_document_price(tmp_path):
                  ).to_csv(src, index=False)
     _, _ = core.process_dona(src, out)
     ws = openpyxl.load_workbook(out)["Дона"]
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,D2/102*2),2)'
-    assert ws["J2"].value == '=D2/I2'
+    assert ws["D1"].value == 'Стоимость без комиссии'
+    assert ws["G1"].value == 'Стоимость с комиссией'
+    assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+    assert ws["J2"].value == '=G2/I2'
 
 
 def test_db_path_override(tmp_path):

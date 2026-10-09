@@ -56,7 +56,7 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
 
         self.tax_in_price = tk.BooleanVar(value=h.get("tax_in_price", True))
         self.auto_threshold = tk.BooleanVar(value=h.get("auto_threshold", True))
-        self.tax_no_commission = tk.BooleanVar(value=h.get("tax_no_commission", False))
+        self.tax_no_commission = tk.BooleanVar(value=h.get("tax_no_commission", True))
 
         for var, title, sub in (
             (
@@ -71,8 +71,8 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
             ),
             (
                 self.tax_no_commission,
-                "Считать налог от стоимости без комиссии",
-                "Только для файлов с нетто-ценами (база = 100% цены гостя)",
+                "Считать налог от стоимости с комиссией",
+                "База = 100% цены (нетто из файла + комиссия агента)",
             ),
         ):
             row = ctk.CTkFrame(
