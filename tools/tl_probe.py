@@ -2,7 +2,8 @@
 """Зонд TravelLine Read Reservation API.
 
 Что делает:
-  1. Забирает брони вашего объекта за указанный квартал.
+  1. Забирает брони вашего объекта за указанный квартал (или берёт их
+     из ранее сохранённого *_full.json — офлайн-режим, за секунды).
   2. Проверяет арифметику: входит ли сумма допуслуг в roomStays.total
      или идёт сверху (гипотезы A/B — критично для формулы турналога).
   3. Показывает разбивку по каналам/статусам и сохраняет выгрузку в JSON.
@@ -12,6 +13,7 @@
 """
 import getpass
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -26,7 +28,6 @@ except Exception:
 
 HOST = 'https://partner.tlintegration.com'
 QUARTERS = {'1': 1, 'i': 1, '2': 2, 'ii': 2, '3': 3, 'iii': 3, '4': 4, 'iv': 4}
-VERDICT_STATUSES = ('Confirmed', 'InHouse', 'CheckedOut')
 
 
 class ApiError(Exception):
@@ -38,7 +39,8 @@ def _http(method, path, token=None, params=None, data=None, ctype=None):
     if params:
         url += '?' + urllib.parse.urlencode(params)
     body = data.encode('utf-8') if isinstance(data, str) else data
-    req = urllib.request.Request(url, data=body, method=method)
+    req = urllib.request.Request(url, data=data if body is None else body,
+                                 method=method)
     if token:
         req.add_header('Authorization', 'Bearer ' + token)
     if ctype:
@@ -149,52 +151,39 @@ def anonymize(obj):
     return obj
 
 
-def main():
-    print('=== Зонд TravelLine: проживание vs допуслуги ===\n')
-    print('Где взять данные:')
-    print('  client_id / client_secret — кабинет TravelLine → Настройки гостиницы')
-    print('                              → Подключения API → ваше подключение;')
-    print('  propertyId — средняя часть номера любой брони (ГГГГММДД-XXXX-...).\n')
+def quarter_bounds(year, q):
+    qs = date(year, (q - 1) * 3 + 1, 1)
+    qe = date(year + (1 if q == 4 else 0), 1 if q == 4 else q * 3 + 1, 1)
+    return qs, qe
+
+
+def download_all(pid, qs, qe, depth):
     cid = input('client_id: ').strip()
     try:
         secret = getpass.getpass('client_secret (ввод не виден): ').strip()
     except Exception:
         secret = input('client_secret: ').strip()
-    pid = input('propertyId: ').strip()
-    year = int(input('Год (например 2026): ').strip())
-    q = QUARTERS.get(input('Квартал (1-4 или I-IV): ').strip().lower())
-    if not q:
-        print('Не понял квартал.')
-        return
-    qs = date(year, (q - 1) * 3 + 1, 1)
-    qe = date(year + (1 if q == 4 else 0), 1 if q == 4 else q * 3 + 1, 1)
-    depth = input('Искать изменения с даты [2024-01-01]: ').strip() or '2024-01-01'
-    last_mod = depth + 'T00:00:00Z'
-    print(f'\nКвартал: {qs} .. {qe} (по датам проживания)')
-
-    print('\n[1/4] Токен…')
+    print('\n[1/3] Токен…')
     token = get_token(cid, secret)
     print('  OK')
-
-    print('[2/4] Список броней…')
+    print('[2/3] Список броней…')
     try:
-        summaries = list_summaries(token, pid, last_mod)
+        summaries = list_summaries(token, pid, depth + 'T00:00:00Z')
     except ApiError as e:
         print(f'  ОШИБКА: {e}')
         if '403' in str(e):
             print('  Подсказка: примите оферту в кабинете и проверьте, что в подключении')
             print('  отмечен Read Reservation API именно для этого объекта.')
-        return
+        return None
     print(f'  Всего сводок: {len(summaries)}')
-
-    print('[3/4] Детали броней (лимит API ~10/сек, это займёт время)…')
-    details, unauth = [], 0
+    print('[3/3] Детали броней (лимит API ~10/сек, это займёт время)…')
+    details, refreshed = [], False
     for i, s in enumerate(summaries, 1):
         try:
             b = get_details(token, pid, s['number'])
         except ApiError as e:
-            if '401' in str(e) and unauth == 0:
-                unauth += 1
+            if '401' in str(e) and not refreshed:
+                refreshed = True
                 token = get_token(cid, secret)  # токен живёт 15 минут
                 b = get_details(token, pid, s['number'])
             elif '429' in str(e):
@@ -208,71 +197,125 @@ def main():
         if i % 25 == 0 or i == len(summaries):
             print(f'  {i}/{len(summaries)}')
         time.sleep(0.15)
+    return details
 
+
+def analyze(details, qs, qe):
     in_q = [b for b in details
             if overlaps(b.get('roomStays', []) or [], qs, qe)]
-    print(f'\n[4/4] В квартал попадает броней: {len(in_q)} из {len(details)}')
+    print(f'\nВ квартал попадает броней: {len(in_q)} из {len(details)}')
 
-    # --- вердикт A/B ---
-    votes_a = votes_b = votes_q = 0
+    # --- вердикт A/B (по всем статусам, с разбивкой) ---
+    votes = {}  # status -> [A, B, ?]
     examples = []
+    paid_with_extras = 0
+    with_discounts = 0
     for b in in_q:
-        if b.get('status') not in VERDICT_STATUSES:
-            continue
+        st = b.get('status', '?')
         room, s_stay, s_book, extra, tot = split_booking(b)
         if s_stay + s_book + extra < 0.01:
-            continue  # без допов гипотезы неразличимы
+            continue  # без платных допов гипотезы неразличимы
+        paid_with_extras += 1
+        if b.get('total', {}).get('discounts'):
+            with_discounts += 1
+        v = votes.setdefault(st, [0, 0, 0])
         a = room + s_stay + s_book + extra
         if abs(tot - a) < 0.02:
-            votes_a += 1
+            v[0] += 1
         elif abs(tot - room) < 0.02:
-            votes_b += 1
+            v[1] += 1
         else:
-            votes_q += 1
-            if len(examples) < 5:
-                examples.append((b.get('number'), room, s_stay + s_book,
+            v[2] += 1
+            if len(examples) < 8:
+                examples.append((b.get('number'), st, room, s_stay + s_book,
                                  extra, tot))
+    tot_a = sum(v[0] for v in votes.values())
+    tot_b = sum(v[1] for v in votes.values())
+    tot_q = sum(v[2] for v in votes.values())
     print('\n=== ВЕРДИКТ ===')
-    print(f'Гипотеза A (допы СВЕРХУ проживания): {votes_a}')
-    print(f'Гипотеза B (допы ВНУТРИ roomStays.total): {votes_b}')
-    print(f'Не сошлось ни то ни другое: {votes_q}')
-    if votes_a and not votes_b and not votes_q:
+    print(f'Броней с платными допами: {paid_with_extras} '
+          f'(из них со скидками: {with_discounts})')
+    print(f'Гипотеза A (допы СВЕРХУ проживания): {tot_a}')
+    print(f'Гипотеза B (допы ВНУТРИ roomStays.total): {tot_b}')
+    print(f'Не сошлось ни то ни другое: {tot_q}')
+    for st, (a, c, q_) in sorted(votes.items()):
+        print(f'  {st}: A={a} B={c} ?={q_}')
+    if tot_a and not tot_b and not tot_q:
         print('>>> Формула: проживание = Σ roomStays.total (допы отдельно).')
-    elif votes_b and not votes_a and not votes_q:
+    elif tot_b and not tot_a and not tot_q:
         print('>>> Формула: проживание = Σ roomStays.total − Σ services.')
     else:
         print('>>> Смешанная картина — покажите примеры ниже разработчику.')
-    for n, r, sv, ex, t in examples:
-        print(f'  {n}: room={r:.2f} svc={sv:.2f} extra={ex:.2f} total={t:.2f}')
+    for n, st, r, sv, ex, t in examples:
+        print(f'  {n} [{st}]: room={r:.2f} svc={sv:.2f} '
+              f'extra={ex:.2f} total={t:.2f}')
 
     # --- каналы и статусы ---
-    print('\n=== Каналы (все статусы, в квартале) ===')
+    print('\n=== Каналы (в квартале) ===')
     ch = {}
     for b in in_q:
         src = b.get('source') or {}
         code = f"{src.get('type', '?')}/{src.get('code', '?')}"
         room, s_stay, s_book, extra, tot = split_booking(b)
-        c = ch.setdefault(code, [0, 0.0, 0.0])
+        c = ch.setdefault(code, [0, 0.0, 0.0, 0.0])
         c[0] += 1
         c[1] += room
         c[2] += s_stay + s_book + extra
-    for code, (n, r, sv) in sorted(ch.items()):
-        print(f'  {code}: броней={n} проживание={r:.2f} допы={sv:.2f}')
+        c[3] += tot
+    for code, (n, r, sv, t) in sorted(ch.items()):
+        print(f'  {code}: броней={n} проживание={r:.2f} '
+              f'допы={sv:.2f} итог={t:.2f}')
     print('\n=== Статусы ===')
     st = {}
     for b in in_q:
-        st[b.get('status', '?')] = st.get(b.get('status', '?'), 0) + 1
+        k = b.get('status', '?')
+        st[k] = st.get(k, 0) + 1
     for k, v in sorted(st.items()):
         print(f'  {k}: {v}')
+    return in_q
 
+
+def main():
+    print('=== Зонд TravelLine: проживание vs допуслуги ===\n')
+    print('Где взять данные:')
+    print('  client_id / client_secret — кабинет TravelLine → Настройки гостиницы')
+    print('                              → Подключения API → ваше подключение;')
+    print('  propertyId — средняя часть номера любой брони (ГГГГММДД-XXXX-...).\n')
+    pid = input('propertyId: ').strip()
+    year = int(input('Год (например 2026): ').strip())
+    q = QUARTERS.get(input('Квартал (1-4 или I-IV): ').strip().lower())
+    if not q:
+        print('Не понял квартал.')
+        return
+    qs, qe = quarter_bounds(year, q)
+    print(f'\nКвартал: {qs} .. {qe} (по датам проживания)')
     base = f'tl_{pid}_{year}Q{q}'
-    with open(base + '_full.json', 'w', encoding='utf-8') as f:
-        json.dump(details, f, ensure_ascii=False, indent=1)
+
+    details = None
+    full_name = base + '_full.json'
+    if os.path.exists(full_name):
+        ans = input(f'Найден {full_name}. Использовать его без скачивания? [Y/n]: '
+                    ).strip().lower()
+        if ans in ('', 'y', 'yes', 'д', 'да'):
+            with open(full_name, encoding='utf-8') as f:
+                details = json.load(f)
+            print(f'  Загружено броней: {len(details)} (офлайн-режим)')
+    if details is None:
+        depth = input('Искать изменения с даты [2024-01-01]: ').strip() or '2024-01-01'
+        details = download_all(pid, qs, qe, depth)
+        if details is None:
+            return
+        with open(full_name, 'w', encoding='utf-8') as f:
+            json.dump(details, f, ensure_ascii=False, indent=1)
+        print(f'\nСохранено: {full_name} (ЕСТЬ ПДн — никому не отправлять)')
+
+    in_q = analyze(details, qs, qe)
+
     anon = [anonymize(b) for b in in_q]
-    with open(base + '_anon.json', 'w', encoding='utf-8') as f:
+    anon_name = base + '_anon.json'
+    with open(anon_name, 'w', encoding='utf-8') as f:
         json.dump(anon, f, ensure_ascii=False, indent=1)
-    print(f'\nСохранено: {base}_full.json (ВСЕ брони, есть ПДн — никому не отправлять),')
-    print(f'           {base}_anon.json (квартал, ФИО скрыты — можно показать разработчику).')
+    print(f'\nСохранено: {anon_name} (квартал, ФИО скрыты — можно показать разработчику).')
     if anon:
         print('\nОбразец первой брони (обезличен):')
         print(json.dumps(anon[0], ensure_ascii=False, indent=1)[:2000])
@@ -284,6 +327,6 @@ if __name__ == '__main__':
     except ApiError as e:
         print(f'\nОШИБКА API: {e}')
     except KeyboardInterrupt:
-        print('\\nПрервано.')
+        print('\nПрервано.')
     except Exception as e:
         print(f'\nНеожиданная ошибка: {e}')
