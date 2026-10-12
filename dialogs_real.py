@@ -275,3 +275,56 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
                 return
         self.result = result
         self.destroy()
+
+
+class TlConfigDialog(ctk.CTkToplevel):
+    """Подключение TravelLine: client_id / client_secret / propertyId."""
+
+    def __init__(self, master, preset=None, hotel_name=''):
+        super().__init__(master)
+        self.title('TravelLine — подключение')
+        self.geometry('420x330')
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        preset = preset or {}
+        title = f'TravelLine — {hotel_name}' if hotel_name else 'TravelLine'
+        ctk.CTkLabel(self, text=title,
+                     font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(14, 2))
+        ctk.CTkLabel(
+            self,
+            text='Данные из кабинета TravelLine: Настройки гостиницы →\n'
+                 'Подключения API. Сохраняются на этом компьютере.',
+            text_color='gray').pack(pady=(0, 10))
+        self.vars = {}
+        for key, label, secret in (
+                ('client_id', 'client_id (логин)', False),
+                ('client_secret', 'client_secret (пароль)', True),
+                ('property_id', 'propertyId (цифры)', False)):
+            ctk.CTkLabel(self, text=label, anchor='w').pack(anchor='w', padx=24)
+            var = tk.StringVar(value=preset.get(key, ''))
+            ctk.CTkEntry(self, textvariable=var, width=370,
+                         show='•' if secret else '').pack(padx=24, pady=(0, 8))
+            self.vars[key] = var
+        bar = ctk.CTkFrame(self, fg_color='transparent')
+        bar.pack(pady=6)
+        ctk.CTkButton(bar, text='OK', width=120, fg_color='green',
+                      command=self.ok).pack(side='left', padx=6)
+        ctk.CTkButton(bar, text='Отмена', width=120, fg_color='gray',
+                      command=self.destroy).pack(side='left', padx=6)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def ok(self):
+        res = {k: v.get().strip() for k, v in self.vars.items()}
+        if not (res['client_id'] and res['client_secret'] and res['property_id']):
+            messagebox.showerror('TravelLine', 'Заполните все три поля.',
+                                 parent=self)
+            return
+        if not res['property_id'].isdigit():
+            messagebox.showerror('TravelLine', 'propertyId — только цифры.',
+                                 parent=self)
+            return
+        self.result = res
+        self.destroy()

@@ -127,6 +127,13 @@ class ProcessView(ctk.CTkFrame):
             command=lambda: self.app.open_column_map("rooms"),
             width=160,
         ).pack(side="left")
+        self.tl_btn = GhostButton(
+            btns,
+            "↓ TravelLine",
+            command=lambda: self.app.hook_tl_import(self.hotel_id),
+            width=160,
+        )
+        self.tl_btn.pack(side="left", padx=(8, 0))
 
     def _build_process(self, card: Card) -> None:
         head = ctk.CTkFrame(card, fg_color="transparent")
@@ -235,6 +242,11 @@ class ProcessView(ctk.CTkFrame):
         self.step1.set_done(False)
         self.step2.set_done(False)
         self._sync_run()
+        # TravelLine есть у Чайковского (и будет у Доны); у Усадьбы другая PMS.
+        if hotel_id in ("chai", "dona"):
+            self.tl_btn.pack(side="left", padx=(8, 0))
+        else:
+            self.tl_btn.pack_forget()
         # Файл номеров у Доны/Усадьбы не обязателен — зона остаётся, чуть бледнее.
         if h["needs_rooms"]:
             self.drop_rooms.configure(fg_color=COLORS["drop"])
@@ -262,6 +274,12 @@ class ProcessView(ctk.CTkFrame):
         if path:
             zone.set_path(path)
             self.app.set_status("Файл номеров выбран")
+
+    def set_tl_files(self, data_path: str, rooms_path: str) -> None:
+        self.drop_data.set_path(data_path)
+        self.drop_rooms.set_path(rooms_path)
+        self.step1.set_done(True)
+        self._sync_run()
 
     def _sync_run(self) -> None:
         ready = bool(self.drop_data.path)

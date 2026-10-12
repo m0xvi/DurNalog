@@ -285,6 +285,13 @@ class TurNalogApp(ctk.CTk):
         self.set_status("Готово к работе")
         self.toast("Файл не сформирован — это только GUI")
 
+    def hook_tl_import(self, hotel_id: str) -> None:
+        messagebox.showinfo(
+            "TravelLine",
+            "Импорт из TravelLine доступен только в боевом приложении.",
+            parent=self,
+        )
+
     def hook_open_file(self, kind: str, row: dict) -> None:
         key = "orig" if kind == "original" else "result"
         messagebox.showinfo(

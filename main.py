@@ -2,6 +2,7 @@
 """Турналог 3.0 — дизайнерский GUI (TurNalog_ui) + боевая логика (core/db)."""
 import os
 import sys
+import tempfile
 import threading
 import copy
 from datetime import datetime
@@ -33,17 +34,18 @@ from agents import migrate_agents, match_agent
 from tax import TaxParams
 from db import HistoryDB, set_db_path, default_db_path
 from schemas import SCHEMAS, needs_mapping
+from tl_client import TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP, is_tl_export
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources,
                   repair_notes_for)
-from dialogs_real import MappingDialog, UnrecognizedSourcesDialog
+from dialogs_real import MappingDialog, UnrecognizedSourcesDialog, TlConfigDialog
 from updater import (UpdateError, check_for_updates, download_release,
                      is_frozen, launch_install, plan_install, staging_dir,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.15"
+APP_VERSION = "3.16"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -629,7 +631,83 @@ class RealApp(TurNalogApp):
     def hook_save_columns(self, kind, mapping):
         pass  # сохраняется в open_column_map
 
+    # ---------- импорт из TravelLine ----------
+    def hook_tl_import(self, hotel_id):
+        from tl_client import (TLApiError, bookings_to_rows, fetch_details,
+                               tl_export_paths, write_data_workbook,
+                               write_rooms_stub)
+        code = ID2CODE[hotel_id]
+        hname = theme.HOTELS[hotel_id]['name']
+        pv = self.process_view
+        quarter, year = pv.qseg.get(), pv.year.get().strip()
+        if quarter not in ROMAN or not year.isdigit():
+            messagebox.showerror('TravelLine', 'Укажите корректные квартал и год.',
+                                 parent=self)
+            return
+        tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
+        dlg = TlConfigDialog(self, tl_cfg, hname)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        tl_cfg.update(dlg.result)
+        save_config(self.cfg)
+        qn, y = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}[quarter], int(year)
+        qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
+        qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
+        depth = f'{y - 2}-01-01'
+        self.set_status('TravelLine: получение токена…')
+
+        def work():
+            def progress(stage, done, total):
+                if stage == 'details' and total:
+                    self.after(0, lambda: self.set_status(
+                        f'TravelLine: {done}/{total}…'))
+                elif stage == 'list':
+                    self.after(0, lambda: self.set_status(
+                        f'TravelLine: список ({done})…'))
+            details = fetch_details(tl_cfg['client_id'], tl_cfg['client_secret'],
+                                    tl_cfg['property_id'], depth, progress)
+            rows, rep = bookings_to_rows(details, qs, qe)
+            data_path, rooms_path = tl_export_paths(tempfile.gettempdir(),
+                                                    code, y, quarter)
+            write_data_workbook(rows, data_path)
+            write_rooms_stub(rooms_path)
+            return rows, rep, data_path, rooms_path
+
+        def done(result, err):
+            if err:
+                self.set_status('TravelLine: ошибка')
+                messagebox.showerror(
+                    'TravelLine', f'Не удалось загрузить брони:\n{err}',
+                    parent=self)
+                return
+            rows, rep, data_path, rooms_path = result
+            pv.set_tl_files(data_path, rooms_path)
+            self.set_status(f'TravelLine: {rep["rows"]} строк за '
+                            f'{quarter}/{year} → нажмите «Обработать»')
+            lines = [f'Броней в квартале: {rep["in_quarter"]} '
+                     f'(строк: {rep["rows"]})',
+                     f'Пропущено отменённых: {rep["cancelled"]}']
+            if rep['mismatch']:
+                lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
+                             '(номера в логе) — проверьте!')
+                for m in rep['mismatch'][:20]:
+                    log.warning('TL mismatch %s', m)
+            lines.append('Файлы подставлены — нажмите «Обработать и сохранить».')
+            messagebox.showinfo('TravelLine', '\n'.join(lines), parent=self)
+
+        def runner():
+            try:
+                r, e = work(), None
+            except Exception as exc:
+                log.exception('tl_import')
+                r, e = None, exc
+            self.after(0, lambda: done(r, e))
+
+        threading.Thread(target=runner, daemon=True).start()
+
     # ---------- сопоставление колонок (боевое) ----------
+
     def open_column_map(self, kind):
         pid = self.current_hotel
         code = ID2CODE[pid]
@@ -721,6 +799,11 @@ class RealApp(TurNalogApp):
                     continue
                 if not needs_mapping(code, slot):
                     continue  # фиксированная структура (Усадьба)
+                if is_tl_export(path):
+                    tlm = TL_DATA_MAP if slot == 'data' else TL_ROOMS_MAP
+                    maps[slot] = (dict(tlm),
+                                  list(TL_EXTRA) if slot == 'data' else [])
+                    continue
                 headers = read_headers(path)
                 saved = self.cfg.get(f"{code}_{slot}", {})
                 if mapping_valid(saved.get('mapping'), headers, SCHEMAS[(code, slot)]):

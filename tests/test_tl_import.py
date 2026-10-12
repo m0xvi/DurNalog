@@ -1,0 +1,127 @@
+# -*- coding: utf-8 -*-
+"""Импорт TravelLine: разбор броней в строки Excel (фикстуры, без сети)."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import mapping_valid, read_table
+from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA
+from tl_client import (TL_DATA_MAP, TL_EXTRA, bookings_to_rows, channel_label,
+                       is_tl_export, write_data_workbook, write_rooms_stub)
+
+
+def _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00', room=10000.0,
+          services=(), guests=(('Иван', 'Петров'),), rt='Стандарт',
+          rp='Базовый'):
+    return {
+        'stayDates': {'arrivalDateTime': arr, 'departureDateTime': dep},
+        'total': {'priceAfterTax': room},
+        'services': [{'total': {'priceAfterTax': s}} for s in services],
+        'extraStayCharges': {'earlyArrival': None, 'lateDeparture': None},
+        'guests': [{'firstName': f, 'lastName': l} for f, l in guests],
+        'roomType': {'name': rt}, 'ratePlans': [{'name': rp}],
+    }
+
+
+def _book(number='20260701-8186-1', status='Active', stays=None,
+          book_services=(), total=10000.0, source=None):
+    return {'number': number, 'status': status,
+            'roomStays': stays if stays is not None else [_stay()],
+            'services': [{'total': {'priceAfterTax': s}}
+                         for s in book_services],
+            'total': {'priceAfterTax': total},
+            'source': source or {'type': 'Channel', 'code': 'YAX'}}
+
+QS, QE = '2026-07-01', '2026-10-01'
+
+
+def test_plain_booking_no_services():
+    rows, rep = bookings_to_rows([_book()], QS, QE)
+    assert rep['votes'] == {'A': 0, 'B': 0, '?': 0}  # неинформативна
+    assert len(rows) == 1
+    r = rows[0]
+    assert r['Стоимость'] == 10000.0 and r['Допуслуги'] == 0.0
+    assert r['Гость'] == 'Иван Петров' and r['Ночей'] == 2
+    assert r['Источник'] == 'TravelLine YAX'
+    assert r['№ брони'] == '20260701-8186-1'
+
+
+def test_mode_a_with_paid_services():
+    b = _book(stays=[_stay(services=(1500.0,))], total=11500.0)
+    rows, rep = bookings_to_rows([b], QS, QE)
+    assert rep['votes']['A'] == 1 and not rep['mismatch']
+    assert rows[0]['Стоимость'] == 10000.0
+    assert rows[0]['Допуслуги'] == 1500.0
+
+
+def test_mode_b_extras_inside():
+    b = _book(stays=[_stay(room=11500.0, services=(1500.0,))], total=11500.0)
+    rows, rep = bookings_to_rows([b], QS, QE)
+    assert rep['votes']['B'] == 1
+    assert rows[0]['Стоимость'] == 10000.0  # 11500 − 1500
+    assert rows[0]['Допуслуги'] == 1500.0
+
+
+def test_mismatch_flagged_base_kept():
+    b = _book(stays=[_stay(services=(1500.0,))], total=99999.0)
+    rows, rep = bookings_to_rows([b], QS, QE)
+    assert rep['votes']['?'] == 1
+    assert len(rep['mismatch']) == 1
+    assert rep['mismatch'][0]['number'] == '20260701-8186-1'
+    assert rows[0]['Стоимость'] == 10000.0  # база как есть + флаг
+
+
+def test_inclusive_zero_neutral():
+    b = _book(stays=[_stay(services=(0.0,))], total=10000.0)
+    rows, rep = bookings_to_rows([b], QS, QE)
+    assert rep['votes'] == {'A': 0, 'B': 0, '?': 0}  # неинформативна
+    assert rows[0]['Стоимость'] == 10000.0
+
+
+def test_cancelled_skipped_and_quarter_filter():
+    cancelled = _book(number='c', status='Cancelled')
+    out_q = _book(number='o', stays=[_stay(arr='2026-10-05T14:00',
+                                           dep='2026-10-07T12:00')])
+    rows, rep = bookings_to_rows([cancelled, out_q, _book()], QS, QE)
+    assert rep['cancelled'] == 1 and rep['in_quarter'] == 1
+    assert [r['№ брони'] for r in rows] == ['20260701-8186-1']
+
+
+def test_group_booking_two_rows():
+    b = _book(stays=[_stay(guests=(('А', 'А'),)),
+                     _stay(room=8000.0, guests=(('Б', 'Б'),))],
+              total=18000.0)
+    rows, rep = bookings_to_rows([b], QS, QE)
+    assert len(rows) == 2 and rep['rows'] == 2
+    assert [r['Гость'] for r in rows] == ['А А', 'Б Б']
+
+
+def test_channels():
+    assert channel_label({'type': 'BookingEngine', 'code': 'PropertySite'}) \
+        == 'TravelLine сайт'
+    assert channel_label({'type': 'PMS', 'code': None}) == 'TravelLine ресепшн'
+    assert channel_label({'type': 'Channel', 'code': 'OTK'}) == 'TravelLine OTK'
+    assert channel_label({}) == 'TravelLine ?'
+
+
+def test_workbooks_roundtrip_and_mapping(tmp_path):
+    rows, _ = bookings_to_rows([_book()], QS, QE)
+    dp = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rp = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    write_data_workbook(rows, dp)
+    write_rooms_stub(rp)
+    assert is_tl_export(dp) and is_tl_export(rp)
+    assert not is_tl_export(str(tmp_path / 'other.xlsx'))
+    df = read_table(dp)
+    assert list(df.columns) == ['Гость', 'Стоимость', 'Заезд', 'Выезд',
+                                'Источник', 'Категория номера', '№ брони',
+                                'Ночей', 'Тариф', 'Допуслуги', 'Итог брони']
+    assert df.iloc[0]['Стоимость'] == 10000.0
+    assert df.iloc[0]['Гость'] == 'Иван Петров'
+    headers = [str(c) for c in df.columns]
+    assert mapping_valid(TL_DATA_MAP, headers, TCH_DATA_SCHEMA)
+    assert mapping_valid(TL_DATA_MAP, headers, DNA_DATA_SCHEMA)
+    assert all(c in headers for c in TL_EXTRA)
+    dr = read_table(rp)
+    assert list(dr.columns) == ['ФИО', '№ комнаты'] and len(dr) == 0
