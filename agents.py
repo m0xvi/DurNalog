@@ -118,7 +118,9 @@ def default_agents():
         out.append({'name': name, 'aliases': list(aliases), 'hotels': ['dna'],
                     'rates': rates})
     for name, spec, aliases in TCH_AGENTS:
-        out.append({'name': name + ' [Чайковский]', 'aliases': list(aliases),
+        channel_aliases = TCH_TL_CHANNEL_ALIASES.get(name, [])
+        out.append({'name': name + ' [Чайковский]',
+                    'aliases': list(aliases) + list(channel_aliases),
                     'hotels': ['tch'], 'rates': _tch_rates(spec)})
     for name, pct, aliases in USADBA_AGENTS:
         out.append({'name': name + ' [Усадьба]', 'aliases': list(aliases),
@@ -131,7 +133,31 @@ def migrate_agents(cfg):
     """Собирает список агентов из конфига: новый ключ 'agents' или старые
     ключи (overrides / agent_aliases / custom_agents)."""
     if cfg.get('agents'):
-        return cfg['agents']
+        agents = cfg['agents']
+        builtins = default_agents()
+        direct_names = {
+            'TravelLine Booking Engine [Чайковский]',
+            'Прямые бронирования (стойка) [Чайковский]',
+        }
+        for builtin in builtins:
+            tl_aliases = [x for x in builtin.get('aliases', [])
+                          if str(x).startswith('TravelLine ')]
+            if not tl_aliases:
+                continue
+            current = next((a for a in agents
+                            if a.get('name') == builtin['name']), None)
+            if current is None:
+                if builtin['name'] in direct_names:
+                    agents.append({
+                        'name': builtin['name'],
+                        'aliases': list(builtin['aliases']),
+                        'hotels': list(builtin['hotels']),
+                        'rates': [dict(r) for r in builtin['rates']],
+                    })
+                continue
+            aliases = current.setdefault('aliases', [])
+            aliases.extend(x for x in tl_aliases if x not in aliases)
+        return agents
     agents = default_agents()
     overrides = cfg.get('agent_overrides') or {}
     extra = cfg.get('agent_aliases') or {}
@@ -217,6 +243,10 @@ def match_agent(source, agents, date=None, hotel=None):
     raw = translit(re.sub(r'[^0-9a-zа-яё]+', ' ', str(source).lower().replace('ё', 'е')))
     tokens = [t for t in re.split(r'[^a-z0-9]+', raw) if len(t) >= 5]
     cands = [sl] + tokens
+    # TravelLine source strings all share a long vendor prefix. Fuzzy-matching
+    # on the token "travelline" would make an unknown code (e.g. CMB) look like
+    # an unrelated known agent. TL labels must match a registered full alias.
+    tl_source = s.startswith('travelline')
 
     best_score, best_agent = -1, None
     for a in agents:
@@ -231,7 +261,7 @@ def match_agent(source, agents, date=None, hotel=None):
                 score = 1000 + len(na)
             elif na in s or s in na or nal in sl or sl in nal:
                 score = 500 + len(na)
-            elif min(len(nal), len(sl)) >= 5:
+            elif not tl_source and min(len(nal), len(sl)) >= 5:
                 r = 0.0
                 for c in cands:
                     # для отдельных слов-токенов порог строже, чем для строки целиком
@@ -392,6 +422,11 @@ TCH_AGENTS = [
     ("«ЖилиБыли»", [("до 26.06.2026", 0), ("с 27.06.2026", 15)], ["жилибыли", "жили-были"]),
     ("ООО «СБО» (Ростелеком)", [("base", 15)], ["сбо", "rostelecom", "ростелеком", "travel tech"]),
     ("Trip.com Group", [("base", 15)], ["trip.com", "tripcom", "trip com"]),
+    # TravelLine Booking Engine public tariff is 4%; property-specific rate is
+    # editable in Settings → Agents. Reception/PMS bookings are direct, 0%.
+    ("TravelLine Booking Engine", [("base", 4)], ["TravelLine сайт"]),
+    ("Прямые бронирования (стойка)", [("base", 0)],
+     ["TravelLine ресепшен"]),
 ]
 
 
@@ -399,6 +434,33 @@ TCH_AGENTS = [
 # АГЕНТЫ ОТЕЛЯ «УСАДЬБА» (из таблицы отеля; спорные рукописные значения
 # помечены комментарием — проверьте в «Настройки → Агенты»)
 # ================================================================
+# TravelLine Read Reservation source labels -> existing Chai agent records.
+# These are aliases only: the agent's configured commission/rate schedule remains
+# authoritative. CMB is intentionally omitted: Comfort Booking's total fee is
+# 2% plus the underlying channel's commission and cannot be inferred from CMB.
+TCH_TL_CHANNEL_ALIASES = {
+    'ООО "Эй энд Эй"': ['TravelLine ANA'],       # Roomlink / Zabroniryi
+    'ООО "ТРИВИО СЕРВИС"': ['TravelLine TIO'],
+    'ООО «ХОМЛИН ЛЭНД» (ПЕГАС)': ['TravelLine PGS'],
+    'ООО Тинькофф Путешествия': ['TravelLine TNK'],
+    'ООО «СБО» (Ростелеком)': ['TravelLine RTT'],
+    'ООО "АЛЕАН ОТДЫХ"': ['TravelLine ALN'],
+    'ООО «Дубль Гис» (OTELLO)': ['TravelLine OL2'],
+    'ООО "АКАДЕМ-ОНЛАЙН"': ['TravelLine ACS'],
+    'ООО "Библио-Глобус Туроператор"': ['TravelLine BGL'],
+    'Яндекс.Путешествия': ['TravelLine YAX'],
+    'ООО "ХБ-ПРО"': ['TravelLine UTS'],         # Hotelbook
+    'ООО «Интернет Трэвел» (OZON)': ['TravelLine OZ2'],
+    'ООО "ОНЛАЙН ИННОВАЦИИ" (101 Отель)': ['TravelLine H1C'],
+    'ООО «12Т» (ранее ONE TWO TRIP)': ['TravelLine OTT'],
+    'Trip.com Group': ['TravelLine CTP'],
+    'ООО "УК ГЦБ и Т"': ['TravelLine CBC'],
+    'ООО "БРОНИРОВАНИЕ ГОСТИНИЦ" (OSTROVOK)': ['TravelLine OTK'],
+    'ООО "КОМПАНИЯ БРОНЕВИК"': ['TravelLine BR2'],
+    '«ЖилиБыли»': ['TravelLine JLB'],
+}
+
+
 USADBA_AGENTS = [
     ("ООО \"ХБ ПРО\"", 20, ["хб-про", "хб про", "hb-pro", "hbpro"]),
     ("ООО Компания Броневик", 20, ["броневик", "bronevik"]),

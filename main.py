@@ -46,7 +46,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.19"
+APP_VERSION = "3.20"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -782,6 +782,17 @@ class RealApp(TurNalogApp):
             if s:
                 counts[s] = counts.get(s, 0) + 1
         decided_none = set(self.cfg.get('source_none', []))
+        # One-time migration: an earlier version may have saved every TL label
+        # as 0% when the first unknown-source dialog was dismissed unchanged.
+        # Clear those stale choices once so known agent rates apply and CMB can
+        # be reviewed; after the user chooses again, their decision persists.
+        if not self.cfg.get('tl_agent_aliases_migrated_v320'):
+            old_tl_none = {s for s in decided_none
+                           if str(s).startswith('TravelLine ')}
+            decided_none.difference_update(old_tl_none)
+            self.cfg['source_none'] = sorted(decided_none)
+            self.cfg['tl_agent_aliases_migrated_v320'] = True
+            save_config(self.cfg)
         items = [(s, c) for s, c in counts.items()
                  if s not in decided_none
                  and match_agent(s, agents, hotel=code)[1] is None]

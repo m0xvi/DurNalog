@@ -480,3 +480,59 @@ def test_db_path_override(tmp_path):
         db2.close()
     finally:
         set_db_path(None)
+
+
+def test_travelline_channel_codes_map_to_existing_chai_agents():
+    from agents import default_agents, match_agent
+    agents = default_agents()
+    when = date(2026, 8, 15)
+    expected = {
+        'TravelLine ANA': 18,
+        'TravelLine TIO': 18,
+        'TravelLine PGS': 0,
+        'TravelLine TNK': 15,
+        'TravelLine RTT': 15,
+        'TravelLine ALN': 0,
+        'TravelLine OL2': 20,
+        'TravelLine ACS': 15,
+        'TravelLine BGL': 15,
+        'TravelLine YAX': 18,
+        'TravelLine UTS': 20,
+        'TravelLine OZ2': 17,
+        'TravelLine H1C': 17,
+        'TravelLine OTT': 15,
+        'TravelLine CTP': 15,
+        'TravelLine CBC': 20,
+        'TravelLine OTK': 16,
+        'TravelLine BR2': 20,
+        'TravelLine JLB': 15,
+        'TravelLine сайт': 4,
+        'TravelLine ресепшен': 0,
+    }
+    for source, rate in expected.items():
+        assert match_agent(source, agents, date=when, hotel='tch')[0] == rate, source
+    # CMB is a multi-channel aggregator: don't fuzzy-map it to CBC or another OTA.
+    assert match_agent('TravelLine CMB', agents, date=when,
+                       hotel='tch') == (0, None)
+
+
+def test_travelline_mappings_merge_into_saved_agent_list():
+    from agents import default_agents, migrate_agents, match_agent
+    saved = default_agents()
+    direct = {'TravelLine Booking Engine [Чайковский]',
+              'Прямые бронирования (стойка) [Чайковский]'}
+    for agent in saved:
+        agent['aliases'] = [a for a in agent['aliases']
+                            if not a.startswith('TravelLine ')]
+    saved = [a for a in saved if a['name'] not in direct]
+    yandex = next(a for a in saved
+                  if a['name'] == 'Яндекс.Путешествия [Чайковский]')
+    yandex['rates'] = [{'from': '', 'to': '', 'pct': 12}]
+
+    merged = migrate_agents({'agents': saved})
+    assert match_agent('TravelLine YAX', merged, date=date(2026, 8, 15),
+                       hotel='tch') == (12, 'Яндекс.Путешествия [Чайковский]')
+    assert match_agent('TravelLine сайт', merged, hotel='tch') == (
+        4, 'TravelLine Booking Engine [Чайковский]')
+    assert match_agent('TravelLine ресепшен', merged, hotel='tch') == (
+        0, 'Прямые бронирования (стойка) [Чайковский]')
