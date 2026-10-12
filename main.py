@@ -46,7 +46,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.18"
+APP_VERSION = "3.19"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -649,6 +649,17 @@ class RealApp(TurNalogApp):
             messagebox.showerror('TravelLine', 'Укажите корректные квартал и год.',
                                  parent=self)
             return
+        qn, y = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}[quarter], int(year)
+        qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
+        qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
+        if not messagebox.askyesno(
+                'TravelLine — быстрый режим',
+                f'Для ускорения запрос ограничен бронями, изменёнными с {qs}.\n\n'
+                'TravelLine фильтрует по дате изменения, а не по датам проживания. '
+                'Бронь, созданная раньше и не изменявшаяся с этой даты, может не '
+                'попасть в импорт, даже если проживание было в выбранном квартале.\n\n'
+                'Продолжить быстрый режим с этим ограничением?', parent=self):
+            return
         tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
         dlg = TlConfigDialog(self, tl_cfg, hname)
         self.wait_window(dlg)
@@ -656,10 +667,9 @@ class RealApp(TurNalogApp):
             return
         tl_cfg.update(dlg.result)
         save_config(self.cfg)
-        qn, y = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}[quarter], int(year)
-        qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
-        qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
-        depth = f'{y - 2}-01-01'
+        # Быстрый режим: API фильтрует по lastModification, не по stayDates.
+        # QS сокращает загрузку, но брони, не менявшиеся с QS, будут пропущены.
+        depth = qs
         cancel_event = threading.Event()
         prog = TlProgressDialog(self, cancel_event)
         self._tl_busy = True
@@ -711,7 +721,9 @@ class RealApp(TurNalogApp):
                             f'{quarter}/{year} → нажмите «Обработать»')
             lines = [f'Броней в квартале: {rep["in_quarter"]} '
                      f'(строк: {rep["rows"]})',
-                     f'Пропущено отменённых: {rep["cancelled"]}']
+                     f'Пропущено отменённых: {rep["cancelled"]}',
+                     f'Быстрый запрос: изменения с {depth}; более ранние '
+                     'неизменённые брони могут отсутствовать.']
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')

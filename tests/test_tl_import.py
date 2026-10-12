@@ -249,3 +249,18 @@ def test_booking_401_refreshes_token_and_retries(monkeypatch):
     assert out == [{'number': 'n1', 'status': 'Active'}]
     assert [token for path, token in calls if path.endswith('/n1')] == [
         'expired', 'fresh']
+
+
+def test_fetch_details_uses_requested_last_modification_date(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *a: 'tok')
+    seen = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        seen.append((path, params))
+        return 200, {'bookingSummaries': [], 'hasMoreData': False}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details('id', 'secret', '8186', '2026-07-01')
+    assert out == []
+    assert seen[0][1]['lastModification'] == '2026-07-01T00:00:00Z'
