@@ -17,6 +17,8 @@ from datetime import datetime
 import openpyxl
 
 HOST = 'https://partner.tlintegration.com'
+# Increment if the prepared-row/report cache format changes incompatibly.
+TL_CACHE_VERSION = 1
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -61,6 +63,37 @@ def tl_export_paths(tmpdir, code, year, quarter):
     stem = f'TL_{code}_{year}{quarter}_'
     return (tmpdir + '/' + stem + 'data.xlsx',
             tmpdir + '/' + stem + 'rooms.xlsx')
+
+
+def tl_import_cache_key(hotel_code, property_id, period_start, period_end,
+                        modified_since):
+    return (f'tlcache-v{TL_CACHE_VERSION}|{hotel_code}|{property_id}|'
+            f'{period_start}|{period_end}|{modified_since}')
+
+
+def encode_tl_import_cache(rows, report):
+    """Сериализует только строки, нужные импорту (без сырого API JSON/контактов)."""
+    def default(value):
+        if hasattr(value, 'isoformat'):
+            return value.isoformat()
+        return str(value)
+    return json.dumps({'rows': rows, 'report': report}, ensure_ascii=False,
+                      default=default)
+
+
+def decode_tl_import_cache(payload):
+    """Восстанавливает строки кэша, включая Excel-совместимые даты."""
+    data = json.loads(payload)
+    rows, report = data['rows'], data['report']
+    for row in rows:
+        for col in (COL_IN, COL_OUT):
+            value = row.get(col)
+            if isinstance(value, str) and value:
+                try:
+                    row[col] = datetime.fromisoformat(value)
+                except ValueError:
+                    pass
+    return rows, report
 
 
 def _http(method, path, token=None, params=None, data=None, ctype=None):

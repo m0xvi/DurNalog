@@ -264,3 +264,36 @@ def test_fetch_details_uses_requested_last_modification_date(monkeypatch):
     out = tl_client.fetch_details('id', 'secret', '8186', '2026-07-01')
     assert out == []
     assert seen[0][1]['lastModification'] == '2026-07-01T00:00:00Z'
+
+
+def test_import_cache_roundtrip_preserves_rows_and_report():
+    from datetime import datetime
+    from tl_client import decode_tl_import_cache, encode_tl_import_cache
+
+    rows = [{
+        'Гость': 'Иван Петров', 'Стоимость': 10000.0,
+        'Заезд': datetime(2026, 7, 10, 14, 0),
+        'Выезд': datetime(2026, 7, 12, 12, 0),
+        'Источник': 'TravelLine YAX', '№ брони': 'TL-42',
+    }]
+    report = {'in_quarter': 1, 'rows': 1, 'cancelled': 0,
+              'votes': {'A': 0, 'B': 0, '?': 0}, 'mismatch': []}
+
+    payload = encode_tl_import_cache(rows, report)
+    restored_rows, restored_report = decode_tl_import_cache(payload)
+    assert restored_rows == rows
+    assert isinstance(restored_rows[0]['Заезд'], datetime)
+    assert isinstance(restored_rows[0]['Выезд'], datetime)
+    assert restored_report == report
+
+
+def test_import_cache_key_is_scoped_to_property_period_and_query():
+    from tl_client import tl_import_cache_key
+
+    common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
+    key = tl_import_cache_key(*common)
+    assert key.startswith('tlcache-v1|')
+    assert tl_import_cache_key(*common) == key
+    assert tl_import_cache_key('tch', '479', *common[2:]) != key
+    assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',
+                               '2026-10-01') != key

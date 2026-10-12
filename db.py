@@ -84,6 +84,17 @@ class HistoryDB:
             role   TEXT NOT NULL,
             hotel  TEXT
         );
+        CREATE TABLE IF NOT EXISTS travelline_cache (
+            cache_key    TEXT PRIMARY KEY,
+            hotel_code   TEXT NOT NULL,
+            property_id  TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end   TEXT NOT NULL,
+            modified_since TEXT NOT NULL,
+            fetched_at   TEXT NOT NULL,
+            row_count    INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL
+        );
         """)
         self.con.commit()
 
@@ -152,6 +163,40 @@ class HistoryDB:
         cur = self.con.execute(f"SELECT {col} FROM reports WHERE id=?", (report_id,))
         row = cur.fetchone()
         return (row[0], row[1]) if row else (None, None)
+
+    # ------------------------------------------------------------------
+    # TravelLine cache (только готовые к импорту строки, не сырой API JSON)
+    # ------------------------------------------------------------------
+    def get_travelline_cache(self, cache_key):
+        row = self.con.execute(
+            "SELECT * FROM travelline_cache WHERE cache_key=?", (cache_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def put_travelline_cache(self, cache_key, hotel_code, property_id,
+                             period_start, period_end, modified_since,
+                             row_count, payload_json):
+        self.con.execute(
+            """INSERT INTO travelline_cache
+               (cache_key, hotel_code, property_id, period_start, period_end,
+                modified_since, fetched_at, row_count, payload_json)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(cache_key) DO UPDATE SET
+                 hotel_code=excluded.hotel_code,
+                 property_id=excluded.property_id,
+                 period_start=excluded.period_start,
+                 period_end=excluded.period_end,
+                 modified_since=excluded.modified_since,
+                 fetched_at=excluded.fetched_at,
+                 row_count=excluded.row_count,
+                 payload_json=excluded.payload_json""",
+            (cache_key, hotel_code, str(property_id), period_start, period_end,
+             modified_since, datetime.now().isoformat(timespec='seconds'),
+             int(row_count), payload_json))
+
+    def delete_travelline_cache(self, cache_key):
+        self.con.execute(
+            "DELETE FROM travelline_cache WHERE cache_key=?", (cache_key,))
 
     # ------------------------------------------------------------------
     # Дубли (переход кварталов)

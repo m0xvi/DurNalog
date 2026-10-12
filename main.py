@@ -34,19 +34,21 @@ from agents import migrate_agents, match_agent
 from tax import TaxParams
 from db import HistoryDB, set_db_path, default_db_path
 from schemas import SCHEMAS, needs_mapping
-from tl_client import TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP, is_tl_export
+from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
+                       decode_tl_import_cache, encode_tl_import_cache,
+                       is_tl_export, tl_import_cache_key)
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources,
                   repair_notes_for)
 from dialogs_real import (MappingDialog, UnrecognizedSourcesDialog,
-                            TlConfigDialog, TlProgressDialog)
+                            TlCacheDialog, TlConfigDialog, TlProgressDialog)
 from updater import (UpdateError, check_for_updates, download_release,
                      is_frozen, launch_install, plan_install, staging_dir,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.20"
+APP_VERSION = "3.21"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -652,53 +654,139 @@ class RealApp(TurNalogApp):
         qn, y = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}[quarter], int(year)
         qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
         qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
-        if not messagebox.askyesno(
-                'TravelLine — быстрый режим',
-                f'Для ускорения запрос ограничен бронями, изменёнными с {qs}.\n\n'
-                'TravelLine фильтрует по дате изменения, а не по датам проживания. '
-                'Бронь, созданная раньше и не изменявшаяся с этой даты, может не '
-                'попасть в импорт, даже если проживание было в выбранном квартале.\n\n'
-                'Продолжить быстрый режим с этим ограничением?', parent=self):
-            return
-        tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
-        dlg = TlConfigDialog(self, tl_cfg, hname)
-        self.wait_window(dlg)
-        if not dlg.result:
-            return
-        tl_cfg.update(dlg.result)
-        save_config(self.cfg)
         # Быстрый режим: API фильтрует по lastModification, не по stayDates.
-        # QS сокращает загрузку, но брони, не менявшиеся с QS, будут пропущены.
         depth = qs
+        tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
+        property_id = str(tl_cfg.get('property_id', '')).strip()
+        cache_key = (tl_import_cache_key(code, property_id, qs, qe, depth)
+                     if property_id else None)
+        cache_record = None
+        if cache_key:
+            try:
+                with HistoryDB() as db:
+                    cache_record = db.get_travelline_cache(cache_key)
+            except Exception:
+                log.exception('tl_cache_read')
+
+        cache_used, cache_fetched_at = False, None
+        cached_rows, cached_rep = None, None
+        if cache_record:
+            cache_dlg = TlCacheDialog(
+                self, f'{quarter}/{year}', cache_record['fetched_at'],
+                cache_record['row_count'])
+            self.wait_window(cache_dlg)
+            choice = cache_dlg.result or 'cancel'
+            if choice == 'cancel':
+                return
+            if choice == 'delete':
+                try:
+                    with HistoryDB() as db:
+                        db.delete_travelline_cache(cache_key)
+                    self.set_status('TravelLine: локальный кэш удалён')
+                    messagebox.showinfo(
+                        'TravelLine',
+                        'Кэш этого периода удалён из локальной базы. '
+                        'Для новой загрузки нажмите «↓ TravelLine» ещё раз.',
+                        parent=self)
+                except Exception as exc:
+                    log.exception('tl_cache_delete')
+                    messagebox.showerror(
+                        'TravelLine', f'Не удалось удалить кэш:\n{exc}',
+                        parent=self)
+                return
+            if choice == 'use':
+                try:
+                    cached_rows, cached_rep = decode_tl_import_cache(
+                        cache_record['payload_json'])
+                    cache_used = True
+                    cache_fetched_at = cache_record['fetched_at']
+                except Exception as exc:
+                    log.exception('tl_cache_decode')
+                    try:
+                        with HistoryDB() as db:
+                            db.delete_travelline_cache(cache_key)
+                    except Exception:
+                        log.exception('tl_cache_bad_delete')
+                    messagebox.showwarning(
+                        'TravelLine',
+                        f'Кэш повреждён и удалён. Загрузим данные заново.\n{exc}',
+                        parent=self)
+
+        if not cache_used:
+            if not messagebox.askyesno(
+                    'TravelLine — быстрый режим',
+                    f'Для ускорения запрос ограничен бронями, изменёнными с {qs}.\n\n'
+                    'TravelLine фильтрует по дате изменения, а не по датам проживания. '
+                    'Бронь, созданная раньше и не изменявшаяся с этой даты, может не '
+                    'попасть в импорт, даже если проживание было в выбранном квартале.\n\n'
+                    'Продолжить быстрый режим с этим ограничением?', parent=self):
+                return
+            dlg = TlConfigDialog(self, tl_cfg, hname)
+            self.wait_window(dlg)
+            if not dlg.result:
+                return
+            tl_cfg.update(dlg.result)
+            save_config(self.cfg)
+            property_id = str(tl_cfg['property_id']).strip()
+            cache_key = tl_import_cache_key(
+                code, property_id, qs, qe, depth)
+
         cancel_event = threading.Event()
         prog = TlProgressDialog(self, cancel_event)
+        if cache_used:
+            prog.set_stage('Подготовка файлов из локального кэша…')
         self._tl_busy = True
-        self.set_status('TravelLine: загрузка…')
+        self.set_status('TravelLine: локальный кэш…' if cache_used
+                        else 'TravelLine: загрузка…')
 
         def work():
-            def progress(stage, done, total):
-                try:
-                    if stage == 'list':
-                        self.after(0, lambda: (
-                            prog.set_stage(f'Получение списка броней ({done})…'),
-                            self.set_status(f'TravelLine: список ({done})…')))
-                    else:
-                        self.after(0, lambda: (
-                            prog.set_stage('Загрузка деталей броней…'),
-                            prog.set_determinate(),
-                            prog.set_progress(done, total),
-                            self.set_status(f'TravelLine: {done}/{total}…')))
-                except Exception:
-                    pass
-            details = fetch_details(tl_cfg['client_id'], tl_cfg['client_secret'],
-                                    tl_cfg['property_id'], depth, progress,
-                                    cancel_event)
-            rows, rep = bookings_to_rows(details, qs, qe)
-            data_path, rooms_path = tl_export_paths(tempfile.gettempdir(),
-                                                    code, y, quarter)
+            cache_error = None
+            if cancel_event.is_set():
+                raise TLCancelled()
+            if cache_used:
+                rows, rep = cached_rows, cached_rep
+            else:
+                def progress(stage, done, total):
+                    try:
+                        if stage == 'list':
+                            self.after(0, lambda: (
+                                prog.set_stage(
+                                    f'Получение списка броней ({done})…'),
+                                self.set_status(f'TravelLine: список ({done})…')))
+                        else:
+                            self.after(0, lambda: (
+                                prog.set_stage('Загрузка деталей броней…'),
+                                prog.set_determinate(),
+                                prog.set_progress(done, total),
+                                self.set_status(f'TravelLine: {done}/{total}…')))
+                    except Exception:
+                        pass
+                details = fetch_details(
+                    tl_cfg['client_id'], tl_cfg['client_secret'], property_id,
+                    depth, progress, cancel_event)
+                rows, rep = bookings_to_rows(details, qs, qe)
+            if cancel_event.is_set():
+                raise TLCancelled()
+            data_path, rooms_path = tl_export_paths(
+                tempfile.gettempdir(), code, y, quarter)
             write_data_workbook(rows, data_path)
+            if cancel_event.is_set():
+                raise TLCancelled()
             write_rooms_stub(rooms_path)
-            return rows, rep, data_path, rooms_path
+            if cancel_event.is_set():
+                raise TLCancelled()
+            if not cache_used:
+                try:
+                    payload_json = encode_tl_import_cache(rows, rep)
+                    with HistoryDB() as db:
+                        db.put_travelline_cache(
+                            cache_key, code, property_id, qs, qe, depth,
+                            len(rows), payload_json)
+                except Exception as exc:
+                    cache_error = str(exc)
+                    log.exception('tl_cache_write')
+            return (rows, rep, data_path, rooms_path, cache_used,
+                    cache_error, cache_fetched_at)
 
         def done(result, err):
             self._tl_busy = False
@@ -715,20 +803,32 @@ class RealApp(TurNalogApp):
                     'TravelLine', f'Не удалось загрузить брони:\n{err}',
                     parent=self)
                 return
-            rows, rep, data_path, rooms_path = result
+            (rows, rep, data_path, rooms_path, from_cache,
+             cache_error, fetched_at) = result
             pv.set_tl_files(data_path, rooms_path)
+            cache_status = (' → локальный кэш' if from_cache else
+                            (' → кэш не сохранён' if cache_error else
+                             ' → сохранено в локальную базу'))
             self.set_status(f'TravelLine: {rep["rows"]} строк за '
-                            f'{quarter}/{year} → нажмите «Обработать»')
+                            f'{quarter}/{year}{cache_status}')
             lines = [f'Броней в квартале: {rep["in_quarter"]} '
                      f'(строк: {rep["rows"]})',
-                     f'Пропущено отменённых: {rep["cancelled"]}',
-                     f'Быстрый запрос: изменения с {depth}; более ранние '
-                     'неизменённые брони могут отсутствовать.']
+                     f'Пропущено отменённых: {rep["cancelled"]}']
+            if from_cache:
+                lines.append(f'Использован локальный кэш от {fetched_at}; '
+                             'запроса к API не было.')
+            elif cache_error:
+                lines.append('⚠ Не удалось сохранить локальный кэш: '
+                             f'{cache_error}')
+            else:
+                lines.append('Сохранено в локальную базу для повторного импорта.')
+            lines.append(f'Быстрый запрос: изменения с {depth}; более ранние '
+                         'неизменённые брони могут отсутствовать.')
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')
-                for m in rep['mismatch'][:20]:
-                    log.warning('TL mismatch %s', m)
+                for mismatch in rep['mismatch'][:20]:
+                    log.warning('TL mismatch %s', mismatch)
             lines.append('Файлы подставлены — нажмите «Обработать и сохранить».')
             messagebox.showinfo('TravelLine', '\n'.join(lines), parent=self)
 
@@ -968,6 +1068,9 @@ class RealApp(TurNalogApp):
 
 
 def main():
+    # Use the same selected SQLite file after restart (including the TL cache).
+    startup_cfg = load_config()
+    set_db_path(startup_cfg.get('db_path'))
     with HistoryDB() as db:
         db.ensure_default_admin()
     theme.DB_PATH_DEMO = default_db_path()

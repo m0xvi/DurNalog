@@ -536,3 +536,37 @@ def test_travelline_mappings_merge_into_saved_agent_list():
         4, 'TravelLine Booking Engine [Чайковский]')
     assert match_agent('TravelLine ресепшен', merged, hotel='tch') == (
         0, 'Прямые бронирования (стойка) [Чайковский]')
+
+
+def test_travelline_cache_crud_and_refresh(tmp_path):
+    path = str(tmp_path / 'cache.db')
+    key = 'tlcache-v1|tch|8186|2026-07-01|2026-10-01|2026-07-01'
+    with HistoryDB(path) as db:
+        assert db.get_travelline_cache(key) is None
+        db.put_travelline_cache(
+            key, 'tch', '8186', '2026-07-01', '2026-10-01',
+            '2026-07-01', 2, '{"rows":[1,2],"report":{}}')
+        first = db.get_travelline_cache(key)
+        assert first['hotel_code'] == 'tch'
+        assert first['property_id'] == '8186'
+        assert first['period_start'] == '2026-07-01'
+        assert first['period_end'] == '2026-10-01'
+        assert first['modified_since'] == '2026-07-01'
+        assert first['row_count'] == 2
+        assert first['payload_json'] == '{"rows":[1,2],"report":{}}'
+        assert first['fetched_at']
+
+        # Повторная загрузка обновляет одну запись, не создавая дубликат.
+        db.put_travelline_cache(
+            key, 'tch', '8186', '2026-07-01', '2026-10-01',
+            '2026-07-01', 1, '{"rows":[3],"report":{"updated":true}}')
+        refreshed = db.get_travelline_cache(key)
+        assert refreshed['row_count'] == 1
+        assert refreshed['payload_json'] == (
+            '{"rows":[3],"report":{"updated":true}}')
+        count = db.con.execute(
+            'SELECT COUNT(*) FROM travelline_cache').fetchone()[0]
+        assert count == 1
+
+        db.delete_travelline_cache(key)
+        assert db.get_travelline_cache(key) is None

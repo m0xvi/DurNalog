@@ -330,6 +330,53 @@ class TlConfigDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class TlCacheDialog(ctk.CTkToplevel):
+    """Выбор: использовать локальный кэш, обновить его, удалить или отменить."""
+
+    def __init__(self, master, quarter_label, cached_at, row_count):
+        super().__init__(master)
+        self.title('TravelLine — сохранённая выгрузка')
+        self.geometry('540x260')
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+        ctk.CTkLabel(self, text='Для периода уже есть локальный кэш',
+                     font=ctk.CTkFont(size=15, weight='bold')).pack(pady=(16, 5))
+        ctk.CTkLabel(
+            self,
+            text=(f'{quarter_label}: {row_count} строк, сохранён {cached_at}.\n'
+                  'Повторное использование не обращается к TravelLine.\n'
+                  'Обновление заново скачает данные и заменит кэш.\n'
+                  'В кэше только подготовленные строки (ФИО, № брони, даты и суммы), '
+                  'он хранится в базе приложения turnalog_history.db.'),
+            text_color='gray', justify='center', wraplength=490).pack(padx=20, pady=5)
+        grid = ctk.CTkFrame(self, fg_color='transparent')
+        grid.pack(pady=(8, 14))
+        ctk.CTkButton(grid, text='Использовать кэш', width=190,
+                      fg_color='green', command=lambda: self.finish('use')) \
+            .grid(row=0, column=0, padx=5, pady=4)
+        ctk.CTkButton(grid, text='Обновить из TravelLine', width=190,
+                      command=lambda: self.finish('refresh')) \
+            .grid(row=0, column=1, padx=5, pady=4)
+        ctk.CTkButton(grid, text='Удалить кэш', width=190,
+                      fg_color='#9b3333', command=lambda: self.finish('delete')) \
+            .grid(row=1, column=0, padx=5, pady=4)
+        ctk.CTkButton(grid, text='Отмена', width=190, fg_color='gray',
+                      command=self.cancel).grid(row=1, column=1, padx=5, pady=4)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def finish(self, result):
+        self.result = result
+        self.destroy()
+
+    def cancel(self):
+        self.result = 'cancel'
+        self.destroy()
+
+
 class TlProgressDialog(ctk.CTkToplevel):
     """Модальный прогресс загрузки броней TravelLine с кнопкой «Отмена».
 
