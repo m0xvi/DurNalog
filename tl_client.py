@@ -102,8 +102,8 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                   progress=None, cancel_event=None):
     """Все детали броней, изменённых с depth. progress(stage, done, total).
 
-    cancel_event — threading.Event: проверяется между запросами,
-    при установке бросает TLCancelled.
+    При HTTP 401 один раз перевыпускает OAuth-токен и повторяет запрос.
+    Ошибки API содержат этап операции, но никогда не содержат client_secret.
     """
     def cancelled():
         return cancel_event is not None and cancel_event.is_set()
@@ -111,8 +111,65 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
     if cancelled():
         raise TLCancelled()
     token = get_token(client_id, secret)
+
+    def api_get(path, params=None, stage='TravelLine API'):
+        """Выполнить GET; на 401 получить свежий token и повторить один раз."""
+        nonlocal token
+
+        def contextual(error):
+            text = str(error)
+            if 'HTTP 403' in text:
+                return TLApiError(
+                    f'{stage}: доступ запрещён (403). В подключении TravelLine '
+                    'проверьте разрешение Read Reservation API и доступ этого '
+                    f'объекта. Ответ API: {text}')
+            if 'HTTP 401' in text:
+                return TLApiError(
+                    f'{stage}: TravelLine не принял токен (401 Unauthorized). '
+                    'Проверьте client_id/client_secret именно из активного '
+                    'подключения этого объекта и повторите проверку. '
+                    f'Ответ API: {text}')
+            return TLApiError(f'{stage}: {text}')
+
+        try:
+            return _http('GET', path, token, params)
+        except TLApiError as first:
+            if 'HTTP 429' in str(first):
+                # Учитываем лимит TravelLine, но оставляем пользователю отмену.
+                for _ in range(60):
+                    if cancelled():
+                        raise TLCancelled()
+                    time.sleep(1)
+                try:
+                    return _http('GET', path, token, params)
+                except TLApiError as retry_error:
+                    raise contextual(retry_error)
+            if 'HTTP 401' not in str(first):
+                raise contextual(first)
+            # Токен действует 15 минут. Обновляем его по 401 и повторяем
+            # конкретный запрос один раз; не оставляем сырой ответ без этапа.
+            try:
+                token = get_token(client_id, secret)
+            except TLApiError as auth_error:
+                raise TLApiError(
+                    f'{stage}: API вернул 401, а получить новый токен не удалось. '
+                    f'{auth_error}')
+            try:
+                return _http('GET', path, token, params)
+            except TLApiError as retry_error:
+                if 'HTTP 401' in str(retry_error):
+                    raise TLApiError(
+                        f'{stage}: HTTP 401 даже после выдачи нового токена. '
+                        'TravelLine не принимает авторизацию этого API-запроса. '
+                        'Проверьте пару client_id/client_secret из одного '
+                        'подключения и разрешение Read Reservation API. '
+                        f'Ответ API: {retry_error}')
+                raise contextual(retry_error)
+
     summaries, cont, page = [], None, 0
     while True:
+        if cancelled():
+            raise TLCancelled()
         page += 1
         if page > 200:
             raise TLApiError('Слишком много страниц списка броней.')
@@ -121,17 +178,9 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             params['continueToken'] = cont
         else:
             params['lastModification'] = depth + 'T00:00:00Z'
-        try:
-            _, data = _http(
-                'GET',
-                f'/api/read-reservation/v1/properties/{property_id}/bookings',
-                token, params)
-        except TLApiError as e:
-            if '403' in str(e):
-                raise TLApiError(
-                    'Доступ запрещён (403): примите оферту в кабинете TravelLine '
-                    'и проверьте, что в подключении отмечен Read Reservation API.')
-            raise
+        _, data = api_get(
+            f'/api/read-reservation/v1/properties/{property_id}/bookings',
+            params, f'Список броней (страница {page})')
         if cancelled():
             raise TLCancelled()
         summaries.extend(data.get('bookingSummaries', []))
@@ -143,36 +192,20 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
         if not cont:
             break
         time.sleep(0.4)
-    details, refreshed = [], False
+    details = []
     total = len(summaries)
-    for i, s in enumerate(summaries, 1):
+    for i, summary in enumerate(summaries, 1):
         if cancelled():
             raise TLCancelled()
-        try:
-            _, data = _http(
-                'GET',
-                f'/api/read-reservation/v1/properties/{property_id}'
-                f'/bookings/{s["number"]}', token)
-        except TLApiError as e:
-            if '401' in str(e) and not refreshed:
-                refreshed = True
-                token = get_token(client_id, secret)
-                _, data = _http(
-                    'GET',
-                    f'/api/read-reservation/v1/properties/{property_id}'
-                    f'/bookings/{s["number"]}', token)
-            elif '429' in str(e):
-                time.sleep(60)
-                _, data = _http(
-                    'GET',
-                    f'/api/read-reservation/v1/properties/{property_id}'
-                    f'/bookings/{s["number"]}', token)
-            else:
-                raise TLApiError(f'Бронь {s["number"]}: {e}')
+        _, data = api_get(
+            f'/api/read-reservation/v1/properties/{property_id}'
+            f'/bookings/{summary["number"]}',
+            stage=f'Бронь {summary["number"]}')
         details.append(data.get('booking', {}))
         if progress:
             progress('details', i, total)
-        time.sleep(0.15)
+        # Read Reservation limit for details: 200 requests/minute.
+        time.sleep(0.31)
     return details
 
 

@@ -188,3 +188,64 @@ def test_cancel_midway(monkeypatch):
         pass
     else:
         raise AssertionError('отмена на середине обязана дать TLCancelled')
+
+
+def test_list_401_refreshes_token_and_retries(monkeypatch):
+    import tl_client
+    tokens = iter(['expired', 'fresh'])
+    monkeypatch.setattr(tl_client, 'get_token', lambda *a: next(tokens))
+    calls = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        calls.append(token)
+        if token == 'expired':
+            raise tl_client.TLApiError('HTTP 401: {"message":"Unauthorized"}')
+        return 200, {'bookingSummaries': [], 'hasMoreData': False}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details('id', 'secret', '8186')
+    assert out == []
+    assert calls == ['expired', 'fresh']
+
+
+def test_persistent_list_401_reports_stage_and_setup_hint(monkeypatch):
+    import tl_client
+    tokens = iter(['expired', 'fresh'])
+    monkeypatch.setattr(tl_client, 'get_token', lambda *a: next(tokens))
+
+    def fake(*args, **kwargs):
+        raise tl_client.TLApiError('HTTP 401: {"message":"Unauthorized"}')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    try:
+        tl_client.fetch_details('id', 'do-not-log-secret', '8186')
+    except tl_client.TLApiError as exc:
+        assert 'Список броней (страница 1)' in str(exc)
+        assert 'даже после выдачи нового токена' in str(exc)
+        assert 'Read Reservation API' in str(exc)
+        assert 'do-not-log-secret' not in str(exc)
+    else:
+        raise AssertionError('persisting HTTP 401 should raise a diagnostic error')
+
+
+def test_booking_401_refreshes_token_and_retries(monkeypatch):
+    import tl_client
+    tokens = iter(['expired', 'fresh'])
+    monkeypatch.setattr(tl_client, 'get_token', lambda *a: next(tokens))
+    calls = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        calls.append((path, token))
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}],
+                         'hasMoreData': False}
+        if token == 'expired':
+            raise tl_client.TLApiError('HTTP 401: {"message":"Unauthorized"}')
+        return 200, {'booking': {'number': 'n1', 'status': 'Active'}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda s: None)
+    out = tl_client.fetch_details('id', 'secret', '8186')
+    assert out == [{'number': 'n1', 'status': 'Active'}]
+    assert [token for path, token in calls if path.endswith('/n1')] == [
+        'expired', 'fresh']
