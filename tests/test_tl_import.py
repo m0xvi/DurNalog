@@ -297,3 +297,63 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',
                                '2026-10-01') != key
+
+
+def test_http_converts_read_timeout_to_diagnostic(monkeypatch):
+    import socket
+    import tl_client
+
+    def timeout(*args, **kwargs):
+        raise socket.timeout('The read operation timed out')
+
+    monkeypatch.setattr(tl_client.urllib.request, 'urlopen', timeout)
+    try:
+        tl_client._http('GET', '/test')
+    except tl_client.TLNetworkError as exc:
+        assert 'Тайм-аут ответа TravelLine' in str(exc)
+        assert '90 с' in str(exc)
+    else:
+        raise AssertionError('socket read timeout should be diagnosed')
+
+
+def test_fetch_details_retries_a_transient_timeout(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    detail_calls = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}],
+                         'hasMoreData': False}
+        detail_calls.append(path)
+        if len(detail_calls) == 1:
+            raise tl_client.TLNetworkError('Тайм-аут ответа TravelLine (90 с)')
+        return 200, {'booking': {'number': 'n1', 'status': 'Active'}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details('id', 'secret', '8186')
+    assert out == [{'number': 'n1', 'status': 'Active'}]
+    assert len(detail_calls) == 2
+
+
+def test_repeated_timeout_reports_api_stage_without_secret(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}],
+                         'hasMoreData': False}
+        raise tl_client.TLNetworkError('Тайм-аут ответа TravelLine (90 с)')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    try:
+        tl_client.fetch_details('id', 'do-not-log-secret', '8186')
+    except tl_client.TLApiError as exc:
+        assert 'Бронь n1' in str(exc)
+        assert '2 попыток' in str(exc)
+        assert 'do-not-log-secret' not in str(exc)
+    else:
+        raise AssertionError('repeated timeout should fail with a stage diagnostic')

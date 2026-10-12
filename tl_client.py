@@ -17,6 +17,9 @@ from datetime import datetime
 import openpyxl
 
 HOST = 'https://partner.tlintegration.com'
+HTTP_TIMEOUT_SECONDS = 90
+NETWORK_RETRIES = 1
+NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
 TL_CACHE_VERSION = 1
 
@@ -43,6 +46,10 @@ TL_ROOMS_MAP = {'fio': 'ФИО', 'room': '№ комнаты'}
 
 class TLApiError(Exception):
     pass
+
+
+class TLNetworkError(TLApiError):
+    """Временная ошибка соединения/тайм-аут, которую можно повторить."""
 
 
 class TLCancelled(Exception):
@@ -108,7 +115,7 @@ def _http(method, path, token=None, params=None, data=None, ctype=None):
     if ctype:
         req.add_header('Content-Type', ctype)
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as r:
             return r.status, json.loads(r.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         try:
@@ -116,16 +123,48 @@ def _http(method, path, token=None, params=None, data=None, ctype=None):
         except Exception:
             detail = ''
         raise TLApiError(f'HTTP {e.code}: {detail}')
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, 'reason', e)
+        reason_text = str(reason)
+        if (isinstance(reason, TimeoutError)
+                or 'timed out' in reason_text.lower()
+                or 'time out' in reason_text.lower()):
+            detail = f'Тайм-аут ответа TravelLine ({HTTP_TIMEOUT_SECONDS} с)'
+        else:
+            detail = f'Ошибка соединения с TravelLine: {reason_text}'
+        raise TLNetworkError(detail) from e
 
 
-def get_token(client_id, secret):
+def _http_with_retry(method, path, token=None, params=None, data=None,
+                     ctype=None, cancel_event=None):
+    """Повторяет один раз только временные сетевые ошибки, не HTTP-ошибки."""
+    for attempt in range(NETWORK_RETRIES + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TLCancelled()
+        try:
+            return _http(method, path, token, params, data, ctype)
+        except TLNetworkError as exc:
+            if attempt >= NETWORK_RETRIES:
+                tries = attempt + 1
+                raise TLNetworkError(
+                    f'{exc}; не удалось после {tries} попыток') from exc
+            if cancel_event is not None:
+                if cancel_event.wait(NETWORK_RETRY_DELAY):
+                    raise TLCancelled()
+            else:
+                time.sleep(NETWORK_RETRY_DELAY)
+
+
+def get_token(client_id, secret, cancel_event=None):
     try:
-        _, data = _http('POST', '/auth/token',
-                        data=urllib.parse.urlencode(
-                            {'grant_type': 'client_credentials',
-                             'client_id': client_id,
-                             'client_secret': secret}),
-                        ctype='application/x-www-form-urlencoded')
+        _, data = _http_with_retry(
+            'POST', '/auth/token',
+            data=urllib.parse.urlencode(
+                {'grant_type': 'client_credentials',
+                 'client_id': client_id,
+                 'client_secret': secret}),
+            ctype='application/x-www-form-urlencoded',
+            cancel_event=cancel_event)
         return data['access_token']
     except (TLApiError, KeyError) as e:
         raise TLApiError(f'Не удалось получить токен ({e}).')
@@ -143,7 +182,7 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
 
     if cancelled():
         raise TLCancelled()
-    token = get_token(client_id, secret)
+    token = get_token(client_id, secret, cancel_event)
 
     def api_get(path, params=None, stage='TravelLine API'):
         """Выполнить GET; на 401 получить свежий token и повторить один раз."""
@@ -151,6 +190,10 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
 
         def contextual(error):
             text = str(error)
+            if isinstance(error, TLNetworkError):
+                return TLApiError(
+                    f'{stage}: {text}. Проверьте соединение с интернетом; '
+                    'TravelLine мог временно не ответить, повторите запрос позже.')
             if 'HTTP 403' in text:
                 return TLApiError(
                     f'{stage}: доступ запрещён (403). В подключении TravelLine '
@@ -165,7 +208,8 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             return TLApiError(f'{stage}: {text}')
 
         try:
-            return _http('GET', path, token, params)
+            return _http_with_retry(
+                'GET', path, token, params, cancel_event=cancel_event)
         except TLApiError as first:
             if 'HTTP 429' in str(first):
                 # Учитываем лимит TravelLine, но оставляем пользователю отмену.
@@ -174,7 +218,9 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                         raise TLCancelled()
                     time.sleep(1)
                 try:
-                    return _http('GET', path, token, params)
+                    return _http_with_retry(
+                        'GET', path, token, params,
+                        cancel_event=cancel_event)
                 except TLApiError as retry_error:
                     raise contextual(retry_error)
             if 'HTTP 401' not in str(first):
@@ -182,13 +228,14 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             # Токен действует 15 минут. Обновляем его по 401 и повторяем
             # конкретный запрос один раз; не оставляем сырой ответ без этапа.
             try:
-                token = get_token(client_id, secret)
+                token = get_token(client_id, secret, cancel_event)
             except TLApiError as auth_error:
                 raise TLApiError(
                     f'{stage}: API вернул 401, а получить новый токен не удалось. '
                     f'{auth_error}')
             try:
-                return _http('GET', path, token, params)
+                return _http_with_retry(
+                    'GET', path, token, params, cancel_event=cancel_event)
             except TLApiError as retry_error:
                 if 'HTTP 401' in str(retry_error):
                     raise TLApiError(
