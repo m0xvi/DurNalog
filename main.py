@@ -633,7 +633,7 @@ class RealApp(TurNalogApp):
 
     # ---------- импорт из TravelLine ----------
     def hook_tl_import(self, hotel_id):
-        from tl_client import (TLApiError, bookings_to_rows, fetch_details,
+        from tl_client import (bookings_to_rows, fetch_details,
                                tl_export_paths, write_data_workbook,
                                write_rooms_stub)
         code = ID2CODE[hotel_id]
