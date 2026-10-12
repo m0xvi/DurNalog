@@ -328,3 +328,90 @@ class TlConfigDialog(ctk.CTkToplevel):
             return
         self.result = res
         self.destroy()
+
+
+class TlProgressDialog(ctk.CTkToplevel):
+    """Модальный прогресс загрузки броней TravelLine с кнопкой «Отмена».
+
+    cancel_event — threading.Event: кнопка/крестик устанавливают его,
+    fetch_details между запросами бросает TLCancelled.
+    Все методы вызывать из главного потока.
+    """
+
+    def __init__(self, master, cancel_event, title='TravelLine — загрузка'):
+        super().__init__(master)
+        self.title(title)
+        self.geometry('440x210')
+        self.resizable(False, False)
+        self.transient(master)
+        self.cancel_event = cancel_event
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+        ctk.CTkLabel(self, text='Загрузка броней из TravelLine…',
+                     font=ctk.CTkFont(size=14, weight='bold')).pack(pady=(16, 4))
+        self.stage_lbl = ctk.CTkLabel(self, text='Подключение…',
+                                      text_color='gray')
+        self.stage_lbl.pack(pady=(0, 8))
+        self.bar = ctk.CTkProgressBar(self, width=380, height=14,
+                                      mode='indeterminate')
+        self.bar.pack(pady=(0, 4))
+        self.bar.start()
+        self.count_lbl = ctk.CTkLabel(self, text='', font=ctk.CTkFont(size=12))
+        self.count_lbl.pack(pady=(0, 10))
+        self.cancel_btn = ctk.CTkButton(self, text='Отмена', width=140,
+                                        fg_color='gray', command=self.cancel)
+        self.cancel_btn.pack()
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def set_stage(self, text):
+        if self._alive():
+            self.stage_lbl.configure(text=text)
+
+    def set_determinate(self):
+        if self._alive():
+            try:
+                self.bar.stop()
+                self.bar.configure(mode='determinate')
+                self.bar.set(0)
+            except Exception:
+                pass
+
+    def set_progress(self, done, total):
+        if not self._alive():
+            return
+        try:
+            if total:
+                self.bar.set(min(1.0, max(0.0, done / total)))
+                self.count_lbl.configure(text=f'{done} / {total}')
+        except Exception:
+            pass
+
+    def cancel(self):
+        try:
+            self.cancel_event.set()
+        except Exception:
+            pass
+        if self._alive():
+            try:
+                self.cancel_btn.configure(state='disabled')
+                self.stage_lbl.configure(text='Отмена…')
+            except Exception:
+                pass
+
+    def close(self):
+        if self._alive():
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            try:
+                self.destroy()
+            except Exception:
+                pass

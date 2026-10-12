@@ -43,6 +43,10 @@ class TLApiError(Exception):
     pass
 
 
+class TLCancelled(Exception):
+    """Загрузка отменена пользователем."""
+
+
 def is_tl_export(path):
     """Файл, сгенерированный импортом TravelLine (канонический маппинг)."""
     try:
@@ -95,8 +99,17 @@ def get_token(client_id, secret):
 
 
 def fetch_details(client_id, secret, property_id, depth='2024-01-01',
-                  progress=None):
-    """Все детали броней, изменённых с depth. progress(stage, done, total)."""
+                  progress=None, cancel_event=None):
+    """Все детали броней, изменённых с depth. progress(stage, done, total).
+
+    cancel_event — threading.Event: проверяется между запросами,
+    при установке бросает TLCancelled.
+    """
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    if cancelled():
+        raise TLCancelled()
     token = get_token(client_id, secret)
     summaries, cont, page = [], None, 0
     while True:
@@ -119,6 +132,8 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                     'Доступ запрещён (403): примите оферту в кабинете TravelLine '
                     'и проверьте, что в подключении отмечен Read Reservation API.')
             raise
+        if cancelled():
+            raise TLCancelled()
         summaries.extend(data.get('bookingSummaries', []))
         if progress:
             progress('list', len(summaries), 0)
@@ -131,6 +146,8 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
     details, refreshed = [], False
     total = len(summaries)
     for i, s in enumerate(summaries, 1):
+        if cancelled():
+            raise TLCancelled()
         try:
             _, data = _http(
                 'GET',

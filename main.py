@@ -39,13 +39,14 @@ from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources,
                   repair_notes_for)
-from dialogs_real import MappingDialog, UnrecognizedSourcesDialog, TlConfigDialog
+from dialogs_real import (MappingDialog, UnrecognizedSourcesDialog,
+                            TlConfigDialog, TlProgressDialog)
 from updater import (UpdateError, check_for_updates, download_release,
                      is_frozen, launch_install, plan_install, staging_dir,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.16"
+APP_VERSION = "3.17"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -633,9 +634,13 @@ class RealApp(TurNalogApp):
 
     # ---------- импорт из TravelLine ----------
     def hook_tl_import(self, hotel_id):
-        from tl_client import (bookings_to_rows, fetch_details,
+        from tl_client import (TLCancelled, bookings_to_rows, fetch_details,
                                tl_export_paths, write_data_workbook,
                                write_rooms_stub)
+        if getattr(self, '_tl_busy', False):
+            messagebox.showinfo('TravelLine', 'Загрузка уже идёт.',
+                                parent=self)
+            return
         code = ID2CODE[hotel_id]
         hname = theme.HOTELS[hotel_id]['name']
         pv = self.process_view
@@ -655,18 +660,29 @@ class RealApp(TurNalogApp):
         qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
         qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
         depth = f'{y - 2}-01-01'
-        self.set_status('TravelLine: получение токена…')
+        cancel_event = threading.Event()
+        prog = TlProgressDialog(self, cancel_event)
+        self._tl_busy = True
+        self.set_status('TravelLine: загрузка…')
 
         def work():
             def progress(stage, done, total):
-                if stage == 'details' and total:
-                    self.after(0, lambda: self.set_status(
-                        f'TravelLine: {done}/{total}…'))
-                elif stage == 'list':
-                    self.after(0, lambda: self.set_status(
-                        f'TravelLine: список ({done})…'))
+                try:
+                    if stage == 'list':
+                        self.after(0, lambda: (
+                            prog.set_stage(f'Получение списка броней ({done})…'),
+                            self.set_status(f'TravelLine: список ({done})…')))
+                    else:
+                        self.after(0, lambda: (
+                            prog.set_stage('Загрузка деталей броней…'),
+                            prog.set_determinate(),
+                            prog.set_progress(done, total),
+                            self.set_status(f'TravelLine: {done}/{total}…')))
+                except Exception:
+                    pass
             details = fetch_details(tl_cfg['client_id'], tl_cfg['client_secret'],
-                                    tl_cfg['property_id'], depth, progress)
+                                    tl_cfg['property_id'], depth, progress,
+                                    cancel_event)
             rows, rep = bookings_to_rows(details, qs, qe)
             data_path, rooms_path = tl_export_paths(tempfile.gettempdir(),
                                                     code, y, quarter)
@@ -675,6 +691,14 @@ class RealApp(TurNalogApp):
             return rows, rep, data_path, rooms_path
 
         def done(result, err):
+            self._tl_busy = False
+            try:
+                prog.close()
+            except Exception:
+                pass
+            if isinstance(err, TLCancelled):
+                self.set_status('TravelLine: отменено пользователем')
+                return
             if err:
                 self.set_status('TravelLine: ошибка')
                 messagebox.showerror(
@@ -700,13 +724,15 @@ class RealApp(TurNalogApp):
             try:
                 r, e = work(), None
             except Exception as exc:
-                log.exception('tl_import')
+                if not isinstance(exc, TLCancelled):
+                    log.exception('tl_import')
                 r, e = None, exc
             self.after(0, lambda: done(r, e))
 
         threading.Thread(target=runner, daemon=True).start()
 
     # ---------- сопоставление колонок (боевое) ----------
+
 
     def open_column_map(self, kind):
         pid = self.current_hotel

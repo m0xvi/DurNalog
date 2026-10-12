@@ -125,3 +125,66 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     assert all(c in headers for c in TL_EXTRA)
     dr = read_table(rp)
     assert list(dr.columns) == ['ФИО', '№ комнаты'] and len(dr) == 0
+
+
+def _fake_http_factory(log):
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        log.append(path)
+        if path == '/auth/token':
+            return 200, {'access_token': 'tok'}
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'},
+                                              {'number': 'n2'}],
+                         'hasMoreData': False}
+        return 200, {'booking': {'number': path.rsplit('/', 1)[-1],
+                                 'status': 'Active'}}
+    return fake
+
+
+def test_fetch_details_progress(monkeypatch):
+    import threading
+    import tl_client
+    log = []
+    calls = []
+    monkeypatch.setattr(tl_client, '_http', _fake_http_factory(log))
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda s: None)
+    out = tl_client.fetch_details('id', 'sec', '8186', '2024-01-01',
+                                  progress=lambda st, d, t: calls.append((st, d, t)),
+                                  cancel_event=threading.Event())
+    assert [b['number'] for b in out] == ['n1', 'n2']
+    assert ('list', 2, 0) in calls
+    assert ('details', 2, 2) in calls
+
+
+def test_cancel_before_start():
+    import threading
+    import tl_client
+    ev = threading.Event()
+    ev.set()
+    try:
+        tl_client.fetch_details('id', 'sec', '8186',
+                                cancel_event=ev)
+    except tl_client.TLCancelled:
+        pass
+    else:
+        raise AssertionError('установленный флаг обязан дать TLCancelled')
+
+
+def test_cancel_midway(monkeypatch):
+    import threading
+    import tl_client
+    ev = threading.Event()
+    monkeypatch.setattr(tl_client, '_http', _fake_http_factory([]))
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda s: None)
+
+    def progress(stage, done, total):
+        if stage == 'details':
+            ev.set()  # отмена после первой детали
+
+    try:
+        tl_client.fetch_details('id', 'sec', '8186', '2024-01-01',
+                                progress=progress, cancel_event=ev)
+    except tl_client.TLCancelled:
+        pass
+    else:
+        raise AssertionError('отмена на середине обязана дать TLCancelled')
