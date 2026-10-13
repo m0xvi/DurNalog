@@ -709,7 +709,8 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             room = clean_room(get(row, 'room'))
             corpus = (get(row, 'corpus') if has_direct_corpus_mapping else None)
             corpus = None if blank(corpus) else corpus
-            row_has_corpus_mapping = has_direct_corpus_mapping
+            # A present-but-empty direct column is not a usable corpus mapping.
+            row_has_corpus_mapping = corpus is not None
             # TravelLine exports include direct room/corpus columns even when
             # the API could not assign a room. In that case, retain the
             # traditional guest-to-room lookup from the separate rooms file.
@@ -869,7 +870,15 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                     if count_errors:
                         errors_summary["Отсутствует корпус (КРАСНЫЙ)"] += 1
                 else:
-                    c_corpus.value = f'=IF(S{r}<50,1,2)'
+                    inferred_corpus = corpus_of(rec)
+                    if inferred_corpus is None:
+                        c_corpus.fill = FILL_ROOM
+                        if count_errors:
+                            errors_summary["Отсутствует корпус (КРАСНЫЙ)"] += 1
+                    else:
+                        # Store the inferred value, not a formula without a
+                        # cached result: previews/non-Excel readers then see it.
+                        c_corpus.value = inferred_corpus
 
             c_note = ws.cell(row=r, column=21, value=rec['dup_note'] or '')
             if rec['dup_note']:

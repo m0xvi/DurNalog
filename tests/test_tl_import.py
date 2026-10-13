@@ -461,7 +461,7 @@ def test_manual_multi_room_booking_uses_exact_stay_dates(tmp_path):
                   '14.07.2026, 12:00', 82])
     arrivals.save(rooms_path)
 
-    core.process_tchaikovsky(
+    summary, _ = core.process_tchaikovsky(
         data_path, rooms_path, output_path, TL_DATA_MAP,
         {'fio': None, 'room': '№ комнаты', 'corpus': None,
          'bron': '№ брони', 'checkin': 'Заезд', 'checkout': 'Выезд'},
@@ -471,7 +471,15 @@ def test_manual_multi_room_booking_uses_exact_stay_dates(tmp_path):
         ws.cell(row, 3).value: ws.cell(row, 19).value
         for row in range(2, ws.max_row)
     }
+    corpora_by_guest = {
+        ws.cell(row, 3).value: ws.cell(row, 20).value
+        for row in range(2, ws.max_row)
+    }
     assert rooms_by_guest == {'Иван Петров': 31, 'Ольга Сидорова': 82}
+    # The data workbook has a Corpus column, but TravelLine left its cells
+    # blank. Manual rooms still get literal corpora based on their room numbers.
+    assert corpora_by_guest == {'Иван Петров': 1, 'Ольга Сидорова': 2}
+    assert summary['Отсутствует корпус (КРАСНЫЙ)'] == 0
 
 
 def test_manual_same_booking_and_stay_dates_remain_ambiguous(tmp_path):
