@@ -324,7 +324,7 @@ def channel_label(source):
     if typ == 'BookingEngine':
         return 'TravelLine сайт'
     if typ == 'PMS':
-        return 'TravelLine ресепшн'
+        return 'TravelLine ресепшен'
     if typ == 'Channel' and code:
         return f'TravelLine {code}'
     if typ or code:

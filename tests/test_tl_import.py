@@ -100,7 +100,7 @@ def test_group_booking_two_rows():
 def test_channels():
     assert channel_label({'type': 'BookingEngine', 'code': 'PropertySite'}) \
         == 'TravelLine сайт'
-    assert channel_label({'type': 'PMS', 'code': None}) == 'TravelLine ресепшн'
+    assert channel_label({'type': 'PMS', 'code': None}) == 'TravelLine ресепшен'
     assert channel_label({'type': 'Channel', 'code': 'OTK'}) == 'TravelLine OTK'
     assert channel_label({}) == 'TravelLine ?'
 

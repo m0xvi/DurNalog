@@ -426,7 +426,7 @@ TCH_AGENTS = [
     # editable in Settings → Agents. Reception/PMS bookings are direct, 0%.
     ("TravelLine Booking Engine", [("base", 4)], ["TravelLine сайт"]),
     ("Прямые бронирования (стойка)", [("base", 0)],
-     ["TravelLine ресепшен"]),
+     ["TravelLine ресепшен", "TravelLine ресепшн"]),
 ]
 
 

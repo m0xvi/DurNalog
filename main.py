@@ -48,7 +48,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.22"
+APP_VERSION = "3.23"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -892,6 +892,18 @@ class RealApp(TurNalogApp):
             decided_none.difference_update(old_tl_none)
             self.cfg['source_none'] = sorted(decided_none)
             self.cfg['tl_agent_aliases_migrated_v320'] = True
+            save_config(self.cfg)
+        # Reception/PMS was previously emitted as the abbreviated "ресепшн";
+        # migrate a saved 0%/not-set choice so the canonical direct-booking agent
+        # is used instead of silently overriding its label on this source.
+        reception_labels = {'travelline ресепшн', 'travelline ресепшен'}
+        stale_reception_none = {
+            s for s in decided_none
+            if str(s).strip().casefold() in reception_labels
+        }
+        if stale_reception_none:
+            decided_none.difference_update(stale_reception_none)
+            self.cfg['source_none'] = sorted(decided_none)
             save_config(self.cfg)
         items = [(s, c) for s, c in counts.items()
                  if s not in decided_none

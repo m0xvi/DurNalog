@@ -508,6 +508,7 @@ def test_travelline_channel_codes_map_to_existing_chai_agents():
         'TravelLine JLB': 15,
         'TravelLine сайт': 4,
         'TravelLine ресепшен': 0,
+        'TravelLine ресепшн': 0,  # прежнее написание из выгрузок v3.22
     }
     for source, rate in expected.items():
         assert match_agent(source, agents, date=when, hotel='tch')[0] == rate, source
@@ -535,6 +536,8 @@ def test_travelline_mappings_merge_into_saved_agent_list():
     assert match_agent('TravelLine сайт', merged, hotel='tch') == (
         4, 'TravelLine Booking Engine [Чайковский]')
     assert match_agent('TravelLine ресепшен', merged, hotel='tch') == (
+        0, 'Прямые бронирования (стойка) [Чайковский]')
+    assert match_agent('TravelLine ресепшн', merged, hotel='tch') == (
         0, 'Прямые бронирования (стойка) [Чайковский]')
 
 

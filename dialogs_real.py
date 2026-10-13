@@ -116,13 +116,20 @@ class UnrecognizedSourcesDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(self, text="Нераспознанные источники",
                      font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 2))
-        ctk.CTkLabel(self, text="Укажите, к кому отнести источники. Выбор сохранится "
-                                "и в следующий раз вопрос не появится.\n«— не указано —» "
-                                "= комиссия 0% без подсветки ошибки. "
-                                "«+ новый агент»: имя возьмётся из левой колонки — впишите только %.\n"
-                                "Начните вводить название и откройте список стрелкой или клавишей ↓ — "
-                                "он уже отфильтрован.",
-                     text_color="gray", wraplength=900).pack(padx=20)
+        help_text = ("Укажите, к кому отнести источники. Выбор сохранится "
+                     "и в следующий раз вопрос не появится.\n«— не указано —» "
+                     "= комиссия 0% без подсветки ошибки. "
+                     "«+ новый агент»: имя возьмётся из левой колонки — впишите только %.\n"
+                     "Начните вводить название и откройте список стрелкой или клавишей ↓ — "
+                     "он уже отфильтрован.")
+        if any(str(src).strip().casefold() == 'travelline cmb'
+               for src, _ in items):
+            help_text += (
+                "\nTravelLine CMB — Comfort Booking: 2% относится к агрегатору; "
+                "сверху может начисляться комиссия подканала. Полную ставку по "
+                "одному коду определить нельзя — уточните подканал/договор.")
+        ctk.CTkLabel(self, text=help_text, text_color="gray",
+                     wraplength=900).pack(padx=20)
 
         sc = ctk.CTkScrollableFrame(self, fg_color=("gray88", "gray17"))
         sc.pack(fill="both", expand=True, padx=15, pady=8)
