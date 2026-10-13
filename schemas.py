@@ -40,6 +40,10 @@ TCH_ROOMS_SCHEMA = [
     dict(key='bron', label='№ брони', required=False,
          aliases=['№ брони', 'номер брони', 'бронь', 'id брони',
                   'идентификатор брони', 'booking number', 'reservation']),
+    dict(key='checkin', label='Заезд', required=False,
+         aliases=['заезд', 'дата заезда', 'прибытие', 'arrival']),
+    dict(key='checkout', label='Выезд', required=False,
+         aliases=['выезд', 'дата выезда', 'убытие', 'departure']),
 ]
 
 # Дона: те же поля, но «Категория номера» необязательна

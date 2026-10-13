@@ -430,6 +430,20 @@ def mapping_valid(mapping, headers, schema):
     return all(mapping.get(f['key']) in hs for f in schema if f['required'])
 
 
+def complete_mapping(mapping, headers, schema):
+    """Дополняет старую сохранённую схему новыми необязательными полями.
+
+    Явно сохранённое ``None`` не перезаписывается: автоподбор применяется
+    только к ключам, которых ещё не было в конфигурации.
+    """
+    result = dict(mapping or {})
+    guessed = guess_mapping(headers, schema)
+    for field in schema:
+        if field['key'] not in result:
+            result[field['key']] = guessed.get(field['key'])
+    return result
+
+
 def open_in_system(path):
     try:
         if os.name == 'nt':
@@ -505,6 +519,7 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
 
     room_mapping = {}
     room_mapping_by_bron = {}
+    booking_date_candidates = {}
     room_file_has_booking_ids = False
     has_corpus_mapping = bool(
         map_rooms.get('corpus') and map_rooms['corpus'] in df_rooms.columns)
@@ -545,9 +560,21 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             text = text.split('.', 1)[0]
         return re.sub(r'\s+', '', text)
 
+    def stay_date_key(value):
+        if blank(value):
+            return None
+        try:
+            parsed = pd.to_datetime(
+                excel_serial_to_dt(value), dayfirst=True, errors='coerce')
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return None if pd.isna(parsed) else parsed.date()
+
     guest_candidates = {}
     booking_candidates = {}
     booking_col = map_rooms.get('bron')
+    room_checkin_col = map_rooms.get('checkin')
+    room_checkout_col = map_rooms.get('checkout')
     for _, rr in df_rooms.iterrows():
         fio_col = map_rooms.get('fio')
         fio = rr[fio_col] if fio_col and fio_col in df_rooms.columns else None
@@ -567,6 +594,13 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
         if bron_key:
             room_file_has_booking_ids = True
             booking_candidates.setdefault(bron_key, []).append(info)
+            room_checkin = (stay_date_key(rr[room_checkin_col])
+                            if room_checkin_col in df_rooms.columns else None)
+            room_checkout = (stay_date_key(rr[room_checkout_col])
+                             if room_checkout_col in df_rooms.columns else None)
+            if room_checkin is not None and room_checkout is not None:
+                date_key = (bron_key, room_checkin, room_checkout)
+                booking_date_candidates.setdefault(date_key, []).append(info)
 
     # Only use a guest/booking key when it resolves to one unambiguous room.
     for key, candidates in guest_candidates.items():
@@ -578,11 +612,25 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 candidate == candidates[0] for candidate in candidates[1:]):
             room_mapping_by_bron[key] = candidates[0]
 
-    def find_room_info(guest_string, booking_value=None):
+    def find_room_info(guest_string, booking_value=None,
+                       checkin_value=None, checkout_value=None):
         bron_key = booking_key(booking_value)
         if bron_key:
             if bron_key in room_mapping_by_bron:
                 return room_mapping_by_bron[bron_key]
+            # For a multi-room booking, an exact booking + stay-date match can
+            # distinguish room changes without guessing from the room type.
+            checkin_key = stay_date_key(checkin_value)
+            checkout_key = stay_date_key(checkout_value)
+            if checkin_key is not None and checkout_key is not None:
+                date_candidates = booking_date_candidates.get(
+                    (bron_key, checkin_key, checkout_key), [])
+                if date_candidates:
+                    first = date_candidates[0]
+                    if first is not None and all(
+                            candidate == first
+                            for candidate in date_candidates[1:]):
+                        return first
             # The room file carries booking IDs, so an absent/blank match is
             # authoritative; don't borrow another booking's room by guest name.
             if room_file_has_booking_ids:
@@ -667,14 +715,15 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             # traditional guest-to-room lookup from the separate rooms file.
             if room is None or corpus is None:
                 manual_room, manual_corpus = find_room_info(
-                    guest, get(row, 'bron'))
+                    guest, get(row, 'bron'), checkin, checkout)
                 if room is None:
                     room = manual_room
                 if corpus is None and manual_corpus is not None:
                     corpus = manual_corpus
                     row_has_corpus_mapping = True
         else:
-            room, corpus = find_room_info(guest, get(row, 'bron'))
+            room, corpus = find_room_info(
+                guest, get(row, 'bron'), checkin, checkout)
             row_has_corpus_mapping = has_corpus_mapping
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,

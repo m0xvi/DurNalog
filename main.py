@@ -40,9 +40,9 @@ from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        is_tl_export, tl_import_cache_key, tl_inspection_path,
                        write_api_inspection_workbook)
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
-                  pack_originals, open_in_system, process_tchaikovsky,
-                  process_dona, process_usadba, usadba_sources,
-                  repair_notes_for)
+                  complete_mapping, pack_originals, open_in_system,
+                  process_tchaikovsky, process_dona, process_usadba,
+                  usadba_sources, repair_notes_for)
 from dialogs_real import (MappingDialog, UnrecognizedSourcesDialog,
                             TlCacheDialog, TlConfigDialog, TlProgressDialog)
 from updater import (UpdateError, check_for_updates, download_release,
@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.29"
+APP_VERSION = "3.30"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -1077,8 +1077,11 @@ class RealApp(TurNalogApp):
                     continue
                 headers = read_headers(path)
                 saved = self.cfg.get(f"{code}_{slot}", {})
-                if mapping_valid(saved.get('mapping'), headers, SCHEMAS[(code, slot)]):
-                    maps[slot] = (saved['mapping'], saved.get('extra', []))
+                schema = SCHEMAS[(code, slot)]
+                if mapping_valid(saved.get('mapping'), headers, schema):
+                    saved_mapping = complete_mapping(
+                        saved['mapping'], headers, schema)
+                    maps[slot] = (saved_mapping, saved.get('extra', []))
                 else:
                     self.current_hotel = hotel_id
                     self.open_column_map(slot)
