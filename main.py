@@ -48,7 +48,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.25"
+APP_VERSION = "3.26"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -749,6 +749,7 @@ class RealApp(TurNalogApp):
 
         def work():
             cache_error = None
+            cache_db_path = None
             if cancel_event.is_set():
                 raise TLCancelled()
             if cache_used:
@@ -775,6 +776,30 @@ class RealApp(TurNalogApp):
                 rows, rep = bookings_to_rows(details, qs, qe)
             if cancel_event.is_set():
                 raise TLCancelled()
+            # Persist the fetched/prepared data before writing temporary XLSX
+            # files: a locked temp workbook must not discard a successful API
+            # download or prevent it from being reused on the next run.
+            if not cache_used:
+                try:
+                    payload_json = encode_tl_import_cache(rows, rep)
+                    with HistoryDB() as db:
+                        cache_db_path = db.path
+                        db.put_travelline_cache(
+                            cache_key, code, property_id, qs, qe, depth,
+                            len(rows), payload_json)
+                    # Confirm the transaction survived closing/reopening the
+                    # SQLite connection before reporting a successful cache.
+                    with HistoryDB() as db:
+                        persisted = db.get_travelline_cache(cache_key)
+                    if (not persisted
+                            or persisted['payload_json'] != payload_json
+                            or persisted['row_count'] != len(rows)):
+                        raise RuntimeError('кэш не найден после записи в базу')
+                    log.info('tl_cache_write_ok path=%s rows=%s',
+                             cache_db_path, len(rows))
+                except Exception as exc:
+                    cache_error = str(exc) or repr(exc)
+                    log.exception('tl_cache_write')
             data_path, rooms_path = tl_export_paths(
                 tempfile.gettempdir(), code, y, quarter)
             write_data_workbook(rows, data_path)
@@ -783,18 +808,8 @@ class RealApp(TurNalogApp):
             write_rooms_stub(rooms_path)
             if cancel_event.is_set():
                 raise TLCancelled()
-            if not cache_used:
-                try:
-                    payload_json = encode_tl_import_cache(rows, rep)
-                    with HistoryDB() as db:
-                        db.put_travelline_cache(
-                            cache_key, code, property_id, qs, qe, depth,
-                            len(rows), payload_json)
-                except Exception as exc:
-                    cache_error = str(exc)
-                    log.exception('tl_cache_write')
             return (rows, rep, data_path, rooms_path, cache_used,
-                    cache_error, cache_fetched_at)
+                    cache_error, cache_fetched_at, cache_db_path)
 
         def done(result, err):
             self._tl_busy = False
@@ -812,7 +827,7 @@ class RealApp(TurNalogApp):
                     parent=self)
                 return
             (rows, rep, data_path, rooms_path, from_cache,
-             cache_error, fetched_at) = result
+             cache_error, fetched_at, cache_db_path) = result
             pv.set_tl_files(data_path, rooms_path)
             cache_status = (' → локальный кэш' if from_cache else
                             (' → кэш не сохранён' if cache_error else
@@ -827,9 +842,10 @@ class RealApp(TurNalogApp):
                              'запроса к API не было.')
             elif cache_error:
                 lines.append('⚠ Не удалось сохранить локальный кэш: '
-                             f'{cache_error}')
+                             f'{cache_error}\nБаза: {cache_db_path or default_db_path()}')
             else:
-                lines.append('Сохранено в локальную базу для повторного импорта.')
+                lines.append('Сохранено в локальную базу для повторного импорта:\n'
+                             f'{cache_db_path or default_db_path()}')
             lines.append(f'Быстрый запрос: изменения с {depth}; более ранние '
                          'неизменённые брони могут отсутствовать.')
             if rep['mismatch']:
