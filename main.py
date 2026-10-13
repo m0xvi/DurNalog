@@ -48,7 +48,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.27"
+APP_VERSION = "3.28"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}

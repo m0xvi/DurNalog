@@ -395,6 +395,16 @@ def _building_number(building, ordinal):
     return ordinal
 
 
+def _room_id_key(value):
+    if isinstance(value, dict):
+        nested_id = value.get('id')
+        if nested_id is None or (isinstance(nested_id, str)
+                                 and not nested_id.strip()):
+            nested_id = value.get('roomId')
+        value = nested_id
+    return '' if value is None else str(value).strip()
+
+
 def accommodation_room_map(response):
     """TravelLine ``roomId`` -> (номер, корпус, исходное имя здания).
 
@@ -424,11 +434,17 @@ def accommodation_room_map(response):
         for room in rooms:
             if not isinstance(room, dict):
                 continue
-            room_id = room.get('id')
-            if room_id is None or not str(room_id).strip():
+            room_id = _room_id_key(room.get('id'))
+            if not room_id:
+                room_id = _room_id_key(room.get('roomId'))
+            if not room_id:
                 continue
-            room_map.setdefault(str(room_id), {
-                'room': _room_number(room.get('displayName')),
+            display_name = next((room.get(field) for field in
+                                 ('displayName', 'roomNumber', 'number', 'name')
+                                 if room.get(field) is not None
+                                 and str(room.get(field)).strip()), None)
+            room_map.setdefault(room_id, {
+                'room': _room_number(display_name),
                 'corpus': corpus,
                 'building_name': building_name,
             })
@@ -591,10 +607,10 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
                                if _guest_name(g))
             rt = rs.get('roomType') or {}
             rps = rs.get('ratePlans') or []
-            room_id = rs.get('roomId')
-            assignment = (room_map.get(str(room_id))
-                          if room_id is not None and str(room_id).strip()
-                          else None)
+            room_key = _room_id_key(rs.get('roomId'))
+            if not room_key:
+                room_key = _room_id_key(rs.get('room'))
+            assignment = room_map.get(room_key) if room_key else None
             room_number = assignment.get('room') if assignment else None
             corpus = assignment.get('corpus') if assignment else None
             building_name = assignment.get('building_name', '') if assignment else ''

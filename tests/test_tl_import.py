@@ -163,6 +163,7 @@ def test_accommodation_inventory_maps_room_display_names_to_buildings():
                  'roomTypeId': 'type-2', 'floorId': 'floor-2'},
                 {'id': 'room-001', 'displayName': '001',
                  'roomTypeId': 'type-2', 'floorId': 'floor-2'},
+                {'roomId': {'id': ' room-A12 '}, 'name': 'A-12'},
             ]},
         ]},
     ]}}
@@ -174,6 +175,8 @@ def test_accommodation_inventory_maps_room_display_names_to_buildings():
     assert mapped['room-205'] == {
         'room': 205, 'corpus': 2, 'building_name': 'Main building'}
     assert mapped['room-001']['room'] == '001'
+    assert mapped['room-A12'] == {
+        'room': 'A-12', 'corpus': 2, 'building_name': 'Main building'}
     assert 'room-111' not in accommodation_room_map({'buildings': []})
 
 
@@ -187,7 +190,7 @@ def test_bookings_rows_keep_real_room_assignment_and_leave_missing_blank():
     details = [_book(stays=[assigned, unassigned, unknown], total=30000.0)]
     inventory = {'accommodationInventory': {'buildings': [{
         'name': 'Корпус 1', 'floors': [{'rooms': [
-            {'id': 'room-72', 'displayName': '72'},
+            {'id': ' room-72 ', 'displayName': '', 'roomNumber': '72'},
         ]}],
     }]}}
 
