@@ -479,8 +479,15 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     miss = [f['label'] for f in TCH_DATA_SCHEMA if f['required'] and not map_data.get(f['key'])]
     if miss:
         raise ValueError(f"Не сопоставлены колонки: {', '.join(miss)}")
-    if not (map_rooms.get('fio') and map_rooms.get('room')):
-        raise ValueError("Не сопоставлены колонки файла «Номера» (ФИО, № комнаты)")
+    has_room_name = bool(map_rooms.get('fio')
+                         and map_rooms['fio'] in df_rooms.columns)
+    has_room_booking = bool(map_rooms.get('bron')
+                            and map_rooms['bron'] in df_rooms.columns)
+    if (not map_rooms.get('room') or map_rooms['room'] not in df_rooms.columns
+            or not (has_room_name or has_room_booking)):
+        raise ValueError(
+            'В файле «Номера» сопоставьте № комнаты и хотя бы один ключ: ФИО '
+            'или № брони')
     extra_data = [c for c in (extra_data or []) if c in df_data.columns]
     extra_amount_col = next(
         (c for c in df_data.columns if _is_extra_amount_header(c)), None)
@@ -497,6 +504,8 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     ]
 
     room_mapping = {}
+    room_mapping_by_bron = {}
+    room_file_has_booking_ids = False
     has_corpus_mapping = bool(
         map_rooms.get('corpus') and map_rooms['corpus'] in df_rooms.columns)
     has_direct_room_mapping = bool(
@@ -528,20 +537,61 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             pass
         return value
 
+    def booking_key(value):
+        if blank(value):
+            return ''
+        text = str(value).strip().casefold()
+        if re.fullmatch(r'\d+\.0+', text):
+            text = text.split('.', 1)[0]
+        return re.sub(r'\s+', '', text)
+
+    guest_candidates = {}
+    booking_candidates = {}
+    booking_col = map_rooms.get('bron')
     for _, rr in df_rooms.iterrows():
-        fio = rr[map_rooms['fio']]
-        if blank(fio):
-            continue
-        guest_key = norm_name(fio)
+        fio_col = map_rooms.get('fio')
+        fio = rr[fio_col] if fio_col and fio_col in df_rooms.columns else None
+        guest_key = '' if blank(fio) else norm_name(fio)
         room = clean_room(rr[map_rooms['room']])
         corpus_col = map_rooms.get('corpus')
         corpus = (rr[corpus_col] if corpus_col and corpus_col in df_rooms.columns
                   else None)
         corpus = None if blank(corpus) else corpus
-        if guest_key and room is not None:
-            room_mapping.setdefault(guest_key, (room, corpus))
+        info = (room, corpus) if room is not None else None
+        if guest_key and info is not None:
+            guest_candidates.setdefault(guest_key, []).append(info)
 
-    def find_room_info(guest_string):
+        bron = (rr[booking_col]
+                if booking_col and booking_col in df_rooms.columns else None)
+        bron_key = booking_key(bron)
+        if bron_key:
+            room_file_has_booking_ids = True
+            booking_candidates.setdefault(bron_key, []).append(info)
+
+    # Only use a guest/booking key when it resolves to one unambiguous room.
+    for key, candidates in guest_candidates.items():
+        first = candidates[0]
+        if all(candidate == first for candidate in candidates[1:]):
+            room_mapping[key] = first
+    for key, candidates in booking_candidates.items():
+        if candidates and candidates[0] is not None and all(
+                candidate == candidates[0] for candidate in candidates[1:]):
+            room_mapping_by_bron[key] = candidates[0]
+
+    def find_room_info(guest_string, booking_value=None):
+        bron_key = booking_key(booking_value)
+        if bron_key:
+            if bron_key in room_mapping_by_bron:
+                return room_mapping_by_bron[bron_key]
+            # The room file carries booking IDs, so an absent/blank match is
+            # authoritative; don't borrow another booking's room by guest name.
+            if room_file_has_booking_ids:
+                candidates = booking_candidates.get(bron_key)
+                if not candidates or any(candidate is None
+                                         for candidate in candidates):
+                    return None, None
+                # A multi-room booking may have several different rooms; then
+                # fall through to the guest key, which must also be unique.
         if not guest_string:
             return None, None
         for guest in re.split(r'[,\n;]+', guest_string):
@@ -612,8 +662,19 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             corpus = (get(row, 'corpus') if has_direct_corpus_mapping else None)
             corpus = None if blank(corpus) else corpus
             row_has_corpus_mapping = has_direct_corpus_mapping
+            # TravelLine exports include direct room/corpus columns even when
+            # the API could not assign a room. In that case, retain the
+            # traditional guest-to-room lookup from the separate rooms file.
+            if room is None or corpus is None:
+                manual_room, manual_corpus = find_room_info(
+                    guest, get(row, 'bron'))
+                if room is None:
+                    room = manual_room
+                if corpus is None and manual_corpus is not None:
+                    corpus = manual_corpus
+                    row_has_corpus_mapping = True
         else:
-            room, corpus = find_room_info(guest)
+            room, corpus = find_room_info(guest, get(row, 'bron'))
             row_has_corpus_mapping = has_corpus_mapping
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,

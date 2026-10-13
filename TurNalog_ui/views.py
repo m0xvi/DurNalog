@@ -134,6 +134,16 @@ class ProcessView(ctk.CTkFrame):
             width=160,
         )
         self.tl_btn.pack(side="left", padx=(8, 0))
+        self.tl_inspection_path = None
+        self.tl_preview_row = ctk.CTkFrame(body, fg_color="transparent")
+        self.tl_preview_btn = GhostButton(
+            self.tl_preview_row,
+            "Просмотр данных API",
+            command=self.app.open_tl_inspection,
+            width=190,
+        )
+        self.tl_preview_btn.pack(side="left")
+        self.tl_preview_btn.configure(state="disabled")
 
     def _build_process(self, card: Card) -> None:
         head = ctk.CTkFrame(card, fg_color="transparent")
@@ -239,14 +249,18 @@ class ProcessView(ctk.CTkFrame):
         self.stat_dup.set_values(h["dup"], "дубли · фиолетовые строки")
         self.drop_data.clear()
         self.drop_rooms.clear()
+        self.tl_inspection_path = None
+        self.tl_preview_btn.configure(state="disabled")
         self.step1.set_done(False)
         self.step2.set_done(False)
         self._sync_run()
-        # TravelLine есть у Чайковского (и будет у Доны); у Усадьбы другая PMS.
+        # TravelLine есть у Чайковского и Доны; у Усадьбы другая PMS.
         if hotel_id in ("chai", "dona"):
             self.tl_btn.pack(side="left", padx=(8, 0))
+            self.tl_preview_row.pack(fill="x", pady=(6, 0))
         else:
             self.tl_btn.pack_forget()
+            self.tl_preview_row.pack_forget()
         # Файл номеров у Доны/Усадьбы не обязателен — зона остаётся, чуть бледнее.
         if h["needs_rooms"]:
             self.drop_rooms.configure(fg_color=COLORS["drop"])
@@ -275,9 +289,13 @@ class ProcessView(ctk.CTkFrame):
             zone.set_path(path)
             self.app.set_status("Файл номеров выбран")
 
-    def set_tl_files(self, data_path: str, rooms_path: str) -> None:
+    def set_tl_files(self, data_path: str, rooms_path: str,
+                     inspection_path: str | None = None) -> None:
         self.drop_data.set_path(data_path)
         self.drop_rooms.set_path(rooms_path)
+        self.tl_inspection_path = inspection_path
+        self.tl_preview_btn.configure(
+            state="normal" if inspection_path else "disabled")
         self.step1.set_done(True)
         self._sync_run()
 

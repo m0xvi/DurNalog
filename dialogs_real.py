@@ -341,10 +341,14 @@ class TlConfigDialog(ctk.CTkToplevel):
 class TlCacheDialog(ctk.CTkToplevel):
     """Выбор: использовать локальный кэш, обновить его, удалить или отменить."""
 
-    def __init__(self, master, quarter_label, cached_at, row_count):
+    def __init__(self, master, quarter_label, cached_at, row_count,
+                 room_stats=None):
         super().__init__(master)
         self.title('TravelLine — сохранённая выгрузка')
-        self.geometry('540x260')
+        has_zero_matches = bool(
+            room_stats and room_stats.get('assigned') == 0
+            and room_stats.get('unassigned', 0) > 0)
+        self.geometry('540x310' if has_zero_matches else '540x260')
         self.resizable(False, False)
         self.transient(master)
         self.result = None
@@ -359,6 +363,21 @@ class TlCacheDialog(ctk.CTkToplevel):
                   'В кэше только подготовленные строки (ФИО, бронь, даты, суммы, '
                   'номер и корпус), он хранится в turnalog_history.db.'),
             text_color='gray', justify='center', wraplength=490).pack(padx=20, pady=5)
+        if room_stats:
+            ctk.CTkLabel(
+                self,
+                text=(f'Номерной фонд: {room_stats.get("inventory_rooms", "—")}; '
+                      f'сопоставлено: {room_stats.get("assigned", "—")}; '
+                      f'без номера: {room_stats.get("unassigned", "—")}.'),
+                text_color='#566579', justify='center', wraplength=490
+            ).pack(padx=20, pady=(2, 0))
+        if has_zero_matches:
+            ctk.CTkLabel(
+                self,
+                text='⚠ В этом кэше нет ни одного сопоставленного номера. '
+                     'Выберите «Обновить из TravelLine», чтобы проверить заново.',
+                text_color='#B42318', justify='center', wraplength=490
+            ).pack(padx=20, pady=(4, 0))
         grid = ctk.CTkFrame(self, fg_color='transparent')
         grid.pack(pady=(8, 14))
         ctk.CTkButton(grid, text='Использовать кэш', width=190,

@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import json
 import threading
 import copy
 from datetime import datetime
@@ -36,7 +37,8 @@ from db import HistoryDB, set_db_path, default_db_path
 from schemas import SCHEMAS, needs_mapping
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        decode_tl_import_cache, encode_tl_import_cache,
-                       is_tl_export, tl_import_cache_key)
+                       is_tl_export, tl_import_cache_key, tl_inspection_path,
+                       write_api_inspection_workbook)
 from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   pack_originals, open_in_system, process_tchaikovsky,
                   process_dona, process_usadba, usadba_sources,
@@ -48,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.28"
+APP_VERSION = "3.29"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -679,9 +681,15 @@ class RealApp(TurNalogApp):
         cache_used, cache_fetched_at = False, None
         cached_rows, cached_rep = None, None
         if cache_record:
+            cache_room_stats = None
+            try:
+                cached_report = json.loads(cache_record['payload_json']).get('report', {})
+                cache_room_stats = cached_report.get('room_assignments')
+            except Exception:
+                pass
             cache_dlg = TlCacheDialog(
                 self, f'{quarter}/{year}', cache_record['fetched_at'],
-                cache_record['row_count'])
+                cache_record['row_count'], room_stats=cache_room_stats)
             self.wait_window(cache_dlg)
             choice = cache_dlg.result or 'cancel'
             if choice == 'cancel':
@@ -752,6 +760,8 @@ class RealApp(TurNalogApp):
             cache_db_path = None
             if cancel_event.is_set():
                 raise TLCancelled()
+            api_details = None
+            room_inventory = None
             if cache_used:
                 rows, rep = cached_rows, cached_rep
             else:
@@ -782,6 +792,7 @@ class RealApp(TurNalogApp):
                     details, room_inventory = fetched
                 else:
                     details, room_inventory = fetched, None
+                api_details = details
                 rows, rep = bookings_to_rows(
                     details, qs, qe, accommodation_inventory=room_inventory)
             if cancel_event.is_set():
@@ -821,8 +832,18 @@ class RealApp(TurNalogApp):
                 write_rooms_stub(rooms_path)
             if cancel_event.is_set():
                 raise TLCancelled()
+            inspection_path = tl_inspection_path(
+                tempfile.gettempdir(), code, y, quarter)
+            try:
+                write_api_inspection_workbook(
+                    rows, rep, inspection_path, details=api_details,
+                    accommodation_inventory=room_inventory)
+            except Exception:
+                log.exception('tl_inspection_export')
+                inspection_path = None
             return (rows, rep, data_path, rooms_path, cache_used,
-                    cache_error, cache_fetched_at, cache_db_path)
+                    cache_error, cache_fetched_at, cache_db_path,
+                    inspection_path)
 
         def done(result, err):
             self._tl_busy = False
@@ -840,8 +861,9 @@ class RealApp(TurNalogApp):
                     parent=self)
                 return
             (rows, rep, data_path, rooms_path, from_cache,
-             cache_error, fetched_at, cache_db_path) = result
-            pv.set_tl_files(data_path, rooms_path)
+             cache_error, fetched_at, cache_db_path,
+             inspection_path) = result
+            pv.set_tl_files(data_path, rooms_path, inspection_path)
             cache_status = (' → локальный кэш' if from_cache else
                             (' → кэш не сохранён' if cache_error else
                              ' → сохранено в локальную базу'))
@@ -868,20 +890,46 @@ class RealApp(TurNalogApp):
                     f'проживаний с номером: {room_stats["assigned"]}; '
                     f'без назначенного/сопоставленного номера: '
                     f'{room_stats["unassigned"]}.')
+                lines.append(
+                    f'Поля roomId/room заполнены: '
+                    f'{room_stats.get("room_id_present", "—")}; пустые: '
+                    f'{room_stats.get("room_id_missing", "—")}; ID не найдены '
+                    f'в фонде: {room_stats.get("room_id_not_in_inventory", "—")}; '
+                    f'у комнат без номера: '
+                    f'{room_stats.get("inventory_no_display", "—")}.' )
                 if room_stats['inventory_rooms'] == 0:
                     lines.append(
                         '⚠ TravelLine не вернул комнаты из PMS API. Проверьте '
                         'право на чтение номерного фонда (PMS API/PropertyRoom).')
                 elif room_stats['unassigned']:
                     lines.append(
-                        'Проживания без назначенного номера оставлены без '
-                        'номера и корпуса, без подстановки по roomId.')
+                        'Проживания без найденного номера оставлены пустыми; '
+                        'ID API не подставляется как номер.')
+                if room_stats.get('assigned') == 0 and room_stats['unassigned']:
+                    lines.append(
+                        '⚠ Ни одно проживание не сопоставлено. В «Просмотр '
+                        'выгрузки» проверьте листы «Проживания API» и '
+                        '«Номерной фонд API».')
+                samples = room_stats.get('unknown_room_id_samples') or []
+                if samples:
+                    lines.append('Примеры ID без совпадения: '
+                                 + ', '.join(map(str, samples[:8])))
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')
                 for mismatch in rep['mismatch'][:20]:
                     log.warning('TL mismatch %s', mismatch)
             lines.append('Файлы подставлены — нажмите «Обработать и сохранить».')
+            if inspection_path:
+                lines.append('Открыть книгу экспорта/диагностики можно кнопкой '
+                             '«Просмотр данных API» под кнопкой TravelLine.')
+                if from_cache:
+                    lines.append('В кэше нет сырых ответов API. Чтобы увидеть '
+                                 'фактические roomId и поля номерного фонда, '
+                                 'выберите «Обновить из TravelLine».')
+            else:
+                lines.append('⚠ Не удалось создать книгу просмотра; подробности '
+                             'записаны в turnalog.log.')
             messagebox.showinfo('TravelLine', '\n'.join(lines), parent=self)
 
         def runner():
@@ -894,6 +942,16 @@ class RealApp(TurNalogApp):
             self.after(0, lambda: done(r, e))
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def open_tl_inspection(self):
+        path = getattr(self.process_view, 'tl_inspection_path', None)
+        if not path or not os.path.isfile(path):
+            messagebox.showinfo(
+                'TravelLine',
+                'Сначала нажмите «↓ TravelLine», чтобы подготовить файл просмотра.',
+                parent=self)
+            return
+        open_in_system(path)
 
     # ---------- сопоставление колонок (боевое) ----------
 

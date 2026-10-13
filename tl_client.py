@@ -52,7 +52,7 @@ TL_DATA_MAP = {'guest': COL_GUEST, 'price': COL_PRICE, 'checkin': COL_IN,
                'room': COL_ROOM, 'corpus': COL_CORPUS}
 TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
-                'building_name': COL_BUILDING_NAME}
+                'building_name': COL_BUILDING_NAME, 'bron': COL_BRON}
 
 
 class TLApiError(Exception):
@@ -528,7 +528,11 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
            'rows': 0, 'mismatch': [], 'channels': {}}
     if has_room_inventory:
         rep['room_assignments'] = {
-            'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0}
+            'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0,
+            'room_id_present': 0, 'room_id_missing': 0,
+            'room_id_not_in_inventory': 0, 'inventory_no_display': 0,
+            'unknown_room_id_samples': [],
+        }
     for b in details or []:
         if b.get('status') == 'Cancelled':
             rep['cancelled'] += 1
@@ -615,8 +619,18 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
             corpus = assignment.get('corpus') if assignment else None
             building_name = assignment.get('building_name', '') if assignment else ''
             if has_room_inventory:
+                room_stats = rep['room_assignments']
+                room_stats['room_id_present' if room_key
+                           else 'room_id_missing'] += 1
+                if room_key and assignment is None:
+                    room_stats['room_id_not_in_inventory'] += 1
+                    samples = room_stats['unknown_room_id_samples']
+                    if room_key not in samples and len(samples) < 20:
+                        samples.append(room_key)
+                elif assignment is not None and room_number is None:
+                    room_stats['inventory_no_display'] += 1
                 bucket = 'assigned' if room_number is not None else 'unassigned'
-                rep['room_assignments'][bucket] += 1
+                room_stats[bucket] += 1
             rows.append({
                 COL_GUEST: guests,
                 COL_PRICE: round(base, 2),
@@ -679,7 +693,7 @@ def write_rooms_workbook(rows, path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'Номера'
-    ws.append(['ФИО', COL_ROOM, COL_CORPUS, COL_BUILDING_NAME])
+    ws.append(['ФИО', COL_ROOM, COL_CORPUS, COL_BUILDING_NAME, COL_BRON])
     for row in rows or []:
         guests = [name.strip() for name in
                   re.split(r'[,;\n]+', str(row.get(COL_GUEST) or ''))
@@ -688,7 +702,230 @@ def write_rooms_workbook(rows, path):
             guests = ['']
         for guest in guests:
             ws.append([guest, row.get(COL_ROOM), row.get(COL_CORPUS),
-                       row.get(COL_BUILDING_NAME) or ''])
+                       row.get(COL_BUILDING_NAME) or '', row.get(COL_BRON)])
+    wb.save(path)
+
+
+def tl_inspection_path(tmpdir, code, year, quarter):
+    """Путь к локальной книге для просмотра выгрузки/диагностики TravelLine."""
+    return f'{tmpdir}/TL_{code}_{year}{quarter}_inspection.xlsx'
+
+
+def _inspection_json(value, limit=32000):
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) > limit:
+        return text[:limit - 24] + ' … [обрезано]'
+    return text
+
+
+def _inspection_cell(value):
+    if value is None:
+        return ''
+    if isinstance(value, (dict, list, tuple)):
+        return _inspection_json(value)
+    return value
+
+
+def _inspection_redact(value):
+    """Сохраняет техполя для отладки, убирая ФИО/контакты из сырого JSON."""
+    private_parts = ('guest', 'name', 'email', 'phone', 'passport',
+                     'document', 'contact')
+    if isinstance(value, dict):
+        return {
+            key: ('<скрыто>' if any(part in str(key).casefold()
+                                    for part in private_parts)
+                  else _inspection_redact(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_inspection_redact(item) for item in value]
+    return value
+
+
+def write_api_inspection_workbook(rows, report, path, details=None,
+                                  accommodation_inventory=None):
+    """Создаёт открытую пользователю книгу с экспортом и сырой диагностикой.
+
+    В кэше TravelLine хранятся только подготовленные строки. Если ``details``
+    отсутствует, книга честно помечает, что исходные API поля доступны только
+    после выбора «Обновить из TravelLine».
+    """
+    wb = openpyxl.Workbook()
+    summary = wb.active
+    summary.title = 'Сводка'
+    stats = (report or {}).get('room_assignments') or {}
+
+    def stat_value(key):
+        return stats.get(key, '—' if details is None else 0)
+
+    summary_rows = [
+        ('Источник', 'Свежий ответ TravelLine' if details is not None
+         else 'Локальный кэш (без исходных ответов API)'),
+        ('Брони в ответе API', len(details) if details is not None else 'нет в кэше'),
+        ('Подготовлено строк для приложения', len(rows or [])),
+        ('Комнат в извлечённом API-инвентаре', stats.get('inventory_rooms', 0)),
+        ('Проживаний сопоставлено с номером', stats.get('assigned', 0)),
+        ('Проживаний без номера', stats.get('unassigned', 0)),
+        ('Проживаний с roomId/room', stat_value('room_id_present')),
+        ('Проживаний без roomId/room', stat_value('room_id_missing')),
+        ('ID не найден в инвентаре', stat_value('room_id_not_in_inventory')),
+        ('Комната найдена, но нет отображаемого номера',
+         stat_value('inventory_no_display')),
+    ]
+    if details is None:
+        summary_rows.append((
+            'Важно', 'Кэш содержит только готовые строки; выберите '
+            '«Обновить из TravelLine», чтобы получить исходные roomId и инвентарь.'))
+    for item in summary_rows:
+        summary.append(item)
+    if stats.get('unknown_room_id_samples'):
+        summary.append(('Примеры ID без совпадения',
+                        ', '.join(map(str, stats['unknown_room_id_samples']))))
+    summary.column_dimensions['A'].width = 48
+    summary.column_dimensions['B'].width = 100
+    summary.freeze_panes = 'A1'
+
+    data_sheet = wb.create_sheet('Данные')
+    data_columns = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
+                    COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
+                    COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS,
+                    COL_BUILDING_NAME]
+    data_sheet.append(data_columns)
+    for row in rows or []:
+        data_sheet.append([row.get(column) for column in data_columns])
+
+    rooms_sheet = wb.create_sheet('Номера')
+    rooms_sheet.append(['ФИО', COL_ROOM, COL_CORPUS,
+                        COL_BUILDING_NAME, COL_BRON])
+    for row in rows or []:
+        guests = [name.strip() for name in
+                  re.split(r'[,;\n]+', str(row.get(COL_GUEST) or ''))
+                  if name.strip()]
+        if not guests:
+            guests = ['']
+        for guest in guests:
+            rooms_sheet.append([guest, row.get(COL_ROOM), row.get(COL_CORPUS),
+                                row.get(COL_BUILDING_NAME) or '',
+                                row.get(COL_BRON)])
+
+    inventory_sheet = wb.create_sheet('Номерной фонд API')
+    inventory_headers = [
+        '№ корпуса', 'ID корпуса', 'Корпус API', 'ID этажа', 'Этаж API',
+        'room.id', 'room.roomId', 'displayName', 'roomNumber', 'number', 'name',
+        'Поля комнаты (JSON)',
+    ]
+    inventory_sheet.append(inventory_headers)
+    inventory = accommodation_inventory
+    if isinstance(inventory, dict) and isinstance(
+            inventory.get('accommodationInventory'), dict):
+        inventory = inventory['accommodationInventory']
+    buildings = inventory.get('buildings') if isinstance(inventory, dict) else None
+    if isinstance(buildings, list):
+        for building_index, building in enumerate(buildings, 1):
+            if not isinstance(building, dict):
+                continue
+            room_entries = [(None, room) for room in (building.get('rooms') or [])]
+            for floor in building.get('floors') or []:
+                if isinstance(floor, dict):
+                    room_entries.extend((floor, room)
+                                        for room in (floor.get('rooms') or []))
+            for floor, room in room_entries:
+                if not isinstance(room, dict):
+                    continue
+                inventory_sheet.append([
+                    _building_number(building, building_index),
+                    _inspection_cell(building.get('id')),
+                    building.get('name') or '',
+                    _inspection_cell(floor.get('id')) if floor else '',
+                    floor.get('name') or '' if floor else '',
+                    _inspection_cell(room.get('id')),
+                    _inspection_cell(room.get('roomId')),
+                    _inspection_cell(room.get('displayName')),
+                    _inspection_cell(room.get('roomNumber')),
+                    _inspection_cell(room.get('number')),
+                    _inspection_cell(room.get('name')),
+                    _inspection_json(_inspection_redact(room)),
+                ])
+    if inventory_sheet.max_row == 1:
+        inventory_sheet.append(['Нет сырого номерного фонда в этой выгрузке.'])
+
+    stays_sheet = wb.create_sheet('Проживания API')
+    stays_sheet.append([
+        '№ брони', '№ проживания', 'pmsRoomStayId', 'roomId', 'room',
+        'roomTypeId', 'roomType', 'Заезд API', 'Выезд API', 'Все ключи roomStay',
+        'Поля размещения (JSON)', 'roomId использован из',
+        'Результат сопоставления', 'Номер из инвентаря', 'Корпус',
+    ])
+    room_map = accommodation_room_map(accommodation_inventory)
+    if details is not None:
+        for booking in details or []:
+            if not isinstance(booking, dict):
+                continue
+            booking_number = booking.get('number') or ''
+            for index, stay in enumerate(booking.get('roomStays') or [], 1):
+                if not isinstance(stay, dict):
+                    stays_sheet.append([booking_number, index, '', '', '', '', '',
+                                        '', '', '', _inspection_json(stay), '',
+                                        'roomStay не является объектом', '', ''])
+                    continue
+                raw_room_id = stay.get('roomId')
+                raw_room = stay.get('room')
+                room_key = _room_id_key(raw_room_id)
+                room_id_source = 'roomId'
+                if not room_key:
+                    room_key = _room_id_key(raw_room)
+                    room_id_source = 'room' if room_key else ''
+                assignment = room_map.get(room_key) if room_key else None
+                if not room_key:
+                    match_status = 'roomId/room отсутствует'
+                elif assignment is None:
+                    match_status = 'ID не найден в инвентаре'
+                elif assignment.get('room') is None:
+                    match_status = 'ID найден, display name отсутствует'
+                else:
+                    match_status = 'Сопоставлено'
+                room_type = stay.get('roomType') or {}
+                if isinstance(room_type, dict):
+                    room_type = room_type.get('name') or room_type.get('displayName') \
+                        or _inspection_json(room_type)
+                stay_dates = stay.get('stayDates') or {}
+                safe_stay = _inspection_redact(stay)
+                stays_sheet.append([
+                    booking_number, index,
+                    _inspection_cell(stay.get('pmsRoomStayId')),
+                    _inspection_cell(raw_room_id), _inspection_cell(raw_room),
+                    _inspection_cell(stay.get('roomTypeId')),
+                    _inspection_cell(room_type),
+                    _inspection_cell(stay_dates.get('arrivalDateTime'))
+                    if isinstance(stay_dates, dict) else '',
+                    _inspection_cell(stay_dates.get('departureDateTime'))
+                    if isinstance(stay_dates, dict) else '',
+                    ', '.join(map(str, stay.keys())),
+                    _inspection_json(safe_stay), room_id_source, match_status,
+                    assignment.get('room') if assignment else None,
+                    assignment.get('corpus') if assignment else None,
+                ])
+    if details is None:
+        stays_sheet.append([
+            'Сырые проживания не сохранены в кэше. Нажмите «Обновить из TravelLine».'])
+    elif stays_sheet.max_row == 1:
+        stays_sheet.append(['В API-ответе нет roomStays.'])
+
+    default_widths = {
+        'Данные': [26, 16, 20, 20, 26, 28, 26, 10, 28, 14, 48, 20, 16, 16, 12, 28],
+        'Номера': [32, 16, 12, 28, 28],
+        'Номерной фонд API': [12, 18, 28, 18, 24, 28, 28, 22, 22, 18, 26, 72],
+        'Проживания API': [28, 12, 28, 32, 32, 24, 32, 24, 24, 54, 72, 18, 36, 20, 14],
+    }
+    for worksheet in wb.worksheets:
+        worksheet.freeze_panes = 'A2' if worksheet.max_row > 1 else 'A1'
+        if worksheet.max_row > 1 and worksheet.title != 'Сводка':
+            worksheet.auto_filter.ref = worksheet.dimensions
+        for index, width in enumerate(default_widths.get(worksheet.title, []), 1):
+            worksheet.column_dimensions[openpyxl.utils.get_column_letter(index)].width = width
     wb.save(path)
 
 

@@ -31,12 +31,15 @@ TCH_DATA_SCHEMA = [
 ]
 
 TCH_ROOMS_SCHEMA = [
-    dict(key='fio',  label='ФИО',       required=True,
+    dict(key='fio',  label='ФИО',       required=False,
          aliases=['фио', 'гость', 'имя', 'проживающий']),
     dict(key='room', label='№ комнаты', required=True,
          aliases=['№ комнаты', 'номер комнаты', 'комната', 'номер', 'room']),
     dict(key='corpus', label='Корпус', required=False,
          aliases=['корпус', 'здание', 'building']),
+    dict(key='bron', label='№ брони', required=False,
+         aliases=['№ брони', 'номер брони', 'бронь', 'id брони',
+                  'идентификатор брони', 'booking number', 'reservation']),
 ]
 
 # Дона: те же поля, но «Категория номера» необязательна

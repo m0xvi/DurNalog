@@ -10,8 +10,8 @@ from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        ROOM_LABEL_TEXT_PREFIX, accommodation_room_map,
                        bookings_to_rows, channel_label,
-                       is_tl_export, write_data_workbook,
-                       write_rooms_workbook)
+                       is_tl_export, write_api_inspection_workbook,
+                       write_data_workbook, write_rooms_workbook)
 
 
 def _service(value):
@@ -198,8 +198,53 @@ def test_bookings_rows_keep_real_room_assignment_and_leave_missing_blank():
 
     assert [row['№ комнаты'] for row in rows] == [72, None, None]
     assert [row['Корпус'] for row in rows] == [1, None, None]
-    assert report['room_assignments'] == {
-        'inventory_rooms': 1, 'assigned': 1, 'unassigned': 2}
+    assert report['room_assignments']['inventory_rooms'] == 1
+    assert report['room_assignments']['assigned'] == 1
+    assert report['room_assignments']['unassigned'] == 2
+    assert report['room_assignments']['room_id_present'] == 2
+    assert report['room_assignments']['room_id_missing'] == 1
+    assert report['room_assignments']['room_id_not_in_inventory'] == 1
+
+
+def test_room_diagnostic_workbook_shows_api_ids_and_match_reasons(tmp_path):
+    import openpyxl
+
+    assigned = _stay()
+    assigned.update({'roomId': 'room-72', 'pmsRoomStayId': 'stay-assigned'})
+    missing = _stay()
+    missing.update({'roomId': None, 'pmsRoomStayId': 'stay-missing'})
+    unknown = _stay()
+    unknown.update({'roomId': 'room-new', 'pmsRoomStayId': 'stay-unknown'})
+    details = [_book(stays=[assigned, missing, unknown], total=30000.0)]
+    inventory = {'accommodationInventory': {'buildings': [{
+        'id': 'building-1', 'name': 'Корпус 1', 'floors': [{
+            'id': 'floor-1', 'name': '1 этаж', 'rooms': [
+                {'id': 'room-72', 'displayName': '72'},
+            ],
+        }],
+    }]}}
+    rows, report = bookings_to_rows(details, QS, QE, inventory)
+    stats = report['room_assignments']
+    assert stats['room_id_present'] == 2
+    assert stats['room_id_missing'] == 1
+    assert stats['room_id_not_in_inventory'] == 1
+    assert stats['unknown_room_id_samples'] == ['room-new']
+
+    path = str(tmp_path / 'inspection.xlsx')
+    write_api_inspection_workbook(
+        rows, report, path, details=details,
+        accommodation_inventory=inventory)
+    wb = openpyxl.load_workbook(path, data_only=True)
+    stays = wb['Проживания API']
+    headers = [cell.value for cell in stays[1]]
+    status_col = headers.index('Результат сопоставления') + 1
+    room_id_col = headers.index('roomId') + 1
+    values = list(stays.iter_rows(min_row=2, values_only=True))
+    assert [row[status_col - 1] for row in values] == [
+        'Сопоставлено', 'roomId/room отсутствует', 'ID не найден в инвентаре']
+    assert values[2][room_id_col - 1] == 'room-new'
+    assert wb['Номерной фонд API']['F2'].value == 'room-72'
+    assert wb['Данные']['N2'].value == 72
 
 
 def test_tl_room_workbooks_drive_corpus_and_do_not_guess_unassigned_stay(tmp_path):
@@ -245,6 +290,124 @@ def test_tl_room_workbooks_drive_corpus_and_do_not_guess_unassigned_stay(tmp_pat
     assert corpus_2['S2'].value == 15 and corpus_2['T2'].value == 2
     assert no_corpus['A2'].value == 'unassigned'
     assert no_corpus['S2'].value is None and no_corpus['T2'].value is None
+
+
+def test_manual_rooms_fill_blank_direct_room_from_exported_data(tmp_path):
+    import openpyxl
+    import core
+
+    stay = _stay(guests=(('Иван', 'Петров'),))
+    stay.update({'roomId': None, 'pmsRoomStayId': 'stay-unassigned'})
+    rows, _ = bookings_to_rows([_book(stays=[stay])], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'manual_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    manual_rooms = openpyxl.Workbook()
+    sheet = manual_rooms.active
+    sheet.title = 'Номера'
+    sheet.append(['ФИО', '№ комнаты', 'Корпус'])
+    sheet.append(['Иван Петров', 72, 1])
+    manual_rooms.save(rooms_path)
+
+    summary, _ = core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': 'ФИО', 'room': '№ комнаты', 'corpus': 'Корпус'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+
+    report = openpyxl.load_workbook(output_path, data_only=False)['1']
+    assert report['S2'].value == 72 and report['T2'].value == 1
+    assert summary['Отсутствует № комнаты (КРАСНЫЙ)'] == 0
+
+
+def test_manual_rooms_prefer_booking_number_when_guest_repeats(tmp_path):
+    import openpyxl
+    import core
+
+    stay = _stay(guests=(('Иван', 'Петров'),))
+    stay.update({'roomId': None, 'pmsRoomStayId': 'stay-unassigned'})
+    data = _book(number='book-1', stays=[stay])
+    rows, _ = bookings_to_rows([data], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'manual_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    manual_rooms = openpyxl.Workbook()
+    sheet = manual_rooms.active
+    sheet.append(['ФИО', '№ комнаты', 'Корпус', '№ брони'])
+    sheet.append(['Иван Петров', 55, 2, 'other-book'])
+    sheet.append(['Иван Петров', 72, 1, 'book-1'])
+    manual_rooms.save(rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': 'ФИО', 'room': '№ комнаты', 'corpus': 'Корпус',
+         'bron': '№ брони'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    report = openpyxl.load_workbook(output_path, data_only=False)['1']
+    assert report['S2'].value == 72 and report['T2'].value == 1
+
+
+def test_manual_rooms_can_join_by_booking_without_guest_column(tmp_path):
+    import openpyxl
+    import core
+
+    stay = _stay(guests=(('Иван', 'Петров'),))
+    stay.update({'roomId': None, 'pmsRoomStayId': 'stay-unassigned'})
+    rows, _ = bookings_to_rows(
+        [_book(number='book-91', stays=[stay])], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'manual_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    manual_rooms = openpyxl.Workbook()
+    sheet = manual_rooms.active
+    sheet.append(['№ брони', '№ комнаты', 'Корпус'])
+    sheet.append(['book-91', 91, 2])
+    manual_rooms.save(rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': None, 'room': '№ комнаты', 'corpus': 'Корпус',
+         'bron': '№ брони'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    report = openpyxl.load_workbook(output_path, data_only=False)['2']
+    assert report['S2'].value == 91 and report['T2'].value == 2
+
+
+def test_manual_multi_room_booking_uses_unique_guest_after_booking_is_ambiguous(tmp_path):
+    import openpyxl
+    import core
+
+    first = _stay(guests=(('Иван', 'Петров'),))
+    first.update({'roomId': None, 'pmsRoomStayId': 'stay-1'})
+    second = _stay(guests=(('Ольга', 'Сидорова'),))
+    second.update({'roomId': None, 'pmsRoomStayId': 'stay-2'})
+    rows, _ = bookings_to_rows(
+        [_book(number='group-booking', stays=[first, second])], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'manual_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    manual_rooms = openpyxl.Workbook()
+    sheet = manual_rooms.active
+    sheet.append(['ФИО', '№ комнаты', 'Корпус', '№ брони'])
+    sheet.append(['Иван Петров', 31, 1, 'group-booking'])
+    sheet.append(['Ольга Сидорова', 82, 2, 'group-booking'])
+    manual_rooms.save(rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': 'ФИО', 'room': '№ комнаты', 'corpus': 'Корпус',
+         'bron': '№ брони'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    wb = openpyxl.load_workbook(output_path, data_only=False)
+    assert wb['1']['S2'].value == 31
+    assert wb['2']['S2'].value == 82
 
 
 def test_rooms_workbook_keeps_room_when_api_stay_has_no_guest_name(tmp_path):
@@ -316,7 +479,7 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     assert all(c in headers for c in TL_EXTRA)
     dr = read_table(rp)
     assert list(dr.columns) == ['ФИО', '№ комнаты', 'Корпус',
-                                'Здание TravelLine']
+                                'Здание TravelLine', '№ брони']
     assert len(dr) == 1
     assert dr.iloc[0]['ФИО'] == 'Иван Петров'
     assert dr['№ комнаты'].isna().all() and dr['Корпус'].isna().all()
