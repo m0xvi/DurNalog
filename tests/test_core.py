@@ -667,7 +667,7 @@ def test_travelline_mappings_merge_into_saved_agent_list():
 
 def test_travelline_cache_survives_connection_restart(tmp_path):
     path = str(tmp_path / 'cache-persistent.db')
-    key = 'tlcache-v3|tch|8186|2026-07-01|2026-10-01|2026-07-01'
+    key = 'tlcache-v4|tch|8186|2026-07-01|2026-10-01|2026-07-01'
     payload = '{"rows":[{"Гость":"Иван Петров"}],"report":{}}'
     with HistoryDB(path) as db:
         db.put_travelline_cache(
@@ -681,7 +681,7 @@ def test_travelline_cache_survives_connection_restart(tmp_path):
 
 def test_travelline_cache_crud_and_refresh(tmp_path):
     path = str(tmp_path / 'cache.db')
-    key = 'tlcache-v3|tch|8186|2026-07-01|2026-10-01|2026-07-01'
+    key = 'tlcache-v4|tch|8186|2026-07-01|2026-10-01|2026-07-01'
     with HistoryDB(path) as db:
         assert db.get_travelline_cache(key) is None
         db.put_travelline_cache(

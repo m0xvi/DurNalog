@@ -6,9 +6,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import mapping_valid, read_table
-from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA
-from tl_client import (TL_DATA_MAP, TL_EXTRA, bookings_to_rows, channel_label,
-                       is_tl_export, write_data_workbook, write_rooms_stub)
+from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
+from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
+                       ROOM_LABEL_TEXT_PREFIX, accommodation_room_map,
+                       bookings_to_rows, channel_label,
+                       is_tl_export, write_data_workbook,
+                       write_rooms_workbook)
 
 
 def _service(value):
@@ -146,19 +149,162 @@ def test_channels():
     assert channel_label({}) == 'TravelLine ?'
 
 
+def test_accommodation_inventory_maps_room_display_names_to_buildings():
+    inventory = {'accommodationInventory': {'buildings': [
+        {'id': 'building-1', 'name': 'Корпус № 1', 'floors': [
+            {'id': 'floor-1', 'name': '1 этаж', 'rooms': [
+                {'id': 'room-111', 'displayName': '111',
+                 'roomTypeId': 'type-1', 'floorId': 'floor-1'},
+            ]},
+        ]},
+        {'id': 'building-2', 'name': 'Main building', 'floors': [
+            {'id': 'floor-2', 'name': '2 этаж', 'rooms': [
+                {'id': 'room-205', 'displayName': '205',
+                 'roomTypeId': 'type-2', 'floorId': 'floor-2'},
+                {'id': 'room-001', 'displayName': '001',
+                 'roomTypeId': 'type-2', 'floorId': 'floor-2'},
+            ]},
+        ]},
+    ]}}
+
+    mapped = accommodation_room_map(inventory)
+    assert mapped['room-111'] == {
+        'room': 111, 'corpus': 1, 'building_name': 'Корпус № 1'}
+    # Arbitrary building names have no number: use their stable API position.
+    assert mapped['room-205'] == {
+        'room': 205, 'corpus': 2, 'building_name': 'Main building'}
+    assert mapped['room-001']['room'] == '001'
+    assert 'room-111' not in accommodation_room_map({'buildings': []})
+
+
+def test_bookings_rows_keep_real_room_assignment_and_leave_missing_blank():
+    assigned = _stay(guests=(('Иван', 'Петров'),))
+    assigned.update({'roomId': 'room-72', 'pmsRoomStayId': 'stay-assigned'})
+    unassigned = _stay(guests=(('Иван', 'Петров'),))
+    unassigned.update({'roomId': None, 'pmsRoomStayId': 'stay-unassigned'})
+    unknown = _stay(guests=(('Петр', 'Сидоров'),))
+    unknown.update({'roomId': 'not-in-inventory', 'pmsRoomStayId': 'stay-unknown'})
+    details = [_book(stays=[assigned, unassigned, unknown], total=30000.0)]
+    inventory = {'accommodationInventory': {'buildings': [{
+        'name': 'Корпус 1', 'floors': [{'rooms': [
+            {'id': 'room-72', 'displayName': '72'},
+        ]}],
+    }]}}
+
+    rows, report = bookings_to_rows(details, QS, QE, inventory)
+
+    assert [row['№ комнаты'] for row in rows] == [72, None, None]
+    assert [row['Корпус'] for row in rows] == [1, None, None]
+    assert report['room_assignments'] == {
+        'inventory_rooms': 1, 'assigned': 1, 'unassigned': 2}
+
+
+def test_tl_room_workbooks_drive_corpus_and_do_not_guess_unassigned_stay(tmp_path):
+    import openpyxl
+    import core
+
+    first = _stay(guests=(('Иван', 'Петров'),))
+    first.update({'roomId': 'room-72', 'pmsRoomStayId': 'stay-1'})
+    second = _stay(guests=(('Ольга', 'Сидорова'),))
+    second.update({'roomId': 'room-15', 'pmsRoomStayId': 'stay-2'})
+    no_room = _stay(guests=(('Иван', 'Петров'),))
+    no_room.update({'roomId': None, 'pmsRoomStayId': 'stay-3'})
+    details = [
+        _book(number='assigned-1', stays=[first]),
+        _book(number='assigned-2', stays=[second]),
+        _book(number='unassigned', stays=[no_room]),
+    ]
+    inventory = {'accommodationInventory': {'buildings': [
+        {'name': 'Корпус 1', 'floors': [{'rooms': [
+            {'id': 'room-72', 'displayName': '72'},
+        ]}]},
+        {'name': 'Корпус 2', 'floors': [{'rooms': [
+            {'id': 'room-15', 'displayName': '15'},
+        ]}]},
+    ]}}
+    rows, _ = bookings_to_rows(details, QS, QE, inventory)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+    write_rooms_workbook(rows, rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP, TL_ROOMS_MAP,
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    wb = openpyxl.load_workbook(output_path, data_only=False)
+    corpus_1 = wb['1']
+    corpus_2 = wb['2']
+    no_corpus = wb['нет корпуса']
+    assert corpus_1['A2'].value == 'assigned-1'
+    assert corpus_1['S2'].value == 72 and corpus_1['T2'].value == 1
+    assert corpus_2['A2'].value == 'assigned-2'
+    assert corpus_2['S2'].value == 15 and corpus_2['T2'].value == 2
+    assert no_corpus['A2'].value == 'unassigned'
+    assert no_corpus['S2'].value is None and no_corpus['T2'].value is None
+
+
+def test_rooms_workbook_keeps_room_when_api_stay_has_no_guest_name(tmp_path):
+    stay = _stay(guests=())
+    stay.update({'roomId': 'room-44', 'pmsRoomStayId': 'stay-44'})
+    inventory = {'accommodationInventory': {'buildings': [{
+        'name': 'Корпус 1', 'floors': [{'rooms': [
+            {'id': 'room-44', 'displayName': '44'},
+        ]}],
+    }]}}
+    rows, _ = bookings_to_rows([_book(stays=[stay])], QS, QE, inventory)
+    rooms_path = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    write_rooms_workbook(rows, rooms_path)
+
+    rooms = read_table(rooms_path)
+    assert len(rooms) == 1
+    assert rooms['ФИО'].isna().all()
+    assert rooms.iloc[0]['№ комнаты'] == 44
+    assert rooms.iloc[0]['Корпус'] == 1
+
+
+def test_string_room_label_survives_excel_and_report_roundtrip(tmp_path):
+    import openpyxl
+    import core
+
+    stay = _stay(guests=(('Иван', 'Петров'),))
+    stay.update({'roomId': 'room-zero', 'pmsRoomStayId': 'stay-zero'})
+    inventory = {'accommodationInventory': {'buildings': [{
+        'name': 'Корпус 1', 'floors': [{'rooms': [
+            {'id': 'room-zero', 'displayName': '001'},
+        ]}],
+    }]}}
+    rows, _ = bookings_to_rows([_book(stays=[stay])], QS, QE, inventory)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+    write_rooms_workbook(rows, rooms_path)
+
+    data = read_table(data_path)
+    assert data.iloc[0]['№ комнаты'] == ROOM_LABEL_TEXT_PREFIX + '001'
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP, TL_ROOMS_MAP,
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    report = openpyxl.load_workbook(output_path, data_only=False)['1']
+    assert report['S2'].value == '001'
+    assert report['T2'].value == 1
+
+
 def test_workbooks_roundtrip_and_mapping(tmp_path):
     rows, _ = bookings_to_rows([_book()], QS, QE)
     dp = str(tmp_path / 'TL_tch_2026III_data.xlsx')
     rp = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
     write_data_workbook(rows, dp)
-    write_rooms_stub(rp)
+    write_rooms_workbook(rows, rp)
     assert is_tl_export(dp) and is_tl_export(rp)
     assert not is_tl_export(str(tmp_path / 'other.xlsx'))
     df = read_table(dp)
     assert list(df.columns) == ['Гость', 'Стоимость', 'Заезд', 'Выезд',
                                 'Источник', 'Категория номера', '№ брони',
                                 'Ночей', 'Тариф', 'Допуслуги', 'Наименование допуслуг',
-                                'Сумма продления номера', 'Итог брони']
+                                'Сумма продления номера', 'Итог брони',
+                                '№ комнаты', 'Корпус']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -166,7 +312,12 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     assert mapping_valid(TL_DATA_MAP, headers, DNA_DATA_SCHEMA)
     assert all(c in headers for c in TL_EXTRA)
     dr = read_table(rp)
-    assert list(dr.columns) == ['ФИО', '№ комнаты'] and len(dr) == 0
+    assert list(dr.columns) == ['ФИО', '№ комнаты', 'Корпус',
+                                'Здание TravelLine']
+    assert len(dr) == 1
+    assert dr.iloc[0]['ФИО'] == 'Иван Петров'
+    assert dr['№ комнаты'].isna().all() and dr['Корпус'].isna().all()
+    assert mapping_valid(TL_ROOMS_MAP, list(dr.columns), TCH_ROOMS_SCHEMA)
 
 
 def _fake_http_factory(log):
@@ -196,6 +347,55 @@ def test_fetch_details_progress(monkeypatch):
     assert [b['number'] for b in out] == ['n1', 'n2']
     assert ('list', 2, 0) in calls
     assert ('details', 2, 2) in calls
+
+
+def test_fetch_details_can_also_request_pms_room_inventory(monkeypatch):
+    import tl_client
+    inventory = {'accommodationInventory': {'buildings': []}}
+    seen, progress = [], []
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        seen.append(path)
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [], 'hasMoreData': False}
+        if path.endswith('/obtain-accommodation-inventory'):
+            return 200, inventory
+        raise AssertionError(f'unexpected API request: {path}')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    result = tl_client.fetch_details(
+        'id', 'sec', '8186', include_room_inventory=True,
+        progress=lambda stage, done, total: progress.append((stage, done, total)))
+
+    assert result == ([], inventory)
+    assert seen[0] == (
+        '/api/pms/v2/properties/8186/obtain-accommodation-inventory')
+    assert seen[1].endswith('/bookings')
+    assert ('inventory', 0, 1) in progress
+    assert ('inventory', 1, 1) in progress
+
+
+def test_pms_room_inventory_403_explains_permission_without_secret(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [], 'hasMoreData': False}
+        raise tl_client.TLApiError('HTTP 403: forbidden')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    try:
+        tl_client.fetch_details(
+            'id', 'do-not-log-secret', '8186', include_room_inventory=True)
+    except tl_client.TLApiError as exc:
+        text = str(exc)
+        assert 'PMS API/PropertyRoom' in text
+        assert 'номерной фонд' in text.casefold()
+        assert 'do-not-log-secret' not in text
+    else:
+        raise AssertionError('a denied PMS API request should fail explicitly')
 
 
 def test_cancel_before_start():
@@ -317,6 +517,7 @@ def test_import_cache_roundtrip_preserves_rows_and_report():
         'Заезд': datetime(2026, 7, 10, 14, 0),
         'Выезд': datetime(2026, 7, 12, 12, 0),
         'Источник': 'TravelLine YAX', '№ брони': 'TL-42',
+        '№ комнаты': 117, 'Корпус': 2,
     }]
     report = {'in_quarter': 1, 'rows': 1, 'cancelled': 0,
               'votes': {'A': 0, 'B': 0, '?': 0}, 'mismatch': []}
@@ -334,7 +535,7 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v3|')
+    assert key.startswith('tlcache-v4|')
     assert tl_import_cache_key(*common) == key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',

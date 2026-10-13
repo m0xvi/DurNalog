@@ -290,7 +290,7 @@ class TlConfigDialog(ctk.CTkToplevel):
     def __init__(self, master, preset=None, hotel_name=''):
         super().__init__(master)
         self.title('TravelLine — подключение')
-        self.geometry('420x330')
+        self.geometry('460x350')
         self.resizable(False, False)
         self.transient(master)
         self.result = None
@@ -301,7 +301,8 @@ class TlConfigDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text='Данные из кабинета TravelLine: Настройки гостиницы →\n'
-                 'Подключения API. Сохраняются на этом компьютере.',
+                 'Подключения API. Для Чайковского также нужен доступ к\n'
+                 'PMS API/PropertyRoom (номерной фонд). Сохраняются локально.',
             text_color='gray').pack(pady=(0, 10))
         self.vars = {}
         for key, label, secret in (
@@ -355,8 +356,8 @@ class TlCacheDialog(ctk.CTkToplevel):
             text=(f'{quarter_label}: {row_count} строк, сохранён {cached_at}.\n'
                   'Повторное использование не обращается к TravelLine.\n'
                   'Обновление заново скачает данные и заменит кэш.\n'
-                  'В кэше только подготовленные строки (ФИО, № брони, даты и суммы), '
-                  'он хранится в базе приложения turnalog_history.db.'),
+                  'В кэше только подготовленные строки (ФИО, бронь, даты, суммы, '
+                  'номер и корпус), он хранится в turnalog_history.db.'),
             text_color='gray', justify='center', wraplength=490).pack(padx=20, pady=5)
         grid = ctk.CTkFrame(self, fg_color='transparent')
         grid.pack(pady=(8, 14))
@@ -400,7 +401,7 @@ class TlProgressDialog(ctk.CTkToplevel):
         self.transient(master)
         self.cancel_event = cancel_event
         self.protocol('WM_DELETE_WINDOW', self.cancel)
-        ctk.CTkLabel(self, text='Загрузка броней из TravelLine…',
+        ctk.CTkLabel(self, text='Загрузка данных из TravelLine…',
                      font=ctk.CTkFont(size=14, weight='bold')).pack(pady=(16, 4))
         self.stage_lbl = ctk.CTkLabel(self, text='Подключение…',
                                       text_color='gray')

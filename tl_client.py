@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Импорт броней из TravelLine Read Reservation API.
+"""Импорт броней и номерного фонда из TravelLine API.
 
 Покрывает Чайковский (8186) и Дону (479): забирает брони за квартал,
 раскладывает проживание/допуслуги/каналы и пишет Excel той же формы,
 что ожидает обработка (канонический маппинг — диалог колонок не нужен).
-Номера API не отдаёт (Read Reservation) — пишется пустая заглушка «Номера»,
-все строки попадают на лист «нет корпуса»; на налог это не влияет.
+Read Reservation возвращает roomStays[].roomId; для Чайковского он
+сопоставляется с комнатами/корпусами из PMS API PropertyRoom. Если
+проживание не назначено или его roomId отсутствует в номерном фонде, номер
+и корпус остаются пустыми — идентификаторы API не подменяются номером комнаты.
 """
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -21,7 +24,7 @@ HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
-TL_CACHE_VERSION = 3
+TL_CACHE_VERSION = 4
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -38,12 +41,18 @@ COL_SVC = 'Допуслуги'
 COL_SVC_NAME = 'Наименование допуслуг'
 COL_SVC_EXTENSION = 'Сумма продления номера'
 COL_TOTAL = 'Итог брони'
+COL_ROOM = '№ комнаты'
+COL_CORPUS = 'Корпус'
+COL_BUILDING_NAME = 'Здание TravelLine'
+ROOM_LABEL_TEXT_PREFIX = '__TL_ROOM_LABEL__:'
 
 TL_DATA_MAP = {'guest': COL_GUEST, 'price': COL_PRICE, 'checkin': COL_IN,
                'checkout': COL_OUT, 'source': COL_SOURCE,
-               'category': COL_CAT, 'bron': COL_BRON, 'nights': COL_NIGHTS}
+               'category': COL_CAT, 'bron': COL_BRON, 'nights': COL_NIGHTS,
+               'room': COL_ROOM, 'corpus': COL_CORPUS}
 TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL]
-TL_ROOMS_MAP = {'fio': 'ФИО', 'room': '№ комнаты'}
+TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
+                'building_name': COL_BUILDING_NAME}
 
 
 class TLApiError(Exception):
@@ -173,10 +182,14 @@ def get_token(client_id, secret, cancel_event=None):
 
 
 def fetch_details(client_id, secret, property_id, depth='2024-01-01',
-                  progress=None, cancel_event=None):
-    """Все детали броней, изменённых с depth. progress(stage, done, total).
+                  progress=None, cancel_event=None,
+                  include_room_inventory=False):
+    """Детали броней и, по запросу, инвентарь комнат/корпусов.
 
-    При HTTP 401 один раз перевыпускает OAuth-токен и повторяет запрос.
+    Брони берутся с lastModification >= depth. При include_room_inventory
+    дополнительно запрашивает PMS API PropertyRoom и возвращает пару
+    ``(bookings, accommodationInventory response)``. progress(stage, done,
+    total); HTTP 401 обновляет OAuth-токен один раз.
     Ошибки API содержат этап операции, но никогда не содержат client_secret.
     """
     def cancelled():
@@ -197,10 +210,14 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                     f'{stage}: {text}. Проверьте соединение с интернетом; '
                     'TravelLine мог временно не ответить, повторите запрос позже.')
             if 'HTTP 403' in text:
+                if 'номерной фонд' in stage.casefold():
+                    permission = 'чтение номерного фонда (PMS API/PropertyRoom)'
+                else:
+                    permission = 'Read Reservation API'
                 return TLApiError(
                     f'{stage}: доступ запрещён (403). В подключении TravelLine '
-                    'проверьте разрешение Read Reservation API и доступ этого '
-                    f'объекта. Ответ API: {text}')
+                    f'проверьте разрешение {permission} и доступ этого объекта. '
+                    f'Ответ API: {text}')
             if 'HTTP 401' in text:
                 return TLApiError(
                     f'{stage}: TravelLine не принял токен (401 Unauthorized). '
@@ -240,13 +257,31 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                     'GET', path, token, params, cancel_event=cancel_event)
             except TLApiError as retry_error:
                 if 'HTTP 401' in str(retry_error):
+                    permission = ('PMS API/PropertyRoom' if 'номерной фонд'
+                                  in stage.casefold() else 'Read Reservation API')
                     raise TLApiError(
                         f'{stage}: HTTP 401 даже после выдачи нового токена. '
                         'TravelLine не принимает авторизацию этого API-запроса. '
                         'Проверьте пару client_id/client_secret из одного '
-                        'подключения и разрешение Read Reservation API. '
+                        f'подключения и разрешение {permission}. '
                         f'Ответ API: {retry_error}')
                 raise contextual(retry_error)
+
+    inventory = None
+    if include_room_inventory:
+        if cancelled():
+            raise TLCancelled()
+        if progress:
+            progress('inventory', 0, 1)
+        _, inventory = api_get(
+            f'/api/pms/v2/properties/{property_id}/obtain-accommodation-inventory',
+            stage='Номерной фонд (комнаты и корпуса)')
+        if not isinstance(inventory, dict):
+            inventory = {}
+        if cancelled():
+            raise TLCancelled()
+        if progress:
+            progress('inventory', 1, 1)
 
     summaries, cont, page = [], None, 0
     while True:
@@ -288,7 +323,7 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             progress('details', i, total)
         # Read Reservation limit for details: 200 requests/minute.
         time.sleep(0.31)
-    return details
+    return (details, inventory) if include_room_inventory else details
 
 
 def _money(total):
@@ -317,6 +352,87 @@ def _parse_dt(s):
 def _guest_name(g):
     return ' '.join(x for x in (g.get('firstName'), g.get('lastName'))
                     if x).strip()
+
+
+def _room_number(value):
+    """Номер из displayName; сохраняет буквенные номера, не roomId."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in ('none', 'null', 'nan'):
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if number.is_integer():
+        # Room labels are display values; don't strip meaningful leading zeroes.
+        return text if re.fullmatch(r'0\d+', text) else int(number)
+    return text
+
+
+def _building_number(building, ordinal):
+    """Нормализует номер корпуса, используя имя API или порядок зданий.
+
+    PMS хранит корпуса как произвольные названия. Если в названии есть
+    явный номер («Корпус 2»), используем его; для имён вроде «Main building»
+    остаётся порядковый номер в accommodationInventory.buildings.
+    """
+    name = str((building or {}).get('name') or '').strip()
+    patterns = (
+        r'(?:корпус|корп\.?|здание|строение|building|block)\D{0,8}(\d+)',
+        r'(\d+)\s*(?:корпус|корп\.?|здание|строение|building|block)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, name, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+    if re.fullmatch(r'\d+', name):
+        return int(name)
+    return ordinal
+
+
+def accommodation_room_map(response):
+    """TravelLine ``roomId`` -> (номер, корпус, исходное имя здания).
+
+    PropertyRoom возвращает вложенную структуру buildings -> floors -> rooms;
+    идентификатор комнаты сопоставляется с её displayName, а не используется
+    как номер. Неизвестные/пустые поля остаются пустыми.
+    """
+    if not isinstance(response, dict):
+        return {}
+    inventory = response.get('accommodationInventory')
+    if not isinstance(inventory, dict):
+        inventory = response
+    buildings = inventory.get('buildings')
+    if not isinstance(buildings, list):
+        return {}
+
+    room_map = {}
+    for building_index, building in enumerate(buildings, 1):
+        if not isinstance(building, dict):
+            continue
+        corpus = _building_number(building, building_index)
+        building_name = str(building.get('name') or '').strip()
+        rooms = list(building.get('rooms') or [])
+        for floor in building.get('floors') or []:
+            if isinstance(floor, dict):
+                rooms.extend(floor.get('rooms') or [])
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            room_id = room.get('id')
+            if room_id is None or not str(room_id).strip():
+                continue
+            room_map.setdefault(str(room_id), {
+                'room': _room_number(room.get('displayName')),
+                'corpus': corpus,
+                'building_name': building_name,
+            })
+    return room_map
 
 
 def _service_amount_text(amount):
@@ -379,17 +495,24 @@ def channel_label(source):
     return 'TravelLine ?'
 
 
-def bookings_to_rows(details, qs, qe):
+def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
     """Детали броней -> (строки Excel, отчёт).
 
     qs/qe — 'YYYY-MM-DD' границ квартала. Отменённые пропускаются.
     Арифметика каждой брони с платными допами самопроверяется:
     A: итог == проживание + допы; B: итог == проживание (допы внутри).
     Иначе бронь помечается расхождением (база = проживание как есть).
+    При наличии инвентаря roomId сопоставляется с номером/корпусом; ID
+    незанятого или неизвестного номера не переносится в отчёт как номер.
     """
+    room_map = accommodation_room_map(accommodation_inventory)
+    has_room_inventory = accommodation_inventory is not None
     rows, votes = [], {'A': 0, 'B': 0, '?': 0}
     rep = {'total': len(details), 'in_quarter': 0, 'cancelled': 0,
            'rows': 0, 'mismatch': [], 'channels': {}}
+    if has_room_inventory:
+        rep['room_assignments'] = {
+            'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0}
     for b in details or []:
         if b.get('status') == 'Cancelled':
             rep['cancelled'] += 1
@@ -468,6 +591,16 @@ def bookings_to_rows(details, qs, qe):
                                if _guest_name(g))
             rt = rs.get('roomType') or {}
             rps = rs.get('ratePlans') or []
+            room_id = rs.get('roomId')
+            assignment = (room_map.get(str(room_id))
+                          if room_id is not None and str(room_id).strip()
+                          else None)
+            room_number = assignment.get('room') if assignment else None
+            corpus = assignment.get('corpus') if assignment else None
+            building_name = assignment.get('building_name', '') if assignment else ''
+            if has_room_inventory:
+                bucket = 'assigned' if room_number is not None else 'unassigned'
+                rep['room_assignments'][bucket] += 1
             rows.append({
                 COL_GUEST: guests,
                 COL_PRICE: round(base, 2),
@@ -476,6 +609,9 @@ def bookings_to_rows(details, qs, qe):
                 COL_CAT: rt.get('name') or '',
                 COL_BRON: b.get('number') or '',
                 COL_NIGHTS: nights,
+                COL_ROOM: room_number,
+                COL_CORPUS: corpus if room_number is not None else None,
+                COL_BUILDING_NAME: building_name if room_number is not None else '',
                 COL_TARIFF: ', '.join(r.get('name') or '' for r in rps),
                 COL_SVC: round(row_svc, 2),
                 COL_SVC_NAME: '; '.join(row_svc_names),
@@ -496,20 +632,54 @@ def write_data_workbook(rows, path):
     ws.title = 'Брони'
     cols = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
             COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
-            COL_SVC_EXTENSION, COL_TOTAL]
+            COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS]
     ws.append(cols)
     for r in rows:
-        ws.append([r.get(c) for c in cols])
+        values = []
+        for column in cols:
+            value = r.get(column)
+            if column == COL_ROOM and isinstance(value, str):
+                # pandas may coerce text labels like "001" to the integer 1
+                # when it later reads the workbook; preserve the exact API label.
+                value = ROOM_LABEL_TEXT_PREFIX + value
+            values.append(value)
+        ws.append(values)
     for col in ('C', 'D'):
         for cell in ws[col][1:]:
             if isinstance(cell.value, datetime):
                 cell.number_format = 'DD.MM.YYYY HH:MM'
+    # Room assignment is consumed by the processor but kept out of the way
+    # in the source workbook.
+    for column in ('N', 'O'):
+        ws.column_dimensions[column].hidden = True
+    wb.save(path)
+
+
+def write_rooms_workbook(rows, path):
+    """Пишет доступные из API имя гостя, номер и корпус для проверки.
+
+    Неприсвоенные и не найденные в номерном фонде roomId остаются пустыми.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Номера'
+    ws.append(['ФИО', COL_ROOM, COL_CORPUS, COL_BUILDING_NAME])
+    for row in rows or []:
+        guests = [name.strip() for name in
+                  re.split(r'[,;\n]+', str(row.get(COL_GUEST) or ''))
+                  if name.strip()]
+        if not guests:
+            guests = ['']
+        for guest in guests:
+            ws.append([guest, row.get(COL_ROOM), row.get(COL_CORPUS),
+                       row.get(COL_BUILDING_NAME) or ''])
     wb.save(path)
 
 
 def write_rooms_stub(path):
+    """Совместимая пустая заглушка для импорта отелей без номерного фонда."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'Номера'
-    ws.append(['ФИО', '№ комнаты'])
+    ws.append(['ФИО', COL_ROOM])
     wb.save(path)

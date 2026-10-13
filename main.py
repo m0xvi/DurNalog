@@ -48,7 +48,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.26"
+APP_VERSION = "3.27"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -646,7 +646,7 @@ class RealApp(TurNalogApp):
     def hook_tl_import(self, hotel_id):
         from tl_client import (TLCancelled, bookings_to_rows, fetch_details,
                                tl_export_paths, write_data_workbook,
-                               write_rooms_stub)
+                               write_rooms_stub, write_rooms_workbook)
         if getattr(self, '_tl_busy', False):
             messagebox.showinfo('TravelLine', 'Загрузка уже идёт.',
                                 parent=self)
@@ -762,6 +762,10 @@ class RealApp(TurNalogApp):
                                 prog.set_stage(
                                     f'Получение списка броней ({done})…'),
                                 self.set_status(f'TravelLine: список ({done})…')))
+                        elif stage == 'inventory':
+                            self.after(0, lambda: (
+                                prog.set_stage('Загрузка комнат и корпусов…'),
+                                self.set_status('TravelLine: номерной фонд…')))
                         else:
                             self.after(0, lambda: (
                                 prog.set_stage('Загрузка деталей броней…'),
@@ -770,10 +774,16 @@ class RealApp(TurNalogApp):
                                 self.set_status(f'TravelLine: {done}/{total}…')))
                     except Exception:
                         pass
-                details = fetch_details(
+                fetched = fetch_details(
                     tl_cfg['client_id'], tl_cfg['client_secret'], property_id,
-                    depth, progress, cancel_event)
-                rows, rep = bookings_to_rows(details, qs, qe)
+                    depth, progress, cancel_event,
+                    include_room_inventory=(code == 'tch'))
+                if code == 'tch':
+                    details, room_inventory = fetched
+                else:
+                    details, room_inventory = fetched, None
+                rows, rep = bookings_to_rows(
+                    details, qs, qe, accommodation_inventory=room_inventory)
             if cancel_event.is_set():
                 raise TLCancelled()
             # Persist the fetched/prepared data before writing temporary XLSX
@@ -805,7 +815,10 @@ class RealApp(TurNalogApp):
             write_data_workbook(rows, data_path)
             if cancel_event.is_set():
                 raise TLCancelled()
-            write_rooms_stub(rooms_path)
+            if code == 'tch':
+                write_rooms_workbook(rows, rooms_path)
+            else:
+                write_rooms_stub(rooms_path)
             if cancel_event.is_set():
                 raise TLCancelled()
             return (rows, rep, data_path, rooms_path, cache_used,
@@ -848,6 +861,21 @@ class RealApp(TurNalogApp):
                              f'{cache_db_path or default_db_path()}')
             lines.append(f'Быстрый запрос: изменения с {depth}; более ранние '
                          'неизменённые брони могут отсутствовать.')
+            room_stats = rep.get('room_assignments')
+            if code == 'tch' and room_stats is not None:
+                lines.append(
+                    f'Номерной фонд API: {room_stats["inventory_rooms"]}; '
+                    f'проживаний с номером: {room_stats["assigned"]}; '
+                    f'без назначенного/сопоставленного номера: '
+                    f'{room_stats["unassigned"]}.')
+                if room_stats['inventory_rooms'] == 0:
+                    lines.append(
+                        '⚠ TravelLine не вернул комнаты из PMS API. Проверьте '
+                        'право на чтение номерного фонда (PMS API/PropertyRoom).')
+                elif room_stats['unassigned']:
+                    lines.append(
+                        'Проживания без назначенного номера оставлены без '
+                        'номера и корпуса, без подстановки по roomId.')
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')

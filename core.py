@@ -30,6 +30,7 @@ FILL_ROOM = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="sol
 FILL_DUP = PatternFill(start_color="CC99FF", end_color="CC99FF", fill_type="solid")
 FILL_TOTALS = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
 DATE_FMT = 'DD.MM.YYYY HH:MM'
+ROOM_LABEL_TEXT_PREFIX = '__TL_ROOM_LABEL__:'
 
 def norm_name(s):
     """Нормализация ФИО: регистр, ё->е, лишние пробелы."""
@@ -496,30 +497,62 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     ]
 
     room_mapping = {}
+    has_corpus_mapping = bool(
+        map_rooms.get('corpus') and map_rooms['corpus'] in df_rooms.columns)
+    has_direct_room_mapping = bool(
+        map_data.get('room') and map_data['room'] in df_data.columns)
+    has_direct_corpus_mapping = bool(
+        map_data.get('corpus') and map_data['corpus'] in df_data.columns)
+
+    def blank(value):
+        if value is None:
+            return True
+        try:
+            if pd.isna(value):
+                return True
+        except (TypeError, ValueError):
+            pass
+        return not str(value).strip()
+
+    def clean_room(value):
+        if blank(value):
+            return None
+        text = str(value).strip()
+        if text.startswith(ROOM_LABEL_TEXT_PREFIX):
+            return text[len(ROOM_LABEL_TEXT_PREFIX):]
+        try:
+            number = float(text)
+            if number.is_integer():
+                return text if re.fullmatch(r'0\d+', text) else int(number)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        return value
+
     for _, rr in df_rooms.iterrows():
         fio = rr[map_rooms['fio']]
-        if pd.isna(fio):
+        if blank(fio):
             continue
-        key = norm_name(fio)
-        if key and key not in room_mapping:
-            room_mapping[key] = rr[map_rooms['room']]
+        guest_key = norm_name(fio)
+        room = clean_room(rr[map_rooms['room']])
+        corpus_col = map_rooms.get('corpus')
+        corpus = (rr[corpus_col] if corpus_col and corpus_col in df_rooms.columns
+                  else None)
+        corpus = None if blank(corpus) else corpus
+        if guest_key and room is not None:
+            room_mapping.setdefault(guest_key, (room, corpus))
 
-    def find_room(guest_string):
+    def find_room_info(guest_string):
         if not guest_string:
-            return None
+            return None, None
         for guest in re.split(r'[,\n;]+', guest_string):
             key = norm_name(guest)
             if key in room_mapping:
-                room = room_mapping[key]
-                try:
-                    return int(float(room))
-                except (ValueError, TypeError):
-                    return room
-        return None
+                return room_mapping[key]
+        return None, None
 
     def get(row, key):
         col = map_data.get(key)
-        return row[col] if col else None
+        return row[col] if col and col in row.index else None
 
     records = []
     for _, row in df_data.iterrows():
@@ -574,13 +607,23 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 value = ''
             extra_vals.append(value)
 
+        if has_direct_room_mapping:
+            room = clean_room(get(row, 'room'))
+            corpus = (get(row, 'corpus') if has_direct_corpus_mapping else None)
+            corpus = None if blank(corpus) else corpus
+            row_has_corpus_mapping = has_direct_corpus_mapping
+        else:
+            room, corpus = find_room_info(guest)
+            row_has_corpus_mapping = has_corpus_mapping
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
             'commission': commission, 'agent': agent,
             'unknown_source': ((not agent) and bool(source)
                                and source not in (source_map or {})),
             'checkin': checkin, 'nights': nights, 'checkout': checkout,
-            'source': source, 'category': category, 'room': find_room(guest),
+            'source': source, 'category': category, 'room': room,
+            'corpus': corpus,
+            'has_corpus_mapping': row_has_corpus_mapping,
             'extras_amount': extras_amount, 'service_names': service_names,
             'extra_vals': extra_vals, 'dup_note': None,
         })
@@ -596,8 +639,21 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
 
     records.sort(key=lambda x: norm_name(x['guest']))
 
+    def corpus_number(value):
+        if blank(value):
+            return None
+        try:
+            number = float(value)
+            if number.is_integer():
+                return int(number)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        match = re.search(r'\d+', str(value))
+        return int(match.group()) if match else None
+
     errors_summary = {
         "Отсутствует № комнаты (КРАСНЫЙ)": 0,
+        "Отсутствует корпус (КРАСНЫЙ)": 0,
         "Не указан Гость (ЖЕЛТЫЙ)": 0,
         "Отсутствуют Даты (ОРАНЖЕВЫЙ)": 0,
         "Отсутствует Стоимость (ГОЛУБОЙ)": 0,
@@ -694,8 +750,16 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             if rec['room'] is None:
                 c_room.fill = FILL_ROOM
                 if count_errors: errors_summary["Отсутствует № комнаты (КРАСНЫЙ)"] += 1
-            else:
-                ws.cell(row=r, column=20, value=f'=IF(S{r}<50,1,2)')
+
+            corpus = corpus_number(rec.get('corpus'))
+            c_corpus = ws.cell(row=r, column=20, value=corpus)
+            if corpus is None and rec['room'] is not None:
+                if rec.get('has_corpus_mapping'):
+                    c_corpus.fill = FILL_ROOM
+                    if count_errors:
+                        errors_summary["Отсутствует корпус (КРАСНЫЙ)"] += 1
+                else:
+                    c_corpus.value = f'=IF(S{r}<50,1,2)'
 
             c_note = ws.cell(row=r, column=21, value=rec['dup_note'] or '')
             if rec['dup_note']:
@@ -747,15 +811,23 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
         return ws
 
     def corpus_of(rec):
+        explicit = corpus_number(rec.get('corpus'))
+        if explicit is not None:
+            return explicit
+        if rec.get('has_corpus_mapping'):
+            return None
         try:
             return 1 if float(rec['room']) < 50 else 2
         except (ValueError, TypeError):
             return None
 
     write_sheet('1&2', records, count_errors=True)
-    write_sheet('нет корпуса', [x for x in records if x['room'] is None])
+    write_sheet('нет корпуса', [x for x in records if corpus_of(x) is None])
     write_sheet('1', [x for x in records if corpus_of(x) == 1])
     write_sheet('2', [x for x in records if corpus_of(x) == 2])
+    for corpus in sorted({corpus_of(x) for x in records
+                          if corpus_of(x) not in (None, 1, 2)}):
+        write_sheet(str(corpus), [x for x in records if corpus_of(x) == corpus])
 
     wb.save(output_path)
     log.info("Чайковский сохранён: %s", output_path)
