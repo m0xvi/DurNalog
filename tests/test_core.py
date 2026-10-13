@@ -148,10 +148,75 @@ def test_tchaikovsky_end_to_end(tmp_path):
     ws = openpyxl.load_workbook(out)["1&2"]
     assert ws["D2"].value == 5000.0
     assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
+    assert ws["S1"].value == "Стоимость для налога"
+    assert ws["S2"].value == "=ROUND(G2,2)"
     assert ws["K2"].value == '=IF(J2>=5100,"ставка","мин.ставка")'
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,S2/102*2),2)'
     assert ws["R1"].value == "Примечание"
     assert bookings[0]["price"] == 5000.0
+
+
+def test_tchaikovsky_tax_includes_extras_after_commission_and_can_disable(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import core
+
+    src = tmp_path / "tch-extras.csv"
+    rooms = tmp_path / "rooms.csv"
+    pd.DataFrame([[
+        "Иванов Иван", 10000, "01.08.2026", "03.08.2026", "OTA",
+        "Стандарт", "B-EXTRA", 2, 1500, "Завтрак",
+    ]], columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник",
+                "Категория номера", "№ брони", "Ночей", "Допуслуги",
+                "Наименование допуслуг"]).to_csv(src, index=False)
+    pd.DataFrame([["Иванов Иван", 12]],
+                 columns=["ФИО", "№ комнаты"]).to_csv(rooms, index=False)
+    extras = ["Допуслуги", "Наименование допуслуг"]
+    source_map = {"OTA": (15, "Тестовый агент")}
+
+    with_extras = tmp_path / "tch-extras-on.xlsx"
+    core.process_tchaikovsky(
+        str(src), str(rooms), str(with_extras), extra_data=extras,
+        source_map=source_map, tax={"include_extras_in_tax": True})
+    ws = openpyxl.load_workbook(with_extras)["1&2"]
+    assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
+    assert ws["S2"].value == 1500
+    assert ws["T2"].value == "Завтрак"
+    assert ws["U1"].value == "Стоимость для налога"
+    assert ws["U2"].value == "=ROUND(G2+S2,2)"
+    assert ws["J2"].value == "=U2/I2"
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,U2/102*2),2)'
+
+    without_extras = tmp_path / "tch-extras-off.xlsx"
+    core.process_tchaikovsky(
+        str(src), str(rooms), str(without_extras), extra_data=extras,
+        source_map=source_map, tax={"include_extras_in_tax": False})
+    ws_off = openpyxl.load_workbook(without_extras)["1&2"]
+    assert ws_off["U1"].value is None
+    assert ws_off["J2"].value == "=G2/I2"
+    assert ws_off["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+
+
+def test_dona_does_not_add_extras_to_tax_base(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import core
+
+    src = tmp_path / "dona-extras.csv"
+    out = tmp_path / "dona-extras.xlsx"
+    pd.DataFrame([[
+        "Иванов Иван", 10000, "01.08.2026", "03.08.2026", "Сайт", 1500,
+    ]], columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник",
+                "Допуслуги"]).to_csv(src, index=False)
+    core.process_dona(
+        str(src), str(out), extra_data=["Допуслуги"],
+        tax={"include_extras_in_tax": True})
+    ws = openpyxl.load_workbook(out)["Дона"]
+    assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
+    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+    assert ws["Q2"].value == 1500
+    assert all(ws.cell(1, c).value != "Стоимость для налога"
+               for c in range(1, ws.max_column + 1))
 
 
 def test_guess_mapping_renamed_headers():
@@ -199,6 +264,7 @@ def test_dona_extra_columns_and_custom_mapping(tmp_path):
 def test_tax_params_custom():
     from tax import TaxParams
     t = TaxParams()  # значения по умолчанию = прежние формулы
+    assert t.include_extras_in_tax is False
     assert t.f_daily('D', 'F', 2) == '=D2/F2'
     assert t.f_method('G', 2) == '=IF(G2>=5100,"ставка","мин.ставка")'
     assert t.f_tax('H', 'F', 'D', 2) == '=ROUND(IF(H2="мин.ставка",F2*100,D2/102*2),2)'

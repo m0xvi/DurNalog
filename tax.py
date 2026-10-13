@@ -91,6 +91,7 @@ DEFAULT_TAX = {
                           # это НЕТТО (без комиссии), база восстанавливается
                           # до 100% (Стоимость/(100-К)*100)
     'auto_threshold': True,  # порог считается автоматически
+    'include_extras_in_tax': False,  # допуслуги включаются в базу турналога
     # Шаблоны Excel-формул. Плейсхолдеры: {P} цена, {N} ночей, {R} сут.ставка,
     # {M} метод, {T} порог, {min} минимум, {rate} ставка, {div} делитель.
     'tpl_daily': '={P}/{N}',
@@ -114,6 +115,7 @@ class TaxParams:
         self.incl = bool(d['incl'])
         self.auto = bool(d['auto_threshold'])
         self.use_full = bool(d.get('use_full', True))
+        self.include_extras_in_tax = bool(d.get('include_extras_in_tax', False))
         self.threshold = (self.auto_threshold() if self.auto
                           else float(d['threshold']))
         self.tpl_daily = d['tpl_daily']
@@ -147,7 +149,9 @@ class TaxParams:
     def as_dict(self):
         return {'rate': self.rate, 'min_per_night': self.min, 'use_full': self.use_full,
                 'threshold': self.threshold, 'incl': self.incl,
-                'auto_threshold': self.auto, 'tpl_daily': self.tpl_daily,
+                'auto_threshold': self.auto,
+                'include_extras_in_tax': self.include_extras_in_tax,
+                'tpl_daily': self.tpl_daily,
                 'tpl_method': self.tpl_method, 'tpl_tax': self.tpl_tax}
 
     def preview(self):

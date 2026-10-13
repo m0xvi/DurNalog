@@ -14,6 +14,7 @@ from datetime import datetime
 import openpyxl
 import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import from_excel
 
 from agents import default_agents, match_agent, norm_key
@@ -39,6 +40,17 @@ def clean_guest_names(text):
     if pd.isna(text):
         return ""
     return re.sub(r'\d+\.\s*', '', str(text)).strip()
+
+
+_EXTRA_AMOUNT_KEYS = {
+    'допуслуги', 'суммадопуслуг', 'стоимостьдопуслуг',
+    'суммадополнительныхуслуг', 'стоимостьдополнительныхуслуг',
+    'extras', 'extrasamount', 'additionalservicesamount',
+}
+
+
+def _is_extra_amount_header(label):
+    return norm_key(label) in _EXTRA_AMOUNT_KEYS
 
 
 class WorkbookReadError(Exception):
@@ -411,7 +423,10 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                         extra_data=None, dup_checker=None, tax=None,
                         agents=None, source_map=None):
     """Возвращает (errors_summary, bookings)."""
-    tp = TaxParams(tax)
+    tax_cfg = dict(tax or {})
+    # Новый режим по умолчанию включён только для Чайковского.
+    tax_cfg.setdefault('include_extras_in_tax', True)
+    tp = TaxParams(tax_cfg)
     log.info("Чайковский: %s / %s", data_path, rooms_path)
     df_data = read_table(data_path)
     df_rooms = read_table(rooms_path)
@@ -426,6 +441,11 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     if not (map_rooms.get('fio') and map_rooms.get('room')):
         raise ValueError("Не сопоставлены колонки файла «Номера» (ФИО, № комнаты)")
     extra_data = [c for c in (extra_data or []) if c in df_data.columns]
+    extra_amount_col = next(
+        (c for c in df_data.columns if _is_extra_amount_header(c)), None)
+    if (tp.include_extras_in_tax and extra_amount_col is not None
+            and extra_amount_col not in extra_data):
+        extra_data.append(extra_amount_col)
 
     room_mapping = {}
     for _, rr in df_rooms.iterrows():
@@ -494,7 +514,15 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 source, agents or default_agents(),
                 date=checkin.date() if checkin else None, hotel='tch')
 
-        extra_vals = [row[c] if not pd.isna(row[c]) else '' for c in extra_data]
+        extra_vals = []
+        for c in extra_data:
+            value = row[c]
+            if c == extra_amount_col:
+                amount = parse_price(value)
+                value = 0.0 if amount is None else round(amount, 2)
+            elif pd.isna(value):
+                value = ''
+            extra_vals.append(value)
 
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
@@ -533,9 +561,19 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                'Стоимость с комиссией', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
                'Налог', 'Выезд', 'Источник', 'Категория номера', '№ комнаты',
                'корпус', 'Примечание'] + extra_data
+    base = 'G' if tp.use_full else 'D'
+    taxable_base_idx = None
+    taxable_base_letter = base
+    extras_amount_letter = None
+    if tp.include_extras_in_tax:
+        if extra_amount_col is not None and extra_amount_col in extra_data:
+            extras_amount_letter = get_column_letter(
+                19 + extra_data.index(extra_amount_col))
+        taxable_base_idx = len(headers) + 1
+        taxable_base_letter = get_column_letter(taxable_base_idx)
+        headers.append('Стоимость для налога')
     n_cols = len(headers)
     font_bold = Font(bold=True)
-    base = 'G' if tp.use_full else 'D'
 
     def write_sheet(name, recs, count_errors=False):
         ws = wb.create_sheet(name)
@@ -580,10 +618,21 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 if count_errors: errors_summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
             ws.cell(row=r, column=9, value=rec['nights'])
-            c_rate = ws.cell(row=r, column=10, value=tp.f_daily(base, 'I', r))
+            if taxable_base_idx is not None:
+                extra_term = (f'+{extras_amount_letter}{r}'
+                              if extras_amount_letter else '')
+                c_tax_base = ws.cell(
+                    row=r, column=taxable_base_idx,
+                    value=f'=ROUND({base}{r}{extra_term},2)')
+                c_tax_base.number_format = '#,##0.00'
+            tax_price_col = (taxable_base_letter if taxable_base_idx is not None
+                             else base)
+            c_rate = ws.cell(row=r, column=10,
+                             value=tp.f_daily(tax_price_col, 'I', r))
             c_rate.number_format = '#,##0.00'
             ws.cell(row=r, column=11, value=tp.f_method('J', r))
-            c_tax = ws.cell(row=r, column=12, value=tp.f_tax('K', 'I', base, r))
+            c_tax = ws.cell(row=r, column=12,
+                            value=tp.f_tax('K', 'I', tax_price_col, r))
             c_tax.number_format = '#,##0.00'
 
             c_out = ws.cell(row=r, column=13, value=rec['checkout'])
@@ -610,7 +659,14 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 if count_errors: errors_summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] += 1
 
             for k, v in enumerate(rec['extra_vals']):
-                ws.cell(row=r, column=19 + k, value=v)
+                col_idx = 19 + k
+                c_extra = ws.cell(row=r, column=col_idx, value=v)
+                label = extra_data[k]
+                if _is_extra_amount_header(label):
+                    c_extra.number_format = '#,##0.00'
+                elif any(word in norm_key(label)
+                         for word in ('наимен', 'назван', 'servicename')):
+                    c_extra.alignment = Alignment(wrap_text=True, vertical='top')
 
         if recs:
             last = len(recs) + 1
@@ -621,6 +677,10 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             ws.cell(row=tr, column=7, value=f'=SUM(G2:G{last})')
             ws.cell(row=tr, column=9, value=f'=SUM(I2:I{last})')
             ws.cell(row=tr, column=12, value=f'=SUM(L2:L{last})')
+            if taxable_base_idx is not None:
+                ws.cell(
+                    row=tr, column=taxable_base_idx,
+                    value=f'=SUM({taxable_base_letter}2:{taxable_base_letter}{last})')
             for c in range(1, n_cols + 1):
                 cell = ws.cell(row=tr, column=c)
                 cell.font = font_bold
@@ -631,6 +691,17 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                   'O': 30, 'P': 10, 'Q': 8, 'R': 45}
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
+        for k, label in enumerate(extra_data):
+            col_letter = get_column_letter(19 + k)
+            if _is_extra_amount_header(label):
+                ws.column_dimensions[col_letter].width = 16
+            elif any(word in norm_key(label)
+                     for word in ('наимен', 'назван', 'servicename')):
+                ws.column_dimensions[col_letter].width = 48
+            elif col_letter not in widths:
+                ws.column_dimensions[col_letter].width = 20
+        if taxable_base_idx is not None:
+            ws.column_dimensions[taxable_base_letter].width = 24
         return ws
 
     def corpus_of(rec):

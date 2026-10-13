@@ -11,13 +11,23 @@ from tl_client import (TL_DATA_MAP, TL_EXTRA, bookings_to_rows, channel_label,
                        is_tl_export, write_data_workbook, write_rooms_stub)
 
 
+def _service(value):
+    if isinstance(value, dict):
+        service = dict(value)
+        amount = service.pop('amount', None)
+        if amount is not None:
+            service.setdefault('total', {'priceAfterTax': amount})
+        return service
+    return {'total': {'priceAfterTax': value}}
+
+
 def _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00', room=10000.0,
           services=(), guests=(('Иван', 'Петров'),), rt='Стандарт',
           rp='Базовый'):
     return {
         'stayDates': {'arrivalDateTime': arr, 'departureDateTime': dep},
         'total': {'priceAfterTax': room},
-        'services': [{'total': {'priceAfterTax': s}} for s in services],
+        'services': [_service(s) for s in services],
         'extraStayCharges': {'earlyArrival': None, 'lateDeparture': None},
         'guests': [{'firstName': f, 'lastName': l} for f, l in guests],
         'roomType': {'name': rt}, 'ratePlans': [{'name': rp}],
@@ -28,8 +38,7 @@ def _book(number='20260701-8186-1', status='Active', stays=None,
           book_services=(), total=10000.0, source=None):
     return {'number': number, 'status': status,
             'roomStays': stays if stays is not None else [_stay()],
-            'services': [{'total': {'priceAfterTax': s}}
-                         for s in book_services],
+            'services': [_service(s) for s in book_services],
             'total': {'priceAfterTax': total},
             'source': source or {'type': 'Channel', 'code': 'YAX'}}
 
@@ -53,6 +62,24 @@ def test_mode_a_with_paid_services():
     assert rep['votes']['A'] == 1 and not rep['mismatch']
     assert rows[0]['Стоимость'] == 10000.0
     assert rows[0]['Допуслуги'] == 1500.0
+
+
+def test_service_names_are_exported_with_amounts():
+    stay = _stay(services=({'name': 'Завтрак', 'amount': 1500.0},))
+    stay['extraStayCharges'] = {
+        'earlyArrival': {'total': {'priceAfterTax': 100.0}},
+        'lateDeparture': None,
+    }
+    b = _book(stays=[stay],
+              book_services=({'name': 'Парковка', 'amount': 900.0},),
+              total=12500.0)
+    rows, _ = bookings_to_rows([b], QS, QE)
+    row = rows[0]
+    assert row['Допуслуги'] == 2500.0
+    names = row['Наименование допуслуг']
+    assert 'Завтрак — 1 500,00 ₽' in names
+    assert 'Парковка — 900,00 ₽' in names
+    assert 'Ранний заезд — 100,00 ₽' in names
 
 
 def test_mode_b_extras_inside():
@@ -116,7 +143,8 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     df = read_table(dp)
     assert list(df.columns) == ['Гость', 'Стоимость', 'Заезд', 'Выезд',
                                 'Источник', 'Категория номера', '№ брони',
-                                'Ночей', 'Тариф', 'Допуслуги', 'Итог брони']
+                                'Ночей', 'Тариф', 'Допуслуги', 'Наименование допуслуг',
+                                'Итог брони']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -292,7 +320,7 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v1|')
+    assert key.startswith('tlcache-v2|')
     assert tl_import_cache_key(*common) == key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',

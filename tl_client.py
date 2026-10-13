@@ -21,7 +21,7 @@ HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
-TL_CACHE_VERSION = 1
+TL_CACHE_VERSION = 2
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -35,12 +35,13 @@ COL_BRON = '№ брони'
 COL_NIGHTS = 'Ночей'
 COL_TARIFF = 'Тариф'
 COL_SVC = 'Допуслуги'
+COL_SVC_NAME = 'Наименование допуслуг'
 COL_TOTAL = 'Итог брони'
 
 TL_DATA_MAP = {'guest': COL_GUEST, 'price': COL_PRICE, 'checkin': COL_IN,
                'checkout': COL_OUT, 'source': COL_SOURCE,
                'category': COL_CAT, 'bron': COL_BRON, 'nights': COL_NIGHTS}
-TL_EXTRA = [COL_TARIFF, COL_SVC, COL_TOTAL]
+TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_TOTAL]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': '№ комнаты'}
 
 
@@ -317,6 +318,37 @@ def _guest_name(g):
                     if x).strip()
 
 
+def _service_amount_text(amount):
+    return f'{amount:,.2f}'.replace(',', ' ').replace('.', ',')
+
+
+def _service_description(service, fallback=''):
+    """Читабельное название допуслуги с ценой, если API её передал."""
+    if not isinstance(service, dict):
+        name = str(service or fallback or '').strip()
+        return name
+    name = next((str(service.get(key)).strip() for key in
+                 ('name', 'displayName', 'serviceName', 'description',
+                  'pmsSideCode', 'code', 'serviceCode')
+                 if service.get(key)), '')
+    name = name or fallback or 'Дополнительная услуга'
+    amount = _money(service.get('total'))
+    if amount > 0:
+        return f'{name} — {_service_amount_text(amount)} ₽'
+    return name
+
+
+def _service_descriptions(services):
+    out = []
+    for service in services or []:
+        if not isinstance(service, dict):
+            continue
+        name = _service_description(service)
+        if name:
+            out.append(name)
+    return out
+
+
 def channel_label(source):
     """Источник брони человекочитаемо (идёт в колонку «Источник»)."""
     source = source or {}
@@ -396,6 +428,17 @@ def bookings_to_rows(details, qs, qe):
             stay_svc = sum(_money(s.get('total'))
                            for s in rs.get('services') or [])
             row_svc = stay_svc + (svc_book + extra if first else 0.0)
+            row_svc_names = _service_descriptions(rs.get('services') or [])
+            if first:
+                row_svc_names.extend(_service_descriptions(b.get('services') or []))
+                for extra_rs in stays:
+                    ex = extra_rs.get('extraStayCharges') or {}
+                    for key, label in (('earlyArrival', 'Ранний заезд'),
+                                       ('lateDeparture', 'Поздний выезд')):
+                        charge = ex.get(key) or {}
+                        if _money(charge.get('total')) > 0:
+                            row_svc_names.append(
+                                _service_description(charge, label))
             if mode == 'B':
                 base = stay_room - row_svc
                 base = base if base > 0 else 0.0
@@ -415,6 +458,7 @@ def bookings_to_rows(details, qs, qe):
                 COL_NIGHTS: nights,
                 COL_TARIFF: ', '.join(r.get('name') or '' for r in rps),
                 COL_SVC: round(row_svc, 2),
+                COL_SVC_NAME: '; '.join(row_svc_names),
                 COL_TOTAL: round(tot, 2),
             })
             first = False
@@ -430,7 +474,7 @@ def write_data_workbook(rows, path):
     ws = wb.active
     ws.title = 'Брони'
     cols = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
-            COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_TOTAL]
+            COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_TOTAL]
     ws.append(cols)
     for r in rows:
         ws.append([r.get(c) for c in cols])
