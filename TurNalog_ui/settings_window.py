@@ -72,7 +72,7 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
         self.auto_threshold = tk.BooleanVar(value=h.get("auto_threshold", True))
         self.tax_no_commission = tk.BooleanVar(value=h.get("tax_no_commission", True))
         self.include_extras_in_tax = tk.BooleanVar(
-            value=h.get("include_extras_in_tax", hotel_id == "chai"))
+            value=h.get("include_extras_in_tax", hotel_id in ("chai", "dona")))
 
         options = [
             (
@@ -91,11 +91,15 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
                 "База = 100% цены (нетто из файла + комиссия агента)",
             ),
         ]
-        if hotel_id == "chai":
+        if hotel_id in ("chai", "dona"):
+            if hotel_id == "dona":
+                extras_title = "Включать «Продление номера» в налоговую базу"
+                extras_sub = "Учитывать только допуслугу с названием «Продление номера»"
+            else:
+                extras_title = "Включать допуслуги в налоговую базу"
+                extras_sub = "Проживание + комиссия, затем все допуслуги, затем налог"
             options.append((
-                self.include_extras_in_tax,
-                "Включать допуслуги в налоговую базу",
-                "Проживание + комиссия, затем допуслуги, затем налог",
+                self.include_extras_in_tax, extras_title, extras_sub,
             ))
 
         for var, title, sub in options:
@@ -218,7 +222,7 @@ class HotelTaxForm(ctk.CTkScrollableFrame):
             "auto_threshold": self.auto_threshold.get(),
             "tax_no_commission": self.tax_no_commission.get(),
             "include_extras_in_tax": (self.include_extras_in_tax.get()
-                                      if self.hotel_id == "chai" else False),
+                                      if self.hotel_id in ("chai", "dona") else False),
             "formula_daily": self.f_daily.get(),
             "formula_method": self.f_method.get(),
             "formula_tax": self.f_tax.get(),

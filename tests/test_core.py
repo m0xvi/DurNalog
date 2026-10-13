@@ -123,8 +123,8 @@ def test_dona_end_to_end(tmp_path):
     assert summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] == 2
     assert all(b["dup_note"] for b in bookings)
     ws = openpyxl.load_workbook(out)["Дона"]
-    assert ws["P2"].value == "Переход кварталов: тест"
-    assert ws["P2"].fill.start_color.rgb.endswith("CC99FF")
+    assert ws["T2"].value == "Переход кварталов: тест"
+    assert ws["T2"].fill.start_color.rgb.endswith("CC99FF")
     assert ws["E2"].value == 15
     assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
 
@@ -148,11 +148,11 @@ def test_tchaikovsky_end_to_end(tmp_path):
     ws = openpyxl.load_workbook(out)["1&2"]
     assert ws["D2"].value == 5000.0
     assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
-    assert ws["S1"].value == "Стоимость для налога"
-    assert ws["S2"].value == "=ROUND(G2,2)"
-    assert ws["K2"].value == '=IF(J2>=5100,"ставка","мин.ставка")'
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,S2/102*2),2)'
-    assert ws["R1"].value == "Примечание"
+    assert ws["I1"].value == "Стоимость для налога"
+    assert ws["I2"].value == "=ROUND(G2+H2,2)"
+    assert ws["N2"].value == '=IF(M2>=5100,"ставка","мин.ставка")'
+    assert ws["O2"].value == '=ROUND(IF(N2="мин.ставка",L2*100,I2/102*2),2)'
+    assert ws["U1"].value == "Примечание"
     assert bookings[0]["price"] == 5000.0
 
 
@@ -179,22 +179,26 @@ def test_tchaikovsky_tax_includes_extras_after_commission_and_can_disable(tmp_pa
         str(src), str(rooms), str(with_extras), extra_data=extras,
         source_map=source_map, tax={"include_extras_in_tax": True})
     ws = openpyxl.load_workbook(with_extras)["1&2"]
+    assert ws["G1"].value == "Стоимость с комиссией"
+    assert ws["H1"].value == "Допуслуги"
+    assert ws["I1"].value == "Стоимость для налога"
     assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
-    assert ws["S2"].value == 1500
-    assert ws["T2"].value == "Завтрак"
-    assert ws["U1"].value == "Стоимость для налога"
-    assert ws["U2"].value == "=ROUND(G2+S2,2)"
-    assert ws["J2"].value == "=U2/I2"
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,U2/102*2),2)'
+    assert ws["H2"].value == 1500
+    assert ws["I1"].value == "Стоимость для налога"
+    assert ws["I2"].value == "=ROUND(G2+H2,2)"
+    assert ws["J2"].value == "Завтрак"
+    assert ws["M2"].value == "=I2/L2"
+    assert ws["O2"].value == '=ROUND(IF(N2="мин.ставка",L2*100,I2/102*2),2)'
 
     without_extras = tmp_path / "tch-extras-off.xlsx"
     core.process_tchaikovsky(
         str(src), str(rooms), str(without_extras), extra_data=extras,
         source_map=source_map, tax={"include_extras_in_tax": False})
     ws_off = openpyxl.load_workbook(without_extras)["1&2"]
-    assert ws_off["U1"].value is None
-    assert ws_off["J2"].value == "=G2/I2"
-    assert ws_off["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
+    assert ws_off["I1"].value == "Стоимость для налога"
+    assert ws_off["I2"].value == "=ROUND(G2,2)"
+    assert ws_off["M2"].value == "=I2/L2"
+    assert ws_off["O2"].value == '=ROUND(IF(N2="мин.ставка",L2*100,I2/102*2),2)'
 
 
 def test_dona_does_not_add_extras_to_tax_base(tmp_path):
@@ -212,11 +216,63 @@ def test_dona_does_not_add_extras_to_tax_base(tmp_path):
         str(src), str(out), extra_data=["Допуслуги"],
         tax={"include_extras_in_tax": True})
     ws = openpyxl.load_workbook(out)["Дона"]
+    assert ws["G1"].value == "Стоимость с комиссией"
+    assert ws["H1"].value == "Допуслуги"
+    assert ws["I1"].value == "Стоимость для налога"
     assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
-    assert ws["Q2"].value == 1500
-    assert all(ws.cell(1, c).value != "Стоимость для налога"
-               for c in range(1, ws.max_column + 1))
+    assert ws["H2"].value == 1500
+    assert ws["I2"].value == "=ROUND(G2+J2,2)"
+    assert ws["J2"].value == 0
+    assert ws["P2"].value == '=ROUND(IF(O2="мин.ставка",M2*100,I2/102*2),2)'
+
+
+def test_dona_tax_base_includes_only_named_room_extension(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import core
+
+    src = tmp_path / "dona-extension.csv"
+    out = tmp_path / "dona-extension.xlsx"
+    pd.DataFrame([[
+        "Иванов Иван", 10000, "01.08.2026", "03.08.2026", "Сайт", 2500,
+        "Продление номера — 1 000,00 ₽; Завтрак — 1 500,00 ₽", 1000,
+    ]], columns=[
+        "Гость", "Стоимость", "Заезд", "Выезд", "Источник", "Допуслуги",
+        "Наименование допуслуг", "Сумма продления номера",
+    ]).to_csv(src, index=False)
+
+    core.process_dona(str(src), str(out),
+                      tax={"include_extras_in_tax": True})
+    ws = openpyxl.load_workbook(out)["Дона"]
+    assert ws["H2"].value == 2500
+    assert ws["I1"].value == "Стоимость для налога"
+    assert ws["I2"].value == "=ROUND(G2+J2,2)"
+    assert ws["J2"].value == 1000
+    assert ws["K2"].value == (
+        "Продление номера — 1 000,00 ₽; Завтрак — 1 500,00 ₽")
+    assert ws["P2"].value == '=ROUND(IF(O2="мин.ставка",M2*100,I2/102*2),2)'
+
+    disabled = tmp_path / "dona-extension-off.xlsx"
+    core.process_dona(str(src), str(disabled),
+                      tax={"include_extras_in_tax": False})
+    ws_off = openpyxl.load_workbook(disabled)["Дона"]
+    assert ws_off["J2"].value == 1000  # для контроля сумма показана и без включения
+    assert ws_off["I2"].value == "=ROUND(G2,2)"
+
+    # Older/manual exports may only have the service description with amount.
+    fallback_src = tmp_path / "dona-extension-no-amount-column.csv"
+    fallback_out = tmp_path / "dona-extension-no-amount-column.xlsx"
+    pd.DataFrame([[
+        "Иванов Иван", 10000, "01.08.2026", "03.08.2026", "Сайт", 2500,
+        "Продление номера — 1 000,00 ₽; Завтрак — 1 500,00 ₽",
+    ]], columns=[
+        "Гость", "Стоимость", "Заезд", "Выезд", "Источник", "Допуслуги",
+        "Наименование допуслуг",
+    ]).to_csv(fallback_src, index=False)
+    core.process_dona(str(fallback_src), str(fallback_out))
+    ws_fallback = openpyxl.load_workbook(fallback_out)["Дона"]
+    assert ws_fallback["J2"].value == 1000
+    assert ws_fallback["I2"].value == "=ROUND(G2+J2,2)"
 
 
 def test_guess_mapping_renamed_headers():
@@ -254,8 +310,8 @@ def test_dona_extra_columns_and_custom_mapping(tmp_path):
     summary, bookings = core.process_dona(src, out, map_data=mapping,
                                               extra_data=["Менеджер"])
     ws = openpyxl.load_workbook(out)["Дона"]
-    assert ws["Q1"].value == "Менеджер"          # доп. колонка в шапке
-    assert ws["Q2"].value == "Менеджер"          # значение перенесено
+    assert ws["U1"].value == "Менеджер"          # доп. колонка в шапке
+    assert ws["U2"].value == "Менеджер"          # значение перенесено
     assert ws["D2"].value == 8500
     assert ws["E2"].value == 16  # островок распознан: 16% с 01.08.2026 (заезд 01.08)
     assert summary["Отсутствует Стоимость (ГОЛУБОЙ)"] == 0
@@ -295,7 +351,7 @@ def test_dona_custom_tax_in_output(tmp_path):
                  ).to_csv(src, index=False)
     _, _ = core.process_dona(src, out, tax={'rate': 3})
     ws = openpyxl.load_workbook(out)["Дона"]
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/103*3),2)'
+    assert ws["P2"].value == '=ROUND(IF(O2="мин.ставка",M2*100,I2/103*3),2)'
 
 
 def test_match_cross_language_and_typos():
@@ -430,8 +486,9 @@ def test_use_full_off(tmp_path):
     _, _ = core.process_dona(src, out, tax={'use_full': False})
     ws = openpyxl.load_workbook(out)["Дона"]
     # налог от исходной стоимости D, а не от пересчитанной G
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,D2/102*2),2)'
-    assert ws["J2"].value == '=D2/I2'
+    assert ws["P2"].value == '=ROUND(IF(O2="мин.ставка",M2*100,I2/102*2),2)'
+    assert ws["N2"].value == '=I2/M2'
+    assert ws["I2"].value == '=ROUND(D2+J2,2)'
 
 
 def test_source_map_none_no_highlight(tmp_path):
@@ -500,8 +557,9 @@ def test_default_tax_base_is_full_price(tmp_path):
     assert ws["D1"].value == 'Стоимость без комиссии'
     assert ws["G1"].value == 'Стоимость с комиссией'
     assert ws["G2"].value == '=ROUND(D2/(100-E2)*100,2)'
-    assert ws["L2"].value == '=ROUND(IF(K2="мин.ставка",I2*100,G2/102*2),2)'
-    assert ws["J2"].value == '=G2/I2'
+    assert ws["P2"].value == '=ROUND(IF(O2="мин.ставка",M2*100,I2/102*2),2)'
+    assert ws["N2"].value == '=I2/M2'
+    assert ws["I2"].value == '=ROUND(G2+J2,2)'
 
 
 def test_discount_zero_and_ostrovok_float():

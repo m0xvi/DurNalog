@@ -80,6 +80,20 @@ def test_service_names_are_exported_with_amounts():
     assert 'Завтрак — 1 500,00 ₽' in names
     assert 'Парковка — 900,00 ₽' in names
     assert 'Ранний заезд — 100,00 ₽' in names
+    assert row['Сумма продления номера'] == 0
+
+
+def test_room_extension_amount_is_separated_from_other_extras():
+    stay = _stay(services=(
+        {'name': 'Продление номера', 'amount': 1200.0},
+        {'name': 'Завтрак', 'amount': 800.0},
+    ))
+    b = _book(stays=[stay], total=12000.0)
+    rows, _ = bookings_to_rows([b], QS, QE)
+    assert rows[0]['Допуслуги'] == 2000.0
+    assert rows[0]['Наименование допуслуг'] == (
+        'Продление номера — 1 200,00 ₽; Завтрак — 800,00 ₽')
+    assert rows[0]['Сумма продления номера'] == 1200.0
 
 
 def test_mode_b_extras_inside():
@@ -144,7 +158,7 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     assert list(df.columns) == ['Гость', 'Стоимость', 'Заезд', 'Выезд',
                                 'Источник', 'Категория номера', '№ брони',
                                 'Ночей', 'Тариф', 'Допуслуги', 'Наименование допуслуг',
-                                'Итог брони']
+                                'Сумма продления номера', 'Итог брони']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -320,7 +334,7 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v2|')
+    assert key.startswith('tlcache-v3|')
     assert tl_import_cache_key(*common) == key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',

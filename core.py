@@ -53,6 +53,46 @@ def _is_extra_amount_header(label):
     return norm_key(label) in _EXTRA_AMOUNT_KEYS
 
 
+def _is_service_name_header(label):
+    return norm_key(label) in {
+        'наименованиедопуслуг', 'названиедопуслуг',
+        'описаниедопуслуг', 'additionalservicenames',
+    }
+
+
+def _is_extension_amount_header(label):
+    return norm_key(label) in {
+        'суммапродленияномера', 'продлениеномерасумма',
+    }
+
+
+def _service_name_parts(value):
+    for part in str(value or '').split(';'):
+        match = re.match(r'^(.*?)\s+[—–-]\s+(.*)$', part.strip())
+        if match:
+            yield match.group(1).strip(), match.group(2).strip()
+        else:
+            yield part.strip(), None
+
+
+def _contains_named_service(value, service_name):
+    target = norm_key(service_name)
+    return any(norm_key(name) == target
+               for name, _amount in _service_name_parts(value))
+
+
+def _named_service_amount(value, service_name):
+    """Извлекает суммы из колонок вида «Услуга — 1 000,00 ₽; ...»."""
+    target = norm_key(service_name)
+    total = 0.0
+    for name, amount_text in _service_name_parts(value):
+        if amount_text is not None and norm_key(name) == target:
+            amount = parse_price(amount_text)
+            if amount is not None:
+                total += amount
+    return round(total, 2)
+
+
 class WorkbookReadError(Exception):
     """Файл Excel не читается: понятное пользователю описание + что делать."""
 
@@ -424,7 +464,7 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                         agents=None, source_map=None):
     """Возвращает (errors_summary, bookings)."""
     tax_cfg = dict(tax or {})
-    # Новый режим по умолчанию включён только для Чайковского.
+    # Для Чайковского сохраняем включение всех допуслуг по умолчанию.
     tax_cfg.setdefault('include_extras_in_tax', True)
     tp = TaxParams(tax_cfg)
     log.info("Чайковский: %s / %s", data_path, rooms_path)
@@ -443,9 +483,17 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     extra_data = [c for c in (extra_data or []) if c in df_data.columns]
     extra_amount_col = next(
         (c for c in df_data.columns if _is_extra_amount_header(c)), None)
-    if (tp.include_extras_in_tax and extra_amount_col is not None
-            and extra_amount_col not in extra_data):
-        extra_data.append(extra_amount_col)
+    service_name_col = next(
+        (c for c in df_data.columns if _is_service_name_header(c)), None)
+    extension_amount_col = next(
+        (c for c in df_data.columns if _is_extension_amount_header(c)), None)
+    for special_col in (extra_amount_col, service_name_col, extension_amount_col):
+        if special_col is not None and special_col not in extra_data:
+            extra_data.append(special_col)
+    report_extra_data = [
+        c for c in extra_data
+        if c not in (extra_amount_col, service_name_col, extension_amount_col)
+    ]
 
     room_mapping = {}
     for _, rr in df_rooms.iterrows():
@@ -514,13 +562,15 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                 source, agents or default_agents(),
                 date=checkin.date() if checkin else None, hotel='tch')
 
+        extras_amount = parse_price(row[extra_amount_col]) if extra_amount_col else 0.0
+        extras_amount = 0.0 if extras_amount is None else round(extras_amount, 2)
+        names_value = row[service_name_col] if service_name_col else ''
+        service_names = ('' if names_value is None or pd.isna(names_value)
+                         else str(names_value).strip())
         extra_vals = []
-        for c in extra_data:
+        for c in report_extra_data:
             value = row[c]
-            if c == extra_amount_col:
-                amount = parse_price(value)
-                value = 0.0 if amount is None else round(amount, 2)
-            elif pd.isna(value):
+            if pd.isna(value):
                 value = ''
             extra_vals.append(value)
 
@@ -531,6 +581,7 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                                and source not in (source_map or {})),
             'checkin': checkin, 'nights': nights, 'checkout': checkout,
             'source': source, 'category': category, 'room': find_room(guest),
+            'extras_amount': extras_amount, 'service_names': service_names,
             'extra_vals': extra_vals, 'dup_note': None,
         })
 
@@ -557,21 +608,14 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    headers = ['№ брони', 'Номеров', 'Гость', 'Стоимость без комиссии', 'Комиссия %', 'Агент',
-               'Стоимость с комиссией', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
-               'Налог', 'Выезд', 'Источник', 'Категория номера', '№ комнаты',
-               'корпус', 'Примечание'] + extra_data
+    headers = [
+        '№ брони', 'Номеров', 'Гость', 'Стоимость без комиссии', 'Комиссия %',
+        'Агент', 'Стоимость с комиссией', 'Допуслуги', 'Стоимость для налога',
+        'Наименование допуслуг', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
+        'Налог', 'Выезд', 'Источник', 'Категория номера', '№ комнаты',
+        'корпус', 'Примечание',
+    ] + report_extra_data
     base = 'G' if tp.use_full else 'D'
-    taxable_base_idx = None
-    taxable_base_letter = base
-    extras_amount_letter = None
-    if tp.include_extras_in_tax:
-        if extra_amount_col is not None and extra_amount_col in extra_data:
-            extras_amount_letter = get_column_letter(
-                19 + extra_data.index(extra_amount_col))
-        taxable_base_idx = len(headers) + 1
-        taxable_base_letter = get_column_letter(taxable_base_idx)
-        headers.append('Стоимость для налога')
     n_cols = len(headers)
     font_bold = Font(bold=True)
 
@@ -610,98 +654,96 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
                              value=f'=ROUND(D{r}/(100-E{r})*100,2)')
             c_full.number_format = '#,##0.00'
 
-            c_in = ws.cell(row=r, column=8, value=rec['checkin'])
+            c_extras = ws.cell(row=r, column=8, value=rec['extras_amount'])
+            c_extras.number_format = '#,##0.00'
+            extra_term = f'+H{r}' if tp.include_extras_in_tax else ''
+            c_tax_base = ws.cell(
+                row=r, column=9, value=f'=ROUND({base}{r}{extra_term},2)')
+            c_tax_base.number_format = '#,##0.00'
+            c_names = ws.cell(row=r, column=10, value=rec['service_names'])
+            c_names.alignment = Alignment(wrap_text=True, vertical='top')
+
+            c_in = ws.cell(row=r, column=11, value=rec['checkin'])
             if rec['checkin']:
                 c_in.number_format = DATE_FMT
             else:
                 c_in.fill = FILL_DATE
                 if count_errors: errors_summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-            ws.cell(row=r, column=9, value=rec['nights'])
-            if taxable_base_idx is not None:
-                extra_term = (f'+{extras_amount_letter}{r}'
-                              if extras_amount_letter else '')
-                c_tax_base = ws.cell(
-                    row=r, column=taxable_base_idx,
-                    value=f'=ROUND({base}{r}{extra_term},2)')
-                c_tax_base.number_format = '#,##0.00'
-            tax_price_col = (taxable_base_letter if taxable_base_idx is not None
-                             else base)
-            c_rate = ws.cell(row=r, column=10,
-                             value=tp.f_daily(tax_price_col, 'I', r))
+            ws.cell(row=r, column=12, value=rec['nights'])
+            c_rate = ws.cell(row=r, column=13,
+                             value=tp.f_daily('I', 'L', r))
             c_rate.number_format = '#,##0.00'
-            ws.cell(row=r, column=11, value=tp.f_method('J', r))
-            c_tax = ws.cell(row=r, column=12,
-                            value=tp.f_tax('K', 'I', tax_price_col, r))
+            ws.cell(row=r, column=14, value=tp.f_method('M', r))
+            c_tax = ws.cell(row=r, column=15,
+                            value=tp.f_tax('N', 'L', 'I', r))
             c_tax.number_format = '#,##0.00'
 
-            c_out = ws.cell(row=r, column=13, value=rec['checkout'])
+            c_out = ws.cell(row=r, column=16, value=rec['checkout'])
             if rec['checkout']:
                 c_out.number_format = DATE_FMT
             else:
                 c_out.fill = FILL_DATE
                 if count_errors: errors_summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-            ws.cell(row=r, column=14, value=rec['source'])
-            cat = ws.cell(row=r, column=15, value=rec['category'])
+            ws.cell(row=r, column=17, value=rec['source'])
+            cat = ws.cell(row=r, column=18, value=rec['category'])
             cat.alignment = Alignment(wrap_text=True, vertical='top')
 
-            c_room = ws.cell(row=r, column=16, value=rec['room'])
+            c_room = ws.cell(row=r, column=19, value=rec['room'])
             if rec['room'] is None:
                 c_room.fill = FILL_ROOM
                 if count_errors: errors_summary["Отсутствует № комнаты (КРАСНЫЙ)"] += 1
             else:
-                ws.cell(row=r, column=17, value=f'=IF(P{r}<50,1,2)')
+                ws.cell(row=r, column=20, value=f'=IF(S{r}<50,1,2)')
 
-            c_note = ws.cell(row=r, column=18, value=rec['dup_note'] or '')
+            c_note = ws.cell(row=r, column=21, value=rec['dup_note'] or '')
             if rec['dup_note']:
                 c_note.fill = FILL_DUP
                 if count_errors: errors_summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] += 1
 
             for k, v in enumerate(rec['extra_vals']):
-                col_idx = 19 + k
+                col_idx = 22 + k
                 c_extra = ws.cell(row=r, column=col_idx, value=v)
-                label = extra_data[k]
+                label = report_extra_data[k]
                 if _is_extra_amount_header(label):
                     c_extra.number_format = '#,##0.00'
-                elif any(word in norm_key(label)
-                         for word in ('наимен', 'назван', 'servicename')):
+                elif (_is_service_name_header(label) or any(
+                        word in norm_key(label)
+                        for word in ('наимен', 'назван', 'servicename'))):
                     c_extra.alignment = Alignment(wrap_text=True, vertical='top')
 
         if recs:
             last = len(recs) + 1
             tr = last + 1
             ws.cell(row=tr, column=3, value="ИТОГО:")
-            ws.cell(row=tr, column=2, value=f'=SUM(B2:B{last})')
-            ws.cell(row=tr, column=4, value=f'=SUM(D2:D{last})')
-            ws.cell(row=tr, column=7, value=f'=SUM(G2:G{last})')
-            ws.cell(row=tr, column=9, value=f'=SUM(I2:I{last})')
-            ws.cell(row=tr, column=12, value=f'=SUM(L2:L{last})')
-            if taxable_base_idx is not None:
-                ws.cell(
-                    row=tr, column=taxable_base_idx,
-                    value=f'=SUM({taxable_base_letter}2:{taxable_base_letter}{last})')
+            for col in (2, 4, 7, 8, 9, 12, 15):
+                letter = get_column_letter(col)
+                ws.cell(row=tr, column=col,
+                        value=f'=SUM({letter}2:{letter}{last})')
             for c in range(1, n_cols + 1):
                 cell = ws.cell(row=tr, column=c)
                 cell.font = font_bold
                 cell.fill = FILL_TOTALS
 
-        widths = {'A': 24, 'B': 9, 'C': 35, 'D': 12, 'E': 10, 'F': 32, 'G': 20,
-                  'H': 17, 'I': 8, 'J': 11, 'K': 12, 'L': 11, 'M': 17, 'N': 25,
-                  'O': 30, 'P': 10, 'Q': 8, 'R': 45}
-        for col, w in widths.items():
-            ws.column_dimensions[col].width = w
-        for k, label in enumerate(extra_data):
-            col_letter = get_column_letter(19 + k)
+        widths = {
+            'A': 24, 'B': 9, 'C': 35, 'D': 18, 'E': 10, 'F': 32,
+            'G': 20, 'H': 16, 'I': 24, 'J': 48, 'K': 12, 'L': 10,
+            'M': 16, 'N': 12, 'O': 12, 'P': 12, 'Q': 25, 'R': 30,
+            'S': 10, 'T': 8, 'U': 45,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+        for k, label in enumerate(report_extra_data):
+            col_letter = get_column_letter(22 + k)
             if _is_extra_amount_header(label):
                 ws.column_dimensions[col_letter].width = 16
-            elif any(word in norm_key(label)
-                     for word in ('наимен', 'назван', 'servicename')):
+            elif (_is_service_name_header(label) or any(
+                    word in norm_key(label)
+                    for word in ('наимен', 'назван', 'servicename'))):
                 ws.column_dimensions[col_letter].width = 48
             elif col_letter not in widths:
                 ws.column_dimensions[col_letter].width = 20
-        if taxable_base_idx is not None:
-            ws.column_dimensions[taxable_base_letter].width = 24
         return ws
 
     def corpus_of(rec):
@@ -734,7 +776,9 @@ def process_dona(data_path, output_path, map_data=None,
                  extra_data=None, dup_checker=None, tax=None,
                  agents=None, source_map=None):
     """Возвращает (summary, bookings)."""
-    tp = TaxParams(tax)
+    tax_cfg = dict(tax or {})
+    tax_cfg.setdefault('include_extras_in_tax', True)
+    tp = TaxParams(tax_cfg)
     log.info("Дона: %s", data_path)
     df_data = read_table(data_path)
     headers = [str(c) for c in df_data.columns]
@@ -743,6 +787,19 @@ def process_dona(data_path, output_path, map_data=None,
     if miss:
         raise ValueError(f"Не сопоставлены колонки: {', '.join(miss)}")
     extra_data = [c for c in (extra_data or []) if c in df_data.columns]
+    extra_amount_col = next(
+        (c for c in df_data.columns if _is_extra_amount_header(c)), None)
+    service_name_col = next(
+        (c for c in df_data.columns if _is_service_name_header(c)), None)
+    extension_amount_col = next(
+        (c for c in df_data.columns if _is_extension_amount_header(c)), None)
+    for special_col in (extra_amount_col, service_name_col, extension_amount_col):
+        if special_col is not None and special_col not in extra_data:
+            extra_data.append(special_col)
+    report_extra_data = [
+        c for c in extra_data
+        if c not in (extra_amount_col, service_name_col, extension_amount_col)
+    ]
 
     def get(row, key):
         col = map_data.get(key)
@@ -789,7 +846,28 @@ def process_dona(data_path, output_path, map_data=None,
             commission, agent = match_agent(
                 source, agents or default_agents(),
                 date=checkin.date() if checkin else None, hotel='dna')
-        extra_vals = [row[c] if not pd.isna(row[c]) else '' for c in extra_data]
+        names_value = row[service_name_col] if service_name_col else ''
+        service_names = ('' if names_value is None or pd.isna(names_value)
+                         else str(names_value).strip())
+        extras_amount = (parse_price(row[extra_amount_col])
+                         if extra_amount_col is not None else 0.0)
+        extras_amount = 0.0 if extras_amount is None else round(extras_amount, 2)
+
+        extension_amount = 0.0
+        if _contains_named_service(service_names, 'Продление номера'):
+            extension_amount = (
+                parse_price(row[extension_amount_col])
+                if extension_amount_col is not None else None)
+            described_amount = _named_service_amount(
+                service_names, 'Продление номера')
+            if extension_amount is None or (
+                    extension_amount == 0 and described_amount > 0):
+                extension_amount = described_amount
+            extension_amount = (0.0 if extension_amount is None
+                                else round(extension_amount, 2))
+
+        extra_vals = [row[c] if not pd.isna(row[c]) else ''
+                      for c in report_extra_data]
 
         records.append({
             'bron': bron, 'num_rooms': num_rooms, 'guest': guest, 'price': price,
@@ -798,6 +876,9 @@ def process_dona(data_path, output_path, map_data=None,
                                and source not in (source_map or {})),
             'checkin': checkin, 'nights': nights, 'checkout': checkout,
             'source': source, 'category': category,
+            'extras_amount': extras_amount,
+            'extension_amount': extension_amount,
+            'service_names': service_names,
             'extra_vals': extra_vals, 'dup_note': None,
         })
 
@@ -823,11 +904,16 @@ def process_dona(data_path, output_path, map_data=None,
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    headers_out = ['№ брони', 'Номеров', 'Гость', 'Стоимость без комиссии', 'Комиссия %', 'Агент',
-                   'Стоимость с комиссией', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
-                   'Налог', 'Выезд', 'Источник', 'Категория номера', 'Примечание'] + extra_data
+    headers_out = [
+        '№ брони', 'Номеров', 'Гость', 'Стоимость без комиссии', 'Комиссия %',
+        'Агент', 'Стоимость с комиссией', 'Допуслуги',
+        'Стоимость для налога', 'Сумма продления номера',
+        'Наименование допуслуг', 'Заезд', 'Ночей', 'Сут.ставка', 'Метод',
+        'Налог', 'Выезд', 'Источник', 'Категория номера', 'Примечание',
+    ] + report_extra_data
     n_cols = len(headers_out)
     font_bold = Font(bold=True)
+    base = 'G' if tp.use_full else 'D'
 
     ws = wb.create_sheet('Дона')
     for c, h in enumerate(headers_out, start=1):
@@ -859,62 +945,87 @@ def process_dona(data_path, output_path, map_data=None,
             c_agent.fill = FILL_GUEST
             summary["Нераспознанный источник — комиссия 0% (ЖЕЛТЫЙ)"] += 1
 
-        c_full = ws.cell(row=r, column=7, value=f'=ROUND(D{r}/(100-E{r})*100,2)')
+        c_full = ws.cell(row=r, column=7,
+                         value=f'=ROUND(D{r}/(100-E{r})*100,2)')
         c_full.number_format = '#,##0.00'
+        c_extras = ws.cell(row=r, column=8, value=rec['extras_amount'])
+        c_extras.number_format = '#,##0.00'
+        extra_term = f'+J{r}' if tp.include_extras_in_tax else ''
+        c_tax_base = ws.cell(
+            row=r, column=9, value=f'=ROUND({base}{r}{extra_term},2)')
+        c_tax_base.number_format = '#,##0.00'
+        c_extension = ws.cell(row=r, column=10, value=rec['extension_amount'])
+        c_extension.number_format = '#,##0.00'
+        c_names = ws.cell(row=r, column=11, value=rec['service_names'])
+        c_names.alignment = Alignment(wrap_text=True, vertical='top')
 
-        c_in = ws.cell(row=r, column=8, value=rec['checkin'])
+        c_in = ws.cell(row=r, column=12, value=rec['checkin'])
         if rec['checkin']:
             c_in.number_format = DATE_FMT
         else:
             c_in.fill = FILL_DATE
             summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-        ws.cell(row=r, column=9, value=rec['nights'])
-        # налог от 100% цены (G) или от нетто как в документе (D)
-        pcol = 'G' if tp.use_full else 'D'
-        c_rate = ws.cell(row=r, column=10, value=tp.f_daily(pcol, 'I', r))
+        ws.cell(row=r, column=13, value=rec['nights'])
+        pcol = 'I'
+        c_rate = ws.cell(row=r, column=14,
+                         value=tp.f_daily(pcol, 'M', r))
         c_rate.number_format = '#,##0.00'
-        ws.cell(row=r, column=11, value=tp.f_method('J', r))
-        c_tax = ws.cell(row=r, column=12, value=tp.f_tax('K', 'I', pcol, r))
+        ws.cell(row=r, column=15, value=tp.f_method('N', r))
+        c_tax = ws.cell(row=r, column=16,
+                        value=tp.f_tax('O', 'M', pcol, r))
         c_tax.number_format = '#,##0.00'
 
-        c_out = ws.cell(row=r, column=13, value=rec['checkout'])
+        c_out = ws.cell(row=r, column=17, value=rec['checkout'])
         if rec['checkout']:
             c_out.number_format = DATE_FMT
         else:
             c_out.fill = FILL_DATE
             summary["Отсутствуют Даты (ОРАНЖЕВЫЙ)"] += 1
 
-        ws.cell(row=r, column=14, value=rec['source'])
-        cat = ws.cell(row=r, column=15, value=rec['category'])
+        ws.cell(row=r, column=18, value=rec['source'])
+        cat = ws.cell(row=r, column=19, value=rec['category'])
         cat.alignment = Alignment(wrap_text=True, vertical='top')
 
-        c_note = ws.cell(row=r, column=16, value=rec['dup_note'] or '')
+        c_note = ws.cell(row=r, column=20, value=rec['dup_note'] or '')
         if rec['dup_note']:
             c_note.fill = FILL_DUP
             summary["Переход кварталов (ФИОЛЕТОВЫЙ)"] += 1
 
         for k, v in enumerate(rec['extra_vals']):
-            ws.cell(row=r, column=17 + k, value=v)
+            ws.cell(row=r, column=21 + k, value=v)
 
     if records:
         last = len(records) + 1
         tr = last + 1
         ws.cell(row=tr, column=3, value="ИТОГО:")
-        ws.cell(row=tr, column=2, value=f'=SUM(B2:B{last})')
-        ws.cell(row=tr, column=4, value=f'=SUM(D2:D{last})')
-        ws.cell(row=tr, column=7, value=f'=SUM(G2:G{last})')
-        ws.cell(row=tr, column=9, value=f'=SUM(I2:I{last})')
-        ws.cell(row=tr, column=12, value=f'=SUM(L2:L{last})')
+        for col in (2, 4, 7, 8, 9, 10, 13, 16):
+            letter = get_column_letter(col)
+            ws.cell(row=tr, column=col,
+                    value=f'=SUM({letter}2:{letter}{last})')
         for c in range(1, n_cols + 1):
             cell = ws.cell(row=tr, column=c)
             cell.font = font_bold
             cell.fill = FILL_TOTALS
 
-    widths = {'A': 24, 'B': 9, 'C': 35, 'D': 12, 'E': 11, 'F': 30, 'G': 20,
-              'H': 17, 'I': 8, 'J': 11, 'K': 12, 'L': 11, 'M': 17, 'N': 35, 'O': 30, 'P': 45}
-    for col, w in widths.items():
-        ws.column_dimensions[col].width = w
+    widths = {
+        'A': 24, 'B': 9, 'C': 35, 'D': 18, 'E': 11, 'F': 30,
+        'G': 20, 'H': 16, 'I': 24, 'J': 24, 'K': 48, 'L': 12,
+        'M': 10, 'N': 16, 'O': 12, 'P': 12, 'Q': 12, 'R': 35,
+        'S': 30, 'T': 45,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    for k, label in enumerate(report_extra_data):
+        col_letter = get_column_letter(21 + k)
+        if _is_extra_amount_header(label):
+            ws.column_dimensions[col_letter].width = 16
+        elif (_is_service_name_header(label) or any(
+                word in norm_key(label)
+                for word in ('наимен', 'назван', 'servicename'))):
+            ws.column_dimensions[col_letter].width = 48
+        elif col_letter not in widths:
+            ws.column_dimensions[col_letter].width = 20
 
     wb.save(output_path)
     log.info("Дона сохранена: %s", output_path)

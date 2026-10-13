@@ -48,7 +48,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.24"
+APP_VERSION = "3.25"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -461,9 +461,9 @@ class RealApp(TurNalogApp):
         theme.DB_PATH_DEMO = default_db_path()
         for hid, code in ID2CODE.items():
             tax_cfg = dict(self.cfg.get('tax', {}).get(code) or {})
-            # For the Chaykovsky hotel the new add-on tax base is enabled by
-            # default; a saved explicit False remains respected.
-            tax_cfg.setdefault('include_extras_in_tax', code == 'tch')
+            # The add-on tax-base option defaults on for Chaykovsky and Dona;
+            # a saved explicit False remains respected for either hotel.
+            tax_cfg.setdefault('include_extras_in_tax', code in ('tch', 'dna'))
             tp = TaxParams(tax_cfg)
             h = theme.HOTELS[hid]
             h['rate'] = f"{tp.rate:g}"
@@ -472,7 +472,8 @@ class RealApp(TurNalogApp):
             h['tax_in_price'] = tp.incl
             h['auto_threshold'] = tp.auto
             h['tax_no_commission'] = tp.use_full
-            h['include_extras_in_tax'] = tp.include_extras_in_tax if code == 'tch' else False
+            h['include_extras_in_tax'] = (tp.include_extras_in_tax
+                                           if code in ('tch', 'dna') else False)
             h['formula_daily'] = tp.tpl_daily
             h['formula_method'] = tp.tpl_method
             h['formula_tax'] = tp.tpl_tax
@@ -624,7 +625,7 @@ class RealApp(TurNalogApp):
                     'auto_threshold': p['auto_threshold'],
                     'use_full': p['tax_no_commission'],
                     'include_extras_in_tax': (bool(p.get('include_extras_in_tax', False))
-                                              if code == 'tch' else False),
+                                              if code in ('tch', 'dna') else False),
                     'tpl_daily': p['formula_daily'], 'tpl_method': p['formula_method'],
                     'tpl_tax': p['formula_tax']}
             except ValueError:
