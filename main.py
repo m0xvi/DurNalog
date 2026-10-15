@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.31"
+APP_VERSION = "3.32"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -914,6 +914,30 @@ class RealApp(TurNalogApp):
                 if samples:
                     lines.append('Примеры ID без совпадения: '
                                  + ', '.join(map(str, samples[:8])))
+            discount_audit = rep.get('discount_audit') or {}
+            discount_stays = discount_audit.get('stays_with_discount', 0)
+            if discount_stays:
+                discount_sum = f"{discount_audit.get('discount_amount', 0.0):,.2f}"
+                discount_sum = discount_sum.replace(',', ' ').replace('.', ',')
+                lines.append(
+                    f'Скидки TravelLine уже учтены в ценах: {discount_stays} '
+                    f'проживаний, всего {discount_sum} ₽.')
+                lines.append(
+                    'Предполагаемых ночей со скидкой по уникальному '
+                    f"совпадению dailyRates: {discount_audit.get('nights_with_discount_identified', 0)}; "
+                    'без однозначной даты: '
+                    f"{discount_audit.get('discounts_without_night_attribution', 0)}.")
+            daily_rates_checked = discount_audit.get('daily_rates_checked', 0)
+            daily_rates_mismatched = discount_audit.get(
+                'daily_rates_mismatched', 0)
+            daily_rates_missing = discount_audit.get('daily_rates_missing', 0)
+            if daily_rates_checked or daily_rates_missing:
+                prefix = '⚠ ' if daily_rates_mismatched else ''
+                lines.append(
+                    f'{prefix}Сверка dailyRates с итогами проживания: '
+                    f"совпало {discount_audit.get('daily_rates_matched', 0)}, "
+                    f'расхождений {daily_rates_mismatched}, '
+                    f'нет данных {daily_rates_missing}.')
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')

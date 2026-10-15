@@ -8,8 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import complete_mapping, guess_mapping, mapping_valid, read_table
 from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
-                       ROOM_LABEL_TEXT_PREFIX, accommodation_room_map,
-                       bookings_to_rows, channel_label,
+                       COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
+                       COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM,
+                       COL_TL_DAILY_CHECK, ROOM_LABEL_TEXT_PREFIX,
+                       accommodation_room_map, bookings_to_rows, channel_label,
                        is_tl_export, write_api_inspection_workbook,
                        write_data_workbook, write_rooms_workbook)
 
@@ -57,6 +59,106 @@ def test_plain_booking_no_services():
     assert r['Гость'] == 'Иван Петров' and r['Ночей'] == 2
     assert r['Источник'] == 'TravelLine YAX'
     assert r['№ брони'] == '20260701-8186-1'
+
+
+def test_discount_night_is_inferred_only_from_unique_daily_rate_match(tmp_path):
+    stay = _stay(arr='2026-08-22T14:00', dep='2026-08-27T12:00',
+                 room=88448.20)
+    stay['dailyRates'] = [
+        {'date': '2026-08-22', 'priceBeforeTax': 17248.20},
+        {'date': '2026-08-23', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-24', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-25', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-26', 'priceBeforeTax': 17800.00},
+    ]
+    stay['total'] = {
+        'priceBeforeTax': 88448.20,
+        'priceAfterTax': 88448.20,
+        'discounts': [{
+            'amount': 551.80, 'percent': 3.1,
+            'discountType': 'Percentage',
+        }],
+    }
+    booking = _book(stays=[stay], total=88448.20)
+    rows, report = bookings_to_rows([booking], QS, QE)
+
+    row = rows[0]
+    assert row['Стоимость'] == 88448.20  # dailyRates уже после скидки
+    assert row[COL_TL_DISCOUNT] == 551.80
+    assert row[COL_TL_DISCOUNT_PERCENT] == '3.1%'
+    assert row[COL_TL_DISCOUNT_DATES] == '2026-08-22'
+    assert row[COL_TL_DAILY_SUM] == 88448.20
+    assert row[COL_TL_DAILY_CHECK] == 'Сошлось по ночным тарифам'
+    audit = report['discount_audit']
+    assert audit['stays_with_discount'] == 1
+    assert audit['nights_with_discount_identified'] == 1
+    assert audit['discounts_without_night_attribution'] == 0
+    assert audit['daily_rates_matched'] == 1
+
+    import openpyxl
+
+    path = str(tmp_path / 'inspection.xlsx')
+    write_api_inspection_workbook(rows, report, path, details=[booking])
+    workbook = openpyxl.load_workbook(path, data_only=True)
+    data = workbook['Данные']
+    assert data['Q1'].value == COL_TL_DISCOUNT
+    assert data['Q2'].value == 551.80
+    assert data['S2'].value == '2026-08-22'
+    assert data['T2'].value == 88448.20
+    assert workbook['Сводка']['B12'].value == 551.80
+    assert workbook['Сводка']['B12'].number_format == '#,##0.00'
+
+
+def test_ambiguous_discount_is_reported_without_guessing_a_date():
+    stay = _stay(arr='2026-07-10T14:00', dep='2026-07-13T12:00', room=180.0)
+    stay['dailyRates'] = [
+        {'date': '2026-07-10', 'priceBeforeTax': 90.0},
+        {'date': '2026-07-11', 'priceBeforeTax': 45.0},
+        {'date': '2026-07-12', 'priceBeforeTax': 45.0},
+    ]
+    stay['total'] = {
+        'priceBeforeTax': 180.0, 'priceAfterTax': 180.0,
+        'discounts': [{
+            'amount': 10.0, 'percent': 10.0,
+            'discountType': 'Percentage',
+        }],
+    }
+    rows, report = bookings_to_rows([_book(stays=[stay], total=180.0)], QS, QE)
+
+    row = rows[0]
+    assert row[COL_TL_DISCOUNT] == 10.0
+    assert row[COL_TL_DISCOUNT_DATES] == 'Не распределена по датам'
+    assert report['discount_audit']['nights_with_discount_identified'] == 0
+    assert report['discount_audit']['discounts_without_night_attribution'] == 1
+
+
+def test_daily_rate_reconciliation_accounts_for_included_services():
+    stay = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                 room=250.0, services=({'name': 'Завтрак', 'amount': 50.0},))
+    stay['dailyRates'] = [
+        {'date': '2026-07-10', 'priceBeforeTax': 100.0},
+        {'date': '2026-07-11', 'priceBeforeTax': 100.0},
+    ]
+    stay['total'] = {'priceBeforeTax': 250.0, 'priceAfterTax': 250.0}
+    rows, report = bookings_to_rows([_book(stays=[stay], total=250.0)], QS, QE)
+
+    assert rows[0][COL_TL_DAILY_SUM] == 200.0
+    assert rows[0][COL_TL_DAILY_CHECK] == 'Сошлось с услугами'
+    assert report['discount_audit']['daily_rates_matched'] == 1
+    assert report['discount_audit']['daily_rates_mismatched'] == 0
+
+
+def test_daily_rates_are_not_compared_to_after_tax_when_before_tax_exists():
+    stay = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00', room=200.0)
+    stay['dailyRates'] = [
+        {'date': '2026-07-10', 'priceBeforeTax': 100.0},
+        {'date': '2026-07-11', 'priceBeforeTax': 100.0},
+    ]
+    stay['total'] = {'priceBeforeTax': 220.0, 'priceAfterTax': 200.0}
+    rows, report = bookings_to_rows([_book(stays=[stay], total=200.0)], QS, QE)
+
+    assert rows[0][COL_TL_DAILY_CHECK] == 'Расхождение -20.00 ₽'
+    assert report['discount_audit']['daily_rates_mismatched'] == 1
 
 
 def test_mode_a_with_paid_services():
@@ -578,7 +680,11 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
                                 'Источник', 'Категория номера', '№ брони',
                                 'Ночей', 'Тариф', 'Допуслуги', 'Наименование допуслуг',
                                 'Сумма продления номера', 'Итог брони',
-                                '№ комнаты', 'Корпус']
+                                '№ комнаты', 'Корпус',
+                                'Скидка TravelLine, ₽',
+                                'Процент скидки TravelLine',
+                                'Предполагаемые ночи со скидкой TravelLine',
+                                'Сумма dailyRates', 'Сверка dailyRates']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -809,7 +915,7 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v4|')
+    assert key.startswith('tlcache-v5|')
     assert tl_import_cache_key(*common) == key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',

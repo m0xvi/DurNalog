@@ -47,6 +47,7 @@ _EXTRA_AMOUNT_KEYS = {
     'допуслуги', 'суммадопуслуг', 'стоимостьдопуслуг',
     'суммадополнительныхуслуг', 'стоимостьдополнительныхуслуг',
     'extras', 'extrasamount', 'additionalservicesamount',
+    'скидкаtravelline', 'суммаdailyrates',
 }
 
 

@@ -12,6 +12,7 @@ Read Reservation возвращает roomStays[].roomId; для Чайковс�
 import json
 import re
 import time
+from collections import defaultdict
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,7 +25,7 @@ HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
-TL_CACHE_VERSION = 4
+TL_CACHE_VERSION = 5
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -44,13 +45,20 @@ COL_TOTAL = 'Итог брони'
 COL_ROOM = '№ комнаты'
 COL_CORPUS = 'Корпус'
 COL_BUILDING_NAME = 'Здание TravelLine'
+COL_TL_DISCOUNT = 'Скидка TravelLine, ₽'
+COL_TL_DISCOUNT_PERCENT = 'Процент скидки TravelLine'
+COL_TL_DISCOUNT_DATES = 'Предполагаемые ночи со скидкой TravelLine'
+COL_TL_DAILY_SUM = 'Сумма dailyRates'
+COL_TL_DAILY_CHECK = 'Сверка dailyRates'
 ROOM_LABEL_TEXT_PREFIX = '__TL_ROOM_LABEL__:'
 
 TL_DATA_MAP = {'guest': COL_GUEST, 'price': COL_PRICE, 'checkin': COL_IN,
                'checkout': COL_OUT, 'source': COL_SOURCE,
                'category': COL_CAT, 'bron': COL_BRON, 'nights': COL_NIGHTS,
                'room': COL_ROOM, 'corpus': COL_CORPUS}
-TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL]
+TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL,
+            COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
+            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
                 'building_name': COL_BUILDING_NAME, 'bron': COL_BRON}
 
@@ -333,6 +341,135 @@ def _money(total):
         return 0.0
 
 
+def _number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _discount_details(stay):
+    """Скидка по проживанию и даты ночей, если их можно определить однозначно.
+
+    API отдаёт скидки агрегированно в ``total.discounts``, а dailyRates — уже
+    итоговую цену каждой ночи. Для одного процентного правила распределяем
+    сумму на даты только когда одна группа одинаковых ночных цен точно
+    объясняет общую сумму скидки. В остальных случаях показываем сумму и не
+    угадываем даты.
+    """
+    total = stay.get('total') or {}
+    discounts = total.get('discounts') or []
+    if isinstance(discounts, dict):
+        discounts = [discounts]
+    discounts = [item for item in discounts if isinstance(item, dict)]
+    if not discounts:
+        return 0.0, '', ''
+
+    amount = round(sum(_number(item.get('amount')) or 0.0
+                       for item in discounts), 2)
+    percent_labels = []
+    for item in discounts:
+        percent = _number(item.get('percent'))
+        if percent is not None:
+            label = f'{percent:g}%'
+        elif str(item.get('discountType') or '').casefold() == 'fixed':
+            label = 'фиксированная'
+        else:
+            label = str(item.get('discountType') or 'скидка')
+        if label not in percent_labels:
+            percent_labels.append(label)
+
+    dates = []
+    daily_rates = stay.get('dailyRates') or []
+    if len(discounts) == 1:
+        item = discounts[0]
+        percent = _number(item.get('percent'))
+        discount_amount = _number(item.get('amount'))
+        kind = str(item.get('discountType') or '').casefold()
+        if (kind == 'percentage' and percent is not None
+                and 0 < percent < 100 and discount_amount is not None
+                and discount_amount > 0 and isinstance(daily_rates, list)):
+            by_price = defaultdict(list)
+            complete = True
+            for rate in daily_rates:
+                if not isinstance(rate, dict):
+                    complete = False
+                    break
+                price = _number(rate.get('priceBeforeTax'))
+                date = str(rate.get('date') or '')[:10]
+                if price is None or len(date) != 10:
+                    complete = False
+                    break
+                by_price[round(price, 2)].append(date)
+            if complete and by_price:
+                candidates = []
+                for net_price, rate_dates in by_price.items():
+                    undiscounted = net_price / (1 - percent / 100)
+                    per_night = round(undiscounted - net_price, 2)
+                    explained = round(per_night * len(rate_dates), 2)
+                    tolerance = max(0.02, 0.01 * len(rate_dates))
+                    if abs(explained - discount_amount) <= tolerance:
+                        candidates.append(rate_dates)
+                if len(candidates) == 1:
+                    dates = sorted(set(candidates[0]))
+
+    if dates:
+        date_text = ', '.join(dates)
+    elif amount > 0:
+        date_text = 'Не распределена по датам'
+    else:
+        date_text = ''
+    return amount, '; '.join(percent_labels), date_text
+
+
+def _daily_rate_audit(stay):
+    """Сверяет сумму ночных тарифов с итогом проживания, не меняя его."""
+    daily_rates = stay.get('dailyRates') or []
+    if not isinstance(daily_rates, list) or not daily_rates:
+        return None, 'Нет dailyRates'
+
+    prices = []
+    for rate in daily_rates:
+        if not isinstance(rate, dict):
+            return None, 'Неполные dailyRates'
+        price = _number(rate.get('priceBeforeTax'))
+        if price is None:
+            return None, 'Неполные dailyRates'
+        prices.append(price)
+    daily_sum = round(sum(prices), 2)
+
+    total = stay.get('total') or {}
+    target_before_tax = _number(total.get('priceBeforeTax'))
+    target_after_tax = _number(total.get('priceAfterTax'))
+    # dailyRates[].priceBeforeTax — сравниваем с тем же налоговым базисом;
+    # priceAfterTax используем только если API не прислал priceBeforeTax.
+    target = (target_before_tax if target_before_tax is not None
+              else target_after_tax)
+    if target is None:
+        return daily_sum, 'Нет итога для сверки'
+    if abs(daily_sum - target) <= 0.02:
+        return daily_sum, 'Сошлось по ночным тарифам'
+
+    services = sum(_money(service.get('total'))
+                   for service in stay.get('services') or []
+                   if isinstance(service, dict))
+    extras = stay.get('extraStayCharges') or {}
+    if not isinstance(extras, dict):
+        extras = {}
+    extras = sum(_money(extras.get(key))
+                 for key in ('earlyArrival', 'lateDeparture'))
+    with_services = round(daily_sum + services + extras, 2)
+    if ((services or extras)
+            and abs(with_services - target) <= 0.02):
+        return daily_sum, 'Сошлось с услугами'
+
+    compared_sum = with_services if services or extras else daily_sum
+    difference = round(compared_sum - target, 2)
+    return daily_sum, f'Расхождение {difference:+.2f} ₽'
+
+
 def _stay_overlaps(stay_dates, qs, qe):
     try:
         a = (stay_dates.get('arrivalDateTime') or '')[:10]
@@ -525,7 +662,14 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
     has_room_inventory = accommodation_inventory is not None
     rows, votes = [], {'A': 0, 'B': 0, '?': 0}
     rep = {'total': len(details), 'in_quarter': 0, 'cancelled': 0,
-           'rows': 0, 'mismatch': [], 'channels': {}}
+           'rows': 0, 'mismatch': [], 'channels': {},
+           'discount_audit': {
+               'stays_with_discount': 0, 'discount_amount': 0.0,
+               'nights_with_discount_identified': 0,
+               'discounts_without_night_attribution': 0,
+               'daily_rates_checked': 0, 'daily_rates_matched': 0,
+               'daily_rates_mismatched': 0, 'daily_rates_missing': 0,
+           }}
     if has_room_inventory:
         rep['room_assignments'] = {
             'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0,
@@ -585,6 +729,27 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
             stay_room = _money(rs.get('total'))
             stay_svc = sum(_money(s.get('total'))
                            for s in rs.get('services') or [])
+            discount_amount, discount_percent, discount_dates = (
+                _discount_details(rs))
+            daily_rate_sum, daily_rate_check = _daily_rate_audit(rs)
+            discount_stats = rep['discount_audit']
+            if discount_amount > 0:
+                discount_stats['stays_with_discount'] += 1
+                discount_stats['discount_amount'] += discount_amount
+                if discount_dates == 'Не распределена по датам':
+                    discount_stats['discounts_without_night_attribution'] += 1
+                else:
+                    discount_stats['nights_with_discount_identified'] += len(
+                        discount_dates.split(', '))
+            if daily_rate_sum is None or daily_rate_check.startswith(
+                    ('Нет', 'Неполные')):
+                discount_stats['daily_rates_missing'] += 1
+            else:
+                discount_stats['daily_rates_checked'] += 1
+                if daily_rate_check.startswith('Сошлось'):
+                    discount_stats['daily_rates_matched'] += 1
+                else:
+                    discount_stats['daily_rates_mismatched'] += 1
             row_svc = stay_svc + (svc_book + extra if first else 0.0)
             row_svc_extension = _extension_amount(rs.get('services') or [])
             row_svc_names = _service_descriptions(rs.get('services') or [])
@@ -647,12 +812,19 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
                 COL_SVC_NAME: '; '.join(row_svc_names),
                 COL_SVC_EXTENSION: round(row_svc_extension, 2),
                 COL_TOTAL: round(tot, 2),
+                COL_TL_DISCOUNT: discount_amount,
+                COL_TL_DISCOUNT_PERCENT: discount_percent,
+                COL_TL_DISCOUNT_DATES: discount_dates,
+                COL_TL_DAILY_SUM: daily_rate_sum,
+                COL_TL_DAILY_CHECK: daily_rate_check,
             })
             first = False
         ch[1] += room
         ch[2] += paid_extras
     rep['rows'] = len(rows)
     rep['votes'] = votes
+    rep['discount_audit']['discount_amount'] = round(
+        rep['discount_audit']['discount_amount'], 2)
     return rows, rep
 
 
@@ -662,7 +834,9 @@ def write_data_workbook(rows, path):
     ws.title = 'Брони'
     cols = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
             COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
-            COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS]
+            COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS,
+            COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
+            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
     ws.append(cols)
     for r in rows:
         values = []
@@ -678,6 +852,9 @@ def write_data_workbook(rows, path):
         for cell in ws[col][1:]:
             if isinstance(cell.value, datetime):
                 cell.number_format = 'DD.MM.YYYY HH:MM'
+    for col in ('P', 'S'):
+        for cell in ws[col][1:]:
+            cell.number_format = '#,##0.00'
     # Room assignment is consumed by the processor but kept out of the way
     # in the source workbook.
     for column in ('N', 'O'):
@@ -757,6 +934,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
     summary = wb.active
     summary.title = 'Сводка'
     stats = (report or {}).get('room_assignments') or {}
+    discount_stats = (report or {}).get('discount_audit') or {}
 
     def stat_value(key):
         return stats.get(key, '—' if details is None else 0)
@@ -774,13 +952,29 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         ('ID не найден в инвентаре', stat_value('room_id_not_in_inventory')),
         ('Комната найдена, но нет отображаемого номера',
          stat_value('inventory_no_display')),
+        ('Проживаний со скидкой TravelLine',
+         discount_stats.get('stays_with_discount', 0)),
+        ('Общая скидка TravelLine, ₽',
+         discount_stats.get('discount_amount', 0.0)),
+        ('Предполагаемых ночей со скидкой (вывод по dailyRates)',
+         discount_stats.get('nights_with_discount_identified', 0)),
+        ('Скидок без однозначной даты',
+         discount_stats.get('discounts_without_night_attribution', 0)),
+        ('Сверок dailyRates совпало',
+         discount_stats.get('daily_rates_matched', 0)),
+        ('Сверок dailyRates с расхождением',
+         discount_stats.get('daily_rates_mismatched', 0)),
+        ('Сверок dailyRates без данных',
+         discount_stats.get('daily_rates_missing', 0)),
     ]
     if details is None:
         summary_rows.append((
             'Важно', 'Кэш содержит только готовые строки; выберите '
             '«Обновить из TravelLine», чтобы получить исходные roomId и инвентарь.'))
-    for item in summary_rows:
+    for row_index, item in enumerate(summary_rows, 1):
         summary.append(item)
+        if item[0] == 'Общая скидка TravelLine, ₽':
+            summary.cell(row=row_index, column=2).number_format = '#,##0.00'
     if stats.get('unknown_room_id_samples'):
         summary.append(('Примеры ID без совпадения',
                         ', '.join(map(str, stats['unknown_room_id_samples']))))
@@ -792,10 +986,15 @@ def write_api_inspection_workbook(rows, report, path, details=None,
     data_columns = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
                     COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
                     COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS,
-                    COL_BUILDING_NAME]
+                    COL_BUILDING_NAME, COL_TL_DISCOUNT,
+                    COL_TL_DISCOUNT_PERCENT, COL_TL_DISCOUNT_DATES,
+                    COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
     data_sheet.append(data_columns)
     for row in rows or []:
         data_sheet.append([row.get(column) for column in data_columns])
+    for col in ('Q', 'T'):
+        for cell in data_sheet[col][1:]:
+            cell.number_format = '#,##0.00'
 
     rooms_sheet = wb.create_sheet('Номера')
     rooms_sheet.append(['ФИО', COL_ROOM, COL_CORPUS,
@@ -915,7 +1114,8 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         stays_sheet.append(['В API-ответе нет roomStays.'])
 
     default_widths = {
-        'Данные': [26, 16, 20, 20, 26, 28, 26, 10, 28, 14, 48, 20, 16, 16, 12, 28],
+        'Данные': [26, 16, 20, 20, 26, 28, 26, 10, 28, 14, 48, 20,
+                   16, 16, 12, 28, 18, 24, 38, 16, 34],
         'Номера': [32, 16, 12, 28, 28],
         'Номерной фонд API': [12, 18, 28, 18, 24, 28, 28, 22, 22, 18, 26, 72],
         'Проживания API': [28, 12, 28, 32, 32, 24, 32, 24, 24, 54, 72, 18, 36, 20, 14],
