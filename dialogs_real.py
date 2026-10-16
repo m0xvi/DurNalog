@@ -390,12 +390,13 @@ class TlPeriodDialog(ctk.CTkToplevel):
             row, variable=self.period_var, values=['Весь квартал'],
             width=300, height=34, dynamic_resizing=False)
         self.period_menu.pack(side='right')
-        self._set_mode('Квартал')
 
         self.period_hint = ctk.CTkLabel(
             self, text='', text_color='gray', anchor='w', wraplength=500,
             justify='left')
         self.period_hint.pack(fill='x', padx=36, pady=(0, 8))
+        # Инициализируем режим после создания виджета, который обновляет _set_mode.
+        self._set_mode('Квартал')
 
         buttons = ctk.CTkFrame(self, fg_color='transparent')
         buttons.pack(pady=(8, 14))
