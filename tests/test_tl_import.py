@@ -569,9 +569,65 @@ def test_accommodation_inventory_maps_room_display_names_to_buildings():
     assert mapped['room-205'] == {
         'room': 205, 'corpus': 2, 'building_name': 'Main building'}
     assert mapped['room-001']['room'] == '001'
-    assert mapped['room-A12'] == {
+    assert mapped['room-a12'] == {
         'room': 'A-12', 'corpus': 2, 'building_name': 'Main building'}
     assert 'room-111' not in accommodation_room_map({'buildings': []})
+
+
+def test_flat_property_room_list_maps_api_room_and_display_name_fallback():
+    from tl_client import bookings_to_rows
+
+    inventory = {'rooms': [
+        {'id': 'room-72', 'displayName': '72', 'floorId': 'floor-a'},
+        {'id': 'room-A12', 'displayName': 'A-12', 'floorId': 'floor-b'},
+    ]}
+    mapped = accommodation_room_map(inventory)
+    assert mapped['room-72'] == {
+        'room': 72, 'corpus': None, 'building_name': ''}
+    assert mapped['room-a12']['room'] == 'A-12'
+
+    # Some TravelLine responses carry the actual room object in `room` while
+    # `roomId` is a nonphysical identifier; try both exact API references.
+    stay = _stay(guests=(('Иван', 'Петров'),))
+    stay.update({'roomId': 'room-type-72',
+                 'room': {'id': 'room-72', 'displayName': '72'}})
+    rows, report = bookings_to_rows(
+        [_book(stays=[stay])], QS, QE, accommodation_inventory=inventory)
+    assert rows[0]['№ комнаты'] == 72
+    assert report['room_assignments']['assigned'] == 1
+    assert report['room_assignments']['assigned_by_room_id'] == 1
+
+    upper_id_stay = _stay()
+    upper_id_stay.update({'roomId': 'ROOM-A12'})
+    rows, _ = bookings_to_rows(
+        [_book(stays=[upper_id_stay])], QS, QE,
+        accommodation_inventory=inventory)
+    assert rows[0]['№ комнаты'] == 'A-12'
+
+    # If only a unique display name is present, use it but never guess when
+    # duplicate room labels exist in different buildings.
+    label_stay = _stay(guests=(('Иван', 'Петров'),))
+    label_stay.update({'roomId': 'not-an-inventory-id', 'room': 'A-12'})
+    rows, report = bookings_to_rows(
+        [_book(stays=[label_stay])], QS, QE, accommodation_inventory=inventory)
+    assert rows[0]['№ комнаты'] == 'A-12'
+    assert report['room_assignments']['assigned_by_display_name'] == 1
+
+    duplicate_labels = {'buildings': [
+        {'name': 'Корпус 1', 'rooms': [
+            {'id': 'room-a', 'displayName': '101'},
+        ]},
+        {'name': 'Корпус 2', 'rooms': [
+            {'id': 'room-b', 'displayName': '101'},
+        ]},
+    ]}
+    ambiguous_stay = _stay()
+    ambiguous_stay.update({'roomId': 'unknown', 'room': '101'})
+    rows, report = bookings_to_rows(
+        [_book(stays=[ambiguous_stay])], QS, QE,
+        accommodation_inventory=duplicate_labels)
+    assert rows[0]['№ комнаты'] is None
+    assert report['room_assignments']['assigned'] == 0
 
 
 def test_bookings_rows_keep_real_room_assignment_and_leave_missing_blank():
@@ -635,7 +691,8 @@ def test_room_diagnostic_workbook_shows_api_ids_and_match_reasons(tmp_path):
     room_id_col = headers.index('roomId') + 1
     values = list(stays.iter_rows(min_row=2, values_only=True))
     assert [row[status_col - 1] for row in values] == [
-        'Сопоставлено', 'roomId/room отсутствует', 'ID не найден в инвентаре']
+        'Сопоставлено по ID', 'roomId/room отсутствует',
+        'ID не найден в инвентаре']
     assert values[2][room_id_col - 1] == 'room-new'
     assert wb['Номерной фонд API']['F2'].value == 'room-72'
     assert wb['Данные']['N2'].value == 72
@@ -684,6 +741,45 @@ def test_tl_room_workbooks_drive_corpus_and_do_not_guess_unassigned_stay(tmp_pat
     assert corpus_2['S2'].value == 15 and corpus_2['T2'].value == 2
     assert no_corpus['A2'].value == 'unassigned'
     assert no_corpus['S2'].value is None and no_corpus['T2'].value is None
+
+
+def test_manual_room_file_matches_same_booking_by_exact_stay_dates(tmp_path):
+    from datetime import datetime
+    import openpyxl
+    import core
+
+    guest = (('Иван', 'Петров'),)
+    first = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                  guests=guest)
+    first.update({'roomId': None, 'pmsRoomStayId': 'stay-1'})
+    second = _stay(arr='2026-07-12T14:00', dep='2026-07-14T12:00',
+                   guests=guest)
+    second.update({'roomId': None, 'pmsRoomStayId': 'stay-2'})
+    rows, _ = bookings_to_rows(
+        [_book(number='group-1', stays=[first, second], total=20000)],
+        QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    room_file = openpyxl.Workbook()
+    sheet = room_file.active
+    sheet.append(['ФИО', '№ комнаты', 'Корпус', '№ брони', 'Заезд', 'Выезд'])
+    sheet.append(['Иван Петров', 72, 1, 'group-1',
+                  datetime(2026, 7, 10, 14), datetime(2026, 7, 12, 12)])
+    sheet.append(['Иван Петров', 15, 2, 'group-1',
+                  datetime(2026, 7, 12, 14), datetime(2026, 7, 14, 12)])
+    room_file.save(rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': 'ФИО', 'room': '№ комнаты', 'corpus': 'Корпус',
+         'bron': '№ брони', 'checkin': 'Заезд', 'checkout': 'Выезд'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    report = openpyxl.load_workbook(output_path, data_only=True)['1&2']
+    assert (report['S2'].value, report['T2'].value) == (72, 1)
+    assert (report['S3'].value, report['T3'].value) == (15, 2)
 
 
 def test_manual_rooms_fill_blank_direct_room_from_exported_data(tmp_path):
@@ -996,9 +1092,11 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     assert all(c in headers for c in TL_EXTRA)
     dr = read_table(rp)
     assert list(dr.columns) == ['ФИО', '№ комнаты', 'Корпус',
-                                'Здание TravelLine', '№ брони']
+                                'Здание TravelLine', '№ брони', 'Заезд', 'Выезд']
     assert len(dr) == 1
     assert dr.iloc[0]['ФИО'] == 'Иван Петров'
+    assert dr.iloc[0]['Заезд'].date().isoformat() == '2026-07-10'
+    assert dr.iloc[0]['Выезд'].date().isoformat() == '2026-07-12'
     assert dr['№ комнаты'].isna().all() and dr['Корпус'].isna().all()
     assert mapping_valid(TL_ROOMS_MAP, list(dr.columns), TCH_ROOMS_SCHEMA)
 
@@ -1299,6 +1397,42 @@ def test_fetch_details_reuses_cached_period_details_and_checkpoints_batches(monk
     assert [[booking['number'] for booking in batch] for batch in batches] == [['n2']]
 
 
+def test_fetch_details_falls_back_to_paginated_property_rooms(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    requested_tokens = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/obtain-accommodation-inventory'):
+            return 200, {'accommodationInventory': {'buildings': []}}
+        if path.endswith('/rooms'):
+            requested_tokens.append(params.get('pageToken'))
+            if params.get('pageToken') is None:
+                return 200, {
+                    'rooms': [{'id': 'room-72', 'displayName': '72',
+                               'floorId': 'floor-1'}],
+                    'hasNextPage': True, 'nextPageToken': 'rooms-page-2',
+                }
+            return 200, {
+                'rooms': [{'id': 'room-73', 'displayName': '73',
+                           'floorId': 'floor-1'}],
+                'hasNextPage': False,
+            }
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [], 'hasMoreData': False}
+        raise AssertionError(f'unexpected API request: {path}')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    details, inventory = tl_client.fetch_details(
+        'id', 'secret', '8186', include_room_inventory=True)
+
+    assert details == []
+    assert requested_tokens == [None, 'rooms-page-2']
+    assert [item['room'] for item in
+            tl_client.accommodation_room_map(inventory).values()] == [72, 73]
+
+
 def test_fetch_details_flushes_downloaded_batch_before_failure(monkeypatch):
     import tl_client
     monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
@@ -1362,6 +1496,8 @@ def test_fetch_details_can_also_request_pms_room_inventory(monkeypatch):
             return 200, {'bookingSummaries': [], 'hasMoreData': False}
         if path.endswith('/obtain-accommodation-inventory'):
             return 200, inventory
+        if path.endswith('/rooms'):
+            return 200, {'rooms': [], 'hasNextPage': False}
         raise AssertionError(f'unexpected API request: {path}')
 
     monkeypatch.setattr(tl_client, '_http', fake)
@@ -1372,7 +1508,8 @@ def test_fetch_details_can_also_request_pms_room_inventory(monkeypatch):
     assert result == ([], inventory)
     assert seen[0] == (
         '/api/pms/v2/properties/8186/obtain-accommodation-inventory')
-    assert seen[1].endswith('/bookings')
+    assert seen[1].endswith('/rooms')
+    assert seen[2].endswith('/bookings')
     assert ('inventory', 0, 1) in progress
     assert ('inventory', 1, 1) in progress
 

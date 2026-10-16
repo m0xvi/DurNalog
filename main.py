@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.38"
+APP_VERSION = "3.39"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -840,8 +840,10 @@ class RealApp(TurNalogApp):
                             cached_details=staged_details,
                             period_start=qs, period_end_exclusive=qe)
                     except TLApiError as inventory_error:
+                        inventory_error_text = str(inventory_error).casefold()
                         if (not include_inventory
-                                or 'номерной фонд' not in str(inventory_error).casefold()):
+                                or 'номерной фонд' not in inventory_error_text
+                                or 'http 429' in inventory_error_text):
                             raise
                         # Номерной фонд необязателен для выгрузки броней.
                         inventory_warning = str(inventory_error)
@@ -988,10 +990,13 @@ class RealApp(TurNalogApp):
                                     f' Уже сохранены детали {failed_stats["period_staged_count"]} '
                                     'броней; повторный запуск их пропустит.')
                         elif '403' in error_text or 'доступ запрещён' in error_text:
-                            required = (
-                                'PMS API/PropertyReservation'
-                                if 'propertyreservation' in error_text or 'pms api' in error_text
-                                else 'Read Reservation API')
+                            if 'propertyroom' in error_text or 'номерной фонд' in error_text:
+                                required = 'PMS API/PropertyRoom'
+                            elif ('propertyreservation' in error_text
+                                  or 'pms api' in error_text):
+                                required = 'PMS API/PropertyReservation'
+                            else:
+                                required = 'Read Reservation API'
                             extra = (
                                 f'\n\nПроверьте разрешение {required} '
                                 'в подключении TravelLine.')
@@ -1061,6 +1066,11 @@ class RealApp(TurNalogApp):
                     f'в фонде: {room_stats.get("room_id_not_in_inventory", "—")}; '
                     f'у комнат без номера: '
                     f'{room_stats.get("inventory_no_display", "—")}.' )
+                lines.append(
+                    f'Сопоставлено по ID: '
+                    f'{room_stats.get("assigned_by_room_id", 0)}; '
+                    f'по подписи комнаты: '
+                    f'{room_stats.get("assigned_by_display_name", 0)}.')
                 if room_stats['inventory_rooms'] == 0:
                     lines.append(
                         '⚠ TravelLine не вернул комнаты из PMS API. Проверьте '

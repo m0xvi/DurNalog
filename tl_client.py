@@ -5,10 +5,11 @@
 отбирает ночи выбранного периода внутри квартала, раскладывает проживание/
 допуслуги/каналы и пишет Excel той же формы,
 что ожидает обработка (канонический маппинг — диалог колонок не нужен).
-Read Reservation возвращает roomStays[].roomId; для Чайковского он
-сопоставляется с комнатами/корпусами из PMS API PropertyRoom. Если
-проживание не назначено или его roomId отсутствует в номерном фонде, номер
-и корпус остаются пустыми — идентификаторы API не подменяются номером комнаты.
+Read Reservation возвращает идентификаторы комнат в roomStays[].roomId/room;
+для Чайковского они сопоставляются с PMS-номерами и корпусами. Используется
+вложенный инвентарь и, если там нет комнат, постраничный PropertyRoom /rooms.
+Неоднозначные или неназначенные комнаты остаются пустыми; ID API не подменяется
+номером комнаты.
 """
 import hashlib
 import json
@@ -76,7 +77,8 @@ TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL,
             COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
             COL_TL_TAX_BASE, COL_TL_PERIOD_PRICE, COL_TL_PERIOD_STATUS]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
-                'building_name': COL_BUILDING_NAME, 'bron': COL_BRON}
+                'building_name': COL_BUILDING_NAME, 'bron': COL_BRON,
+                'checkin': COL_IN, 'checkout': COL_OUT}
 
 
 class TLApiError(Exception):
@@ -467,9 +469,75 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             raise TLCancelled()
         if progress:
             progress('inventory', 0, 1)
-        _, inventory = api_get(
-            f'/api/pms/v2/properties/{property_id}/obtain-accommodation-inventory',
-            stage='Номерной фонд (комнаты и корпуса)')
+        inventory_error = None
+        try:
+            _, inventory = api_get(
+                f'/api/pms/v2/properties/{property_id}'
+                '/obtain-accommodation-inventory',
+                stage='Номерной фонд (комнаты и корпуса)')
+            if not isinstance(inventory, dict):
+                inventory = {}
+        except TLCancelled:
+            raise
+        except TLApiError as exc:
+            inventory_error = exc
+            inventory = {}
+
+        # The documented PropertyRoom /rooms endpoint returns a flat, paginated
+        # list. Use it when the legacy accommodation-inventory response has no
+        # mappable room IDs (or is unavailable), and preserve building data if
+        # the first endpoint did return it.
+        if not accommodation_room_map(inventory):
+            property_rooms = []
+            page_token = None
+            seen_page_tokens = set()
+            page = 0
+            try:
+                while True:
+                    if cancelled():
+                        raise TLCancelled()
+                    page += 1
+                    params = {'maxPageSize': 100}
+                    if page_token:
+                        if page_token in seen_page_tokens:
+                            raise TLApiError(
+                                'TravelLine повторил pageToken номерного фонда.')
+                        seen_page_tokens.add(page_token)
+                        params['pageToken'] = page_token
+                    _, data = api_get(
+                        f'/api/pms/v2/properties/{property_id}/rooms', params,
+                        f'Номерной фонд PropertyRoom (страница {page})')
+                    if not isinstance(data, dict):
+                        raise TLApiError(
+                            'TravelLine вернул некорректный список комнат.')
+                    page_rooms = data.get('rooms') or []
+                    if not isinstance(page_rooms, list):
+                        raise TLApiError(
+                            'TravelLine вернул некорректный список комнат.')
+                    property_rooms.extend(
+                        room for room in page_rooms if isinstance(room, dict))
+                    if not data.get('hasNextPage'):
+                        break
+                    page_token = data.get('nextPageToken')
+                    if not page_token:
+                        raise TLApiError(
+                            'TravelLine сообщил о следующей странице комнат, '
+                            'но не вернул nextPageToken.')
+                    time.sleep(0.4)
+            except TLCancelled:
+                raise
+            except TLApiError as rooms_error:
+                if inventory_error is not None:
+                    raise TLApiError(
+                        f'{inventory_error}; список комнат PropertyRoom: '
+                        f'{rooms_error}') from rooms_error
+                raise
+            if property_rooms:
+                inventory = dict(inventory)
+                inventory['propertyRooms'] = property_rooms
+            elif inventory_error is not None:
+                raise inventory_error
+
         if not isinstance(inventory, dict):
             inventory = {}
         if cancelled():
@@ -1049,26 +1117,108 @@ def _room_id_key(value):
                                  and not nested_id.strip()):
             nested_id = value.get('roomId')
         value = nested_id
-    return '' if value is None else str(value).strip()
+    return '' if value is None else str(value).strip().casefold()
 
 
-def accommodation_room_map(response):
-    """TravelLine ``roomId`` -> (номер, корпус, исходное имя здания).
+def _room_label_key(value):
+    if value is None:
+        return ''
+    text = re.sub(r'\s+', ' ', str(value).strip()).casefold()
+    return '' if text in ('', 'none', 'null', 'nan') else text
 
-    PropertyRoom возвращает вложенную структуру buildings -> floors -> rooms;
-    идентификатор комнаты сопоставляется с её displayName, а не используется
-    как номер. Неизвестные/пустые поля остаются пустыми.
+
+def _room_reference_candidates(value):
+    """Return exact API IDs and display labels carried by a room reference."""
+    ids, labels = [], []
+    if isinstance(value, dict):
+        for field in ('id', 'roomId'):
+            key = _room_id_key(value.get(field))
+            if key and key not in ids:
+                ids.append(key)
+        for field in ('displayName', 'roomNumber', 'number', 'name'):
+            key = _room_label_key(value.get(field))
+            if key and key not in labels:
+                labels.append(key)
+    else:
+        key = _room_id_key(value)
+        if key:
+            ids.append(key)
+            label = _room_label_key(value)
+            if label:
+                labels.append(label)
+    return ids, labels
+
+
+def _match_room_assignment(room_map, room_labels, raw_room_id, raw_room):
+    id_candidates, label_candidates = [], []
+    for source, value in (('roomId', raw_room_id), ('room', raw_room)):
+        ids, labels = _room_reference_candidates(value)
+        id_candidates.extend((key, source) for key in ids
+                             if all(key != existing for existing, _ in id_candidates))
+        label_candidates.extend((key, source) for key in labels
+                                 if all(key != existing
+                                        for existing, _ in label_candidates))
+    for key, source in id_candidates:
+        if key in room_map:
+            return room_map[key], source, key, 'id'
+    for key, source in label_candidates:
+        if key in room_labels:
+            return room_labels[key], f'{source}:displayName', key, 'label'
+    if id_candidates:
+        return None, id_candidates[0][1], id_candidates[0][0], 'id-unmatched'
+    if label_candidates:
+        return None, label_candidates[0][1], label_candidates[0][0], 'label-unmatched'
+    return None, '', '', ''
+
+
+def _accommodation_room_maps(response):
+    """Return (ID map, unique display-name map) for supported PMS payloads.
+
+    ``obtain-accommodation-inventory`` nests rooms under buildings/floors,
+    whereas PropertyRoom ``/rooms`` returns a paginated top-level ``rooms``
+    array. Both use room ``id``/``displayName``; the second form may be joined
+    to a building through ``floorId`` when the building inventory is present.
     """
     if not isinstance(response, dict):
-        return {}
+        return {}, {}
     inventory = response.get('accommodationInventory')
     if not isinstance(inventory, dict):
         inventory = response
     buildings = inventory.get('buildings')
     if not isinstance(buildings, list):
-        return {}
+        buildings = []
 
     room_map = {}
+    labels_by_key = {}
+    ambiguous_labels = set()
+    floor_buildings = {}
+
+    def add_room(room, corpus=None, building_name=''):
+        if not isinstance(room, dict):
+            return
+        room_id = _room_id_key(room.get('id'))
+        if not room_id:
+            room_id = _room_id_key(room.get('roomId'))
+        if not room_id:
+            return
+        display_name = next((room.get(field) for field in
+                             ('displayName', 'roomNumber', 'number', 'name')
+                             if room.get(field) is not None
+                             and str(room.get(field)).strip()), None)
+        assignment = {
+            'room': _room_number(display_name),
+            'corpus': corpus,
+            'building_name': building_name,
+        }
+        room_map.setdefault(room_id, assignment)
+        label_key = _room_label_key(display_name)
+        if label_key:
+            previous = labels_by_key.get(label_key)
+            if previous is None:
+                labels_by_key[label_key] = assignment
+            elif previous != assignment:
+                ambiguous_labels.add(label_key)
+
     for building_index, building in enumerate(buildings, 1):
         if not isinstance(building, dict):
             continue
@@ -1076,26 +1226,45 @@ def accommodation_room_map(response):
         building_name = str(building.get('name') or '').strip()
         rooms = list(building.get('rooms') or [])
         for floor in building.get('floors') or []:
-            if isinstance(floor, dict):
-                rooms.extend(floor.get('rooms') or [])
+            if not isinstance(floor, dict):
+                continue
+            floor_id = _room_id_key(floor.get('id'))
+            if floor_id:
+                floor_buildings[floor_id] = (corpus, building_name)
+            rooms.extend(floor.get('rooms') or [])
         for room in rooms:
+            add_room(room, corpus, building_name)
+
+    flat_rooms = response.get('propertyRooms')
+    if not isinstance(flat_rooms, list):
+        flat_rooms = inventory.get('rooms')
+    if not isinstance(flat_rooms, list):
+        flat_rooms = response.get('rooms')
+    if isinstance(flat_rooms, list):
+        buildings_by_id = {
+            _room_id_key(building.get('id')): (
+                _building_number(building, index),
+                str(building.get('name') or '').strip())
+            for index, building in enumerate(buildings, 1)
+            if isinstance(building, dict) and _room_id_key(building.get('id'))
+        }
+        for room in flat_rooms:
             if not isinstance(room, dict):
                 continue
-            room_id = _room_id_key(room.get('id'))
-            if not room_id:
-                room_id = _room_id_key(room.get('roomId'))
-            if not room_id:
-                continue
-            display_name = next((room.get(field) for field in
-                                 ('displayName', 'roomNumber', 'number', 'name')
-                                 if room.get(field) is not None
-                                 and str(room.get(field)).strip()), None)
-            room_map.setdefault(room_id, {
-                'room': _room_number(display_name),
-                'corpus': corpus,
-                'building_name': building_name,
-            })
-    return room_map
+            parent = buildings_by_id.get(_room_id_key(room.get('buildingId')))
+            if parent is None:
+                parent = floor_buildings.get(_room_id_key(room.get('floorId')))
+            corpus, building_name = parent if parent is not None else (None, '')
+            add_room(room, corpus, building_name)
+
+    for key in ambiguous_labels:
+        labels_by_key.pop(key, None)
+    return room_map, labels_by_key
+
+
+def accommodation_room_map(response):
+    """TravelLine room ID -> physical room number/building (when available)."""
+    return _accommodation_room_maps(response)[0]
 
 
 def _service_amount_text(amount):
@@ -1173,7 +1342,7 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
     аудита. Периодная сумма и налоговая база хранятся отдельно.
     """
     period_start, period_end = _parse_day(qs), _parse_day(qe)
-    room_map = accommodation_room_map(accommodation_inventory)
+    room_map, room_labels = _accommodation_room_maps(accommodation_inventory)
     has_room_inventory = accommodation_inventory is not None
     rows, votes = [], {'A': 0, 'B': 0, '?': 0}
     rep = {
@@ -1207,6 +1376,7 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
             'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0,
             'room_id_present': 0, 'room_id_missing': 0,
             'room_id_not_in_inventory': 0, 'inventory_no_display': 0,
+            'assigned_by_room_id': 0, 'assigned_by_display_name': 0,
             'unknown_room_id_samples': [],
         }
 
@@ -1427,10 +1597,9 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
                                if _guest_name(guest))
             room_type = rs.get('roomType') or {}
             rate_plans = rs.get('ratePlans') or []
-            room_key = _room_id_key(rs.get('roomId'))
-            if not room_key:
-                room_key = _room_id_key(rs.get('room'))
-            assignment = room_map.get(room_key) if room_key else None
+            assignment, _, room_key, room_match_kind = (
+                _match_room_assignment(
+                    room_map, room_labels, rs.get('roomId'), rs.get('room')))
             room_number = assignment.get('room') if assignment else None
             corpus = assignment.get('corpus') if assignment else None
             building_name = (assignment.get('building_name', '')
@@ -1446,6 +1615,10 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
                         samples.append(room_key)
                 elif assignment is not None and room_number is None:
                     room_stats['inventory_no_display'] += 1
+                elif assignment is not None and room_match_kind == 'id':
+                    room_stats['assigned_by_room_id'] += 1
+                elif assignment is not None:
+                    room_stats['assigned_by_display_name'] += 1
                 bucket = 'assigned' if room_number is not None else 'unassigned'
                 room_stats[bucket] += 1
 
@@ -1536,7 +1709,8 @@ def write_rooms_workbook(rows, path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = 'Номера'
-    ws.append(['ФИО', COL_ROOM, COL_CORPUS, COL_BUILDING_NAME, COL_BRON])
+    ws.append(['ФИО', COL_ROOM, COL_CORPUS, COL_BUILDING_NAME, COL_BRON,
+               COL_IN, COL_OUT])
     for row in rows or []:
         guests = [name.strip() for name in
                   re.split(r'[,;\n]+', str(row.get(COL_GUEST) or ''))
@@ -1545,7 +1719,12 @@ def write_rooms_workbook(rows, path):
             guests = ['']
         for guest in guests:
             ws.append([guest, row.get(COL_ROOM), row.get(COL_CORPUS),
-                       row.get(COL_BUILDING_NAME) or '', row.get(COL_BRON)])
+                       row.get(COL_BUILDING_NAME) or '', row.get(COL_BRON),
+                       row.get(COL_IN), row.get(COL_OUT)])
+    for column in ('F', 'G'):
+        for cell in ws[column][1:]:
+            if isinstance(cell.value, datetime):
+                cell.number_format = 'DD.MM.YYYY HH:MM'
     wb.save(path)
 
 
@@ -1720,7 +1899,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
 
     rooms_sheet = wb.create_sheet('Номера')
     rooms_sheet.append(['ФИО', COL_ROOM, COL_CORPUS,
-                        COL_BUILDING_NAME, COL_BRON])
+                        COL_BUILDING_NAME, COL_BRON, COL_IN, COL_OUT])
     for row in rows or []:
         guests = [name.strip() for name in
                   re.split(r'[,;\n]+', str(row.get(COL_GUEST) or ''))
@@ -1730,7 +1909,8 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         for guest in guests:
             rooms_sheet.append([guest, row.get(COL_ROOM), row.get(COL_CORPUS),
                                 row.get(COL_BUILDING_NAME) or '',
-                                row.get(COL_BRON)])
+                                row.get(COL_BRON), row.get(COL_IN),
+                                row.get(COL_OUT)])
 
     inventory_sheet = wb.create_sheet('Номерной фонд API')
     inventory_headers = [
@@ -1739,18 +1919,27 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         'Поля комнаты (JSON)',
     ]
     inventory_sheet.append(inventory_headers)
-    inventory = accommodation_inventory
+    raw_inventory = accommodation_inventory
+    inventory = raw_inventory
     if isinstance(inventory, dict) and isinstance(
             inventory.get('accommodationInventory'), dict):
         inventory = inventory['accommodationInventory']
     buildings = inventory.get('buildings') if isinstance(inventory, dict) else None
+    floor_buildings = {}
+    building_records = {}
     if isinstance(buildings, list):
         for building_index, building in enumerate(buildings, 1):
             if not isinstance(building, dict):
                 continue
+            building_id = _room_id_key(building.get('id'))
+            if building_id:
+                building_records[building_id] = (building_index, building)
             room_entries = [(None, room) for room in (building.get('rooms') or [])]
             for floor in building.get('floors') or []:
                 if isinstance(floor, dict):
+                    floor_id = _room_id_key(floor.get('id'))
+                    if floor_id:
+                        floor_buildings[floor_id] = (building_index, building, floor)
                     room_entries.extend((floor, room)
                                         for room in (floor.get('rooms') or []))
             for floor, room in room_entries:
@@ -1770,6 +1959,39 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                     _inspection_cell(room.get('name')),
                     _inspection_json(_inspection_redact(room)),
                 ])
+    flat_rooms = (raw_inventory.get('propertyRooms')
+                  if isinstance(raw_inventory, dict) else None)
+    if not isinstance(flat_rooms, list) and isinstance(inventory, dict):
+        flat_rooms = inventory.get('rooms')
+    if not isinstance(flat_rooms, list) and isinstance(raw_inventory, dict):
+        flat_rooms = raw_inventory.get('rooms')
+    for room in flat_rooms or []:
+        if not isinstance(room, dict):
+            continue
+        parent = building_records.get(_room_id_key(room.get('buildingId')))
+        floor = None
+        if parent is None:
+            parent = floor_buildings.get(_room_id_key(room.get('floorId')))
+            if parent is not None:
+                building_index, building, floor = parent
+            else:
+                building_index, building = None, {}
+        else:
+            building_index, building = parent
+        inventory_sheet.append([
+            building_index if building_index is not None else '',
+            _inspection_cell(building.get('id')),
+            building.get('name') or '',
+            _inspection_cell(room.get('floorId')),
+            _inspection_cell(floor.get('name')) if floor else '',
+            _inspection_cell(room.get('id')),
+            _inspection_cell(room.get('roomId')),
+            _inspection_cell(room.get('displayName')),
+            _inspection_cell(room.get('roomNumber')),
+            _inspection_cell(room.get('number')),
+            _inspection_cell(room.get('name')),
+            _inspection_json(_inspection_redact(room)),
+        ])
     if inventory_sheet.max_row == 1:
         inventory_sheet.append(['Нет сырого номерного фонда в этой выгрузке.'])
 
@@ -1781,7 +2003,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         'Результат сопоставления', 'Номер из инвентаря', 'Корпус',
         'Скидки API: название/тип/процент/сумма',
     ])
-    room_map = accommodation_room_map(accommodation_inventory)
+    room_map, room_labels = _accommodation_room_maps(accommodation_inventory)
     if details is not None:
         for booking in details or []:
             if not isinstance(booking, dict):
@@ -1795,20 +2017,21 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                     continue
                 raw_room_id = stay.get('roomId')
                 raw_room = stay.get('room')
-                room_key = _room_id_key(raw_room_id)
-                room_id_source = 'roomId'
-                if not room_key:
-                    room_key = _room_id_key(raw_room)
-                    room_id_source = 'room' if room_key else ''
-                assignment = room_map.get(room_key) if room_key else None
+                assignment, room_id_source, room_key, room_match_kind = (
+                    _match_room_assignment(
+                        room_map, room_labels, raw_room_id, raw_room))
                 if not room_key:
                     match_status = 'roomId/room отсутствует'
+                elif assignment is None and room_match_kind == 'label-unmatched':
+                    match_status = 'Подпись комнаты не найдена в инвентаре'
                 elif assignment is None:
                     match_status = 'ID не найден в инвентаре'
                 elif assignment.get('room') is None:
                     match_status = 'ID найден, display name отсутствует'
+                elif room_match_kind == 'label':
+                    match_status = 'Сопоставлено по подписи комнаты'
                 else:
-                    match_status = 'Сопоставлено'
+                    match_status = 'Сопоставлено по ID'
                 room_type = stay.get('roomType') or {}
                 if isinstance(room_type, dict):
                     room_type = room_type.get('name') or room_type.get('displayName') \
@@ -1840,7 +2063,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
     default_widths = {
         'Данные': [26, 16, 20, 20, 26, 28, 26, 10, 28, 14, 48, 20,
                    16, 16, 12, 28, 18, 24, 38, 16, 34, 42, 16, 16, 58, 20],
-        'Номера': [32, 16, 12, 28, 28],
+        'Номера': [32, 16, 12, 28, 28, 22, 22],
         'Номерной фонд API': [12, 18, 28, 18, 24, 28, 28, 22, 22, 18, 26, 72],
         'Проживания API': [28, 12, 28, 32, 32, 24, 32, 24, 24, 54, 72, 18, 36, 20, 14, 60],
     }
