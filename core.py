@@ -470,6 +470,25 @@ def complete_mapping(mapping, headers, schema):
     return result
 
 
+def mapping_with_guessed_defaults(mapping, headers, schema):
+    """Использует распознаваемые колонки как значения по умолчанию.
+
+    Выбор пользователя, существующий в текущем файле, сохраняется. Пустые
+    или устаревшие поля дополняются по заголовкам — особенно важно для
+    необязательных ключей брони и дат в
+    TravelLine ArrivalsReport, без которых нельзя надёжно различить комнаты.
+    """
+    result = complete_mapping(mapping, headers, schema)
+    guessed = guess_mapping(headers, schema)
+    header_set = set(headers)
+    for field in schema:
+        key = field['key']
+        if (result.get(key) not in header_set
+                and guessed.get(key) in header_set):
+            result[key] = guessed[key]
+    return result
+
+
 def open_in_system(path):
     try:
         if os.name == 'nt':
@@ -600,47 +619,109 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             return None
         return None if pd.isna(parsed) else parsed.date()
 
+    def guest_name_parts(value):
+        if blank(value):
+            return []
+        cleaned = clean_guest_names(value)
+        return [part.strip() for part in re.split(r'[,;\n]+', cleaned)
+                if part.strip()]
+
+    def guest_name_tokens(value):
+        text = str(value or '').casefold().replace('ё', 'е')
+        return frozenset(re.findall(r'[^\W_]+', text, flags=re.UNICODE))
+
+    def similar_guest_name(left, right):
+        left_tokens = guest_name_tokens(left)
+        right_tokens = guest_name_tokens(right)
+        shared = left_tokens & right_tokens
+        # Exact token-set inclusion tolerates omitted patronymics/extra names,
+        # but at least two non-initial tokens must agree.
+        return (len(shared) >= 2
+                and all(len(token) >= 2 for token in shared)
+                and (left_tokens.issubset(right_tokens)
+                     or right_tokens.issubset(left_tokens)))
+
+    def unique_room_info(candidates):
+        if not candidates:
+            return None
+        first = candidates[0]
+        return first if first is not None and all(
+            candidate == first for candidate in candidates[1:]) else None
+
+    def match_scoped_guest(candidates, guest_string):
+        """Match an exact or safely abbreviated guest within one booking scope."""
+        guests = guest_name_parts(guest_string)
+        if not guests:
+            return None
+        target_keys = {norm_name(guest) for guest in guests}
+        exact = [info for name, info in candidates
+                 if norm_name(name) in target_keys]
+        matched = unique_room_info(exact)
+        if matched is not None:
+            return matched
+        approximate = [info for name, info in candidates
+                       if any(similar_guest_name(guest, name)
+                              for guest in guests)]
+        return unique_room_info(approximate)
+
     guest_candidates = {}
     booking_candidates = {}
+    booking_guest_candidates = {}
+    booking_date_guest_candidates = {}
     booking_col = map_rooms.get('bron')
     room_checkin_col = map_rooms.get('checkin')
     room_checkout_col = map_rooms.get('checkout')
     for _, rr in df_rooms.iterrows():
         fio_col = map_rooms.get('fio')
         fio = rr[fio_col] if fio_col and fio_col in df_rooms.columns else None
-        guest_key = '' if blank(fio) else norm_name(fio)
+        guests = guest_name_parts(fio)
         room = clean_room(rr[map_rooms['room']])
         corpus_col = map_rooms.get('corpus')
         corpus = (rr[corpus_col] if corpus_col and corpus_col in df_rooms.columns
                   else None)
         corpus = None if blank(corpus) else corpus
         info = (room, corpus) if room is not None else None
-        if guest_key and info is not None:
-            guest_candidates.setdefault(guest_key, []).append(info)
 
         bron = (rr[booking_col]
                 if booking_col and booking_col in df_rooms.columns else None)
         bron_key = booking_key(bron)
+        room_checkin = (stay_date_key(rr[room_checkin_col])
+                        if room_checkin_col and room_checkin_col in df_rooms.columns
+                        else None)
+        room_checkout = (stay_date_key(rr[room_checkout_col])
+                         if room_checkout_col and room_checkout_col in df_rooms.columns
+                         else None)
+        date_key = ((bron_key, room_checkin, room_checkout)
+                    if bron_key and room_checkin is not None
+                    and room_checkout is not None else None)
+
+        if info is not None:
+            for guest in guests:
+                guest_key = norm_name(guest)
+                if guest_key:
+                    guest_candidates.setdefault(guest_key, []).append(info)
+                    if bron_key:
+                        booking_guest_candidates.setdefault(
+                            bron_key, []).append((guest, info))
+                    if date_key:
+                        booking_date_guest_candidates.setdefault(
+                            date_key, []).append((guest, info))
+
         if bron_key:
             room_file_has_booking_ids = True
             booking_candidates.setdefault(bron_key, []).append(info)
-            room_checkin = (stay_date_key(rr[room_checkin_col])
-                            if room_checkin_col in df_rooms.columns else None)
-            room_checkout = (stay_date_key(rr[room_checkout_col])
-                             if room_checkout_col in df_rooms.columns else None)
-            if room_checkin is not None and room_checkout is not None:
-                date_key = (bron_key, room_checkin, room_checkout)
+            if date_key:
                 booking_date_candidates.setdefault(date_key, []).append(info)
 
     # Only use a guest/booking key when it resolves to one unambiguous room.
     for key, candidates in guest_candidates.items():
-        first = candidates[0]
-        if all(candidate == first for candidate in candidates[1:]):
-            room_mapping[key] = first
+        mapped = unique_room_info(candidates)
+        if mapped is not None:
+            room_mapping[key] = mapped
     for key, candidates in booking_candidates.items():
-        if candidates and candidates[0] is not None and all(
-                candidate == candidates[0] for candidate in candidates[1:]):
-            room_mapping_by_bron[key] = candidates[0]
+        mapped = unique_room_info(candidates)
+        if mapped is not None:
+            room_mapping_by_bron[key] = mapped
 
     def find_room_info(guest_string, booking_value=None,
                        checkin_value=None, checkout_value=None):
@@ -648,31 +729,38 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
         if bron_key:
             if bron_key in room_mapping_by_bron:
                 return room_mapping_by_bron[bron_key]
-            # For a multi-room booking, an exact booking + stay-date match can
-            # distinguish room changes without guessing from the room type.
+            # For a multi-room booking, exact booking + stay dates can identify
+            # the room. If several same-date rooms remain, the guest may
+            # distinguish them within that same booking and stay.
             checkin_key = stay_date_key(checkin_value)
             checkout_key = stay_date_key(checkout_value)
-            if checkin_key is not None and checkout_key is not None:
-                date_candidates = booking_date_candidates.get(
-                    (bron_key, checkin_key, checkout_key), [])
-                if date_candidates:
-                    first = date_candidates[0]
-                    if first is not None and all(
-                            candidate == first
-                            for candidate in date_candidates[1:]):
-                        return first
-            # The room file carries booking IDs, so an absent/blank match is
-            # authoritative; don't borrow another booking's room by guest name.
+            date_key = ((bron_key, checkin_key, checkout_key)
+                        if checkin_key is not None and checkout_key is not None
+                        else None)
+            date_candidates = (booking_date_candidates.get(date_key, [])
+                               if date_key else [])
+            mapped = unique_room_info(date_candidates)
+            if mapped is not None:
+                return mapped
+            if date_candidates:
+                mapped = match_scoped_guest(
+                    booking_date_guest_candidates.get(date_key, []),
+                    guest_string)
+                if mapped is not None:
+                    return mapped
+            # Booking IDs are authoritative: never borrow a room from a
+            # different booking merely because the guest name is similar.
             if room_file_has_booking_ids:
                 candidates = booking_candidates.get(bron_key)
                 if not candidates or any(candidate is None
                                          for candidate in candidates):
                     return None, None
-                # A multi-room booking may have several different rooms; then
-                # fall through to the guest key, which must also be unique.
+                mapped = match_scoped_guest(
+                    booking_guest_candidates.get(bron_key, []), guest_string)
+                return mapped if mapped is not None else (None, None)
         if not guest_string:
             return None, None
-        for guest in re.split(r'[,\n;]+', guest_string):
+        for guest in guest_name_parts(guest_string):
             key = norm_name(guest)
             if key in room_mapping:
                 return room_mapping[key]

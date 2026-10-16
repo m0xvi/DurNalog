@@ -5,7 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import complete_mapping, guess_mapping, mapping_valid, read_table
+from core import (complete_mapping, guess_mapping, mapping_valid,
+                  mapping_with_guessed_defaults, read_table)
 from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
@@ -909,6 +910,106 @@ def test_arrivals_report_columns_auto_map_booking_and_stay_dates():
     assert mapping['room'] == '№ комнаты'
     assert mapping['checkin'] == 'Заезд'
     assert mapping['checkout'] == 'Выезд'
+
+
+def test_old_arrivals_mapping_autofills_recognized_matching_columns():
+    headers = ['№ брони', 'ФИО гостей', 'Заезд', 'Выезд', '№ комнаты']
+    old_mapping = {
+        'fio': None, 'room': '№ комнаты', 'corpus': None,
+        'bron': None, 'checkin': None, 'checkout': None,
+    }
+    mapping = mapping_with_guessed_defaults(
+        old_mapping, headers, TCH_ROOMS_SCHEMA)
+    assert mapping == {
+        'fio': 'ФИО гостей', 'room': '№ комнаты', 'corpus': None,
+        'bron': '№ брони', 'checkin': 'Заезд', 'checkout': 'Выезд',
+    }
+    assert mapping_valid(mapping, headers, TCH_ROOMS_SCHEMA)
+
+
+def test_arrivals_report_disambiguates_same_date_group_rooms_by_guest_tokens(tmp_path):
+    import openpyxl
+    import core
+    from datetime import datetime
+
+    first = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                  guests=(('Иван', 'Иванов'),))
+    first.update({'roomId': None, 'pmsRoomStayId': 'same-date-1'})
+    second = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                   guests=(('Мария', 'Сидорова'),))
+    second.update({'roomId': None, 'pmsRoomStayId': 'same-date-2'})
+    rows, _ = bookings_to_rows(
+        [_book(number='group-same-date', stays=[first, second], total=20000)],
+        QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'ArrivalsReport.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    arrivals = openpyxl.Workbook()
+    sheet = arrivals.active
+    sheet.append(['№ брони', 'ФИО гостей', 'Заезд', 'Выезд', '№ комнаты'])
+    sheet.append(['group-same-date', 'Иванов Иван Иванович',
+                  datetime(2026, 7, 10, 14), datetime(2026, 7, 12, 12), 72])
+    sheet.append(['group-same-date', 'Сидорова Мария Петровна',
+                  datetime(2026, 7, 10, 14), datetime(2026, 7, 12, 12), 15])
+    arrivals.save(rooms_path)
+
+    headers = ['№ брони', 'ФИО гостей', 'Заезд', 'Выезд', '№ комнаты']
+    room_mapping = mapping_with_guessed_defaults(
+        {'fio': None, 'room': '№ комнаты', 'corpus': None,
+         'bron': None, 'checkin': None, 'checkout': None},
+        headers, TCH_ROOMS_SCHEMA)
+    summary, _ = core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP, room_mapping,
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+
+    report = openpyxl.load_workbook(output_path, data_only=True)['1&2']
+    rooms_by_guest = {
+        report.cell(row, 3).value: report.cell(row, 19).value
+        for row in range(2, report.max_row)
+    }
+    assert rooms_by_guest == {'Иван Иванов': 72, 'Мария Сидорова': 15}
+    assert summary['Отсутствует № комнаты (КРАСНЫЙ)'] == 0
+
+
+def test_arrivals_report_keeps_room_blank_when_guest_matches_two_rooms(tmp_path):
+    import openpyxl
+    import core
+    from datetime import datetime
+
+    first = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                  guests=(('Иван', 'Петров'),))
+    first.update({'roomId': None, 'pmsRoomStayId': 'ambiguous-1'})
+    second = _stay(arr='2026-07-10T14:00', dep='2026-07-12T12:00',
+                   guests=(('Иван', 'Петров'),))
+    second.update({'roomId': None, 'pmsRoomStayId': 'ambiguous-2'})
+    rows, _ = bookings_to_rows(
+        [_book(number='group-ambiguous-name', stays=[first, second],
+               total=20000)], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'ArrivalsReport.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+
+    arrivals = openpyxl.Workbook()
+    sheet = arrivals.active
+    sheet.append(['№ брони', 'ФИО гостей', 'Заезд', 'Выезд', '№ комнаты'])
+    for room in (31, 82):
+        sheet.append(['group-ambiguous-name', 'Иванов Иван Иванович',
+                      datetime(2026, 7, 10, 14),
+                      datetime(2026, 7, 12, 12), room])
+    arrivals.save(rooms_path)
+
+    room_mapping = mapping_with_guessed_defaults(
+        None, ['№ брони', 'ФИО гостей', 'Заезд', 'Выезд', '№ комнаты'],
+        TCH_ROOMS_SCHEMA)
+    summary, _ = core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP, room_mapping,
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    report = openpyxl.load_workbook(output_path, data_only=True)['1&2']
+    assert [report.cell(row, 19).value for row in range(2, report.max_row)] == [None, None]
+    assert summary['Отсутствует № комнаты (КРАСНЫЙ)'] == 2
 
 
 def test_legacy_room_mapping_gains_date_columns_without_overriding_choices():

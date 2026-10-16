@@ -38,8 +38,9 @@ from schemas import SCHEMAS, needs_mapping
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        is_tl_export, tl_inspection_path,
                        write_api_inspection_workbook)
-from core import (read_table, read_headers, guess_mapping, mapping_valid,
-                  complete_mapping, pack_originals, open_in_system,
+from core import (read_table, read_headers, mapping_valid,
+                  complete_mapping, mapping_with_guessed_defaults,
+                  pack_originals, open_in_system,
                   process_tchaikovsky, process_dona, process_usadba,
                   usadba_sources, repair_notes_for)
 from dialogs_real import (MappingDialog, UnrecognizedSourcesDialog,
@@ -50,7 +51,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.39"
+APP_VERSION = "3.40"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -1154,6 +1155,33 @@ class RealApp(TurNalogApp):
                              'записаны в turnalog.log.')
             messagebox.showinfo('TravelLine', '\n'.join(lines), parent=self)
 
+            # The API export may have valid room IDs missing from its local
+            # inventory. Offer the standard TravelLine arrivals report as a
+            # second source; core.py merges it only into blank room/corpus cells.
+            needs_room_fallback = (
+                code == 'tch' and rep.get('rows', 0) > 0
+                and (room_stats is None or room_stats.get('unassigned', 0) > 0))
+            if needs_room_fallback and messagebox.askyesno(
+                    'Дополнить номера из TravelLine',
+                    'Выгрузка API оставила часть проживаний без номера комнаты. '
+                    'Если у вас есть готовый TravelLine «ArrivalsReport» / '
+                    '«Отчёт о заездах» с колонками № брони, заезд, выезд и № комнаты, '
+                    'выберите его сейчас. Номера будут сопоставлены по брони и датам, '
+                    'а для нескольких комнат одной брони — дополнительно по ФИО.\n\n'
+                    'Пропустить этот шаг можно кнопкой «Нет».',
+                    parent=self):
+                arrivals_path = filedialog.askopenfilename(
+                    parent=self,
+                    title='Выберите TravelLine ArrivalsReport / Отчёт о заездах',
+                    filetypes=[('Excel', '*.xlsx *.xls'), ('Все файлы', '*.*')],
+                )
+                if arrivals_path:
+                    pv.drop_rooms.set_path(arrivals_path)
+                    self.set_status(
+                        f'TravelLine: номера будут дополнены из '
+                        f'{os.path.basename(arrivals_path)}')
+                    self.toast('Дополнительный файл номеров выбран')
+
         def runner():
             try:
                 r, e = work(), None
@@ -1197,8 +1225,13 @@ class RealApp(TurNalogApp):
         except Exception as e:
             messagebox.showerror("Колонки", f"Файл не читается:\n{e}", parent=self)
             return
-        dlg = MappingDialog(self, os.path.basename(path), headers, SCHEMAS[(code, slot)],
-                            mapping=st.get('mapping'), extra=st.get('extra'))
+        schema = SCHEMAS[(code, slot)]
+        saved = self.cfg.get(f"{code}_{slot}", {})
+        current_mapping = st.get('mapping') or saved.get('mapping')
+        default_mapping = mapping_with_guessed_defaults(
+            current_mapping, headers, schema)
+        dlg = MappingDialog(self, os.path.basename(path), headers, schema,
+                            mapping=default_mapping, extra=st.get('extra'))
         self.wait_window(dlg)
         if dlg.result:
             st['mapping'], st['extra'] = dlg.result
@@ -1300,9 +1333,14 @@ class RealApp(TurNalogApp):
                 headers = read_headers(path)
                 saved = self.cfg.get(f"{code}_{slot}", {})
                 schema = SCHEMAS[(code, slot)]
-                if mapping_valid(saved.get('mapping'), headers, schema):
-                    saved_mapping = complete_mapping(
-                        saved['mapping'], headers, schema)
+                saved_mapping = saved.get('mapping')
+                if slot == 'rooms':
+                    saved_mapping = mapping_with_guessed_defaults(
+                        saved_mapping, headers, schema)
+                if mapping_valid(saved_mapping, headers, schema):
+                    if slot != 'rooms':
+                        saved_mapping = complete_mapping(
+                            saved_mapping, headers, schema)
                     maps[slot] = (saved_mapping, saved.get('extra', []))
                 else:
                     self.current_hotel = hotel_id

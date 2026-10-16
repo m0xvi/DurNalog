@@ -108,7 +108,7 @@ class ProcessView(ctk.CTkFrame):
         self.drop_rooms = DropZone(
             body,
             "Номера — расселение",
-            "Гости по комнатам, для разбивки по корпусам",
+            "TravelLine ArrivalsReport: бронь, даты, комната",
             on_pick=self._pick_rooms,
         )
         self.drop_rooms.pack(fill="x", pady=(0, 10))
@@ -282,7 +282,7 @@ class ProcessView(ctk.CTkFrame):
     def _pick_rooms(self, zone: DropZone) -> None:
         path = filedialog.askopenfilename(
             parent=self.app,
-            title="Номера — расселение",
+            title="Номера — TravelLine ArrivalsReport или файл API",
             filetypes=[("Excel", "*.xlsx *.xls"), ("Все файлы", "*.*")],
         )
         if path:
