@@ -133,6 +133,62 @@ def inclusive_period_bounds(start_value, end_value):
     return start.isoformat(), (end + timedelta(days=1)).isoformat()
 
 
+def period_preset_options(mode, quarter_start, quarter_end_exclusive):
+    """Build month/week/quarter presets clipped to one report quarter.
+
+    Weeks use Monday–Sunday (ISO-style) boundaries and are clipped at quarter
+    edges so an import for one report quarter never includes nights from another.
+    Each tuple is (label, start_iso, end_exclusive_iso).
+    """
+    def as_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value)[:10])
+        except (TypeError, ValueError):
+            raise ValueError('Некорректные границы квартала.')
+
+    start, end = as_date(quarter_start), as_date(quarter_end_exclusive)
+    if end <= start:
+        raise ValueError('Конец квартала должен быть позже его начала.')
+    mode = str(mode or '').strip().casefold()
+    if mode == 'quarter':
+        return [('Весь квартал', start.isoformat(), end.isoformat())]
+
+    options = []
+    if mode == 'month':
+        names = ('Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь')
+        cursor = start.replace(day=1)
+        while cursor < end:
+            if cursor.month == 12:
+                next_month = date(cursor.year + 1, 1, 1)
+            else:
+                next_month = date(cursor.year, cursor.month + 1, 1)
+            period_start, period_end = max(start, cursor), min(end, next_month)
+            label = f'{names[cursor.month - 1]} {cursor.year}'
+            options.append((label, period_start.isoformat(), period_end.isoformat()))
+            cursor = next_month
+        return options
+
+    if mode == 'week':
+        cursor = start - timedelta(days=start.weekday())
+        while cursor < end:
+            period_start = max(start, cursor)
+            period_end = min(end, cursor + timedelta(days=7))
+            week_number = cursor.isocalendar()[1]
+            period_last = period_end - timedelta(days=1)
+            label = (f'Неделя {week_number} · '
+                     f'{period_start:%d.%m}–{period_last:%d.%m}')
+            options.append((label, period_start.isoformat(), period_end.isoformat()))
+            cursor += timedelta(days=7)
+        return options
+
+    raise ValueError('Тип периода должен быть month, week или quarter.')
+
+
 def tl_import_cache_key(hotel_code, property_id, period_start, period_end,
                         modified_since, campaigns_with_discount=None):
     campaign_keys = sorted({_campaign_name_key(name) for name in
@@ -238,14 +294,17 @@ def get_token(client_id, secret, cancel_event=None):
 
 def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                   progress=None, cancel_event=None,
-                  include_room_inventory=False):
-    """Детали броней и, по запросу, инвентарь комнат/корпусов.
+                  include_room_inventory=False, details_callback=None,
+                  retain_details=True, details_batch_size=100):
+    """Получает список и детали броней, при необходимости — инвентарь.
 
-    Брони берутся с lastModification >= depth. При include_room_inventory
-    дополнительно запрашивает PMS API PropertyRoom и возвращает пару
-    ``(bookings, accommodationInventory response)``. progress(stage, done,
-    total); HTTP 401 обновляет OAuth-токен один раз.
-    Ошибки API содержат этап операции, но никогда не содержат client_secret.
+    Если задан ``depth``, брони фильтруются по lastModification >= depth;
+    ``depth=None`` запрашивает полный доступный архив. При
+    ``include_room_inventory`` возвращается также ответ PMS API. Callback
+    ``details_callback`` получает небольшие партии деталей по мере загрузки;
+    ``retain_details=False`` позволяет архивировать большие выгрузки, не
+    удерживая все записи в памяти. progress(stage, done, total); HTTP 401
+    обновляет OAuth-токен один раз. Ошибки никогда не содержат client_secret.
     """
     def cancelled():
         return cancel_event is not None and cancel_event.is_set()
@@ -339,17 +398,19 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             progress('inventory', 1, 1)
 
     summaries, cont, page = [], None, 0
+    seen_tokens = set()
     while True:
         if cancelled():
             raise TLCancelled()
         page += 1
-        if page > 200:
-            raise TLApiError('Слишком много страниц списка броней.')
         params = {'count': 1000}
         if cont:
+            if cont in seen_tokens:
+                raise TLApiError('TravelLine повторил continueToken списка броней.')
+            seen_tokens.add(cont)
             params['continueToken'] = cont
-        else:
-            params['lastModification'] = depth + 'T00:00:00Z'
+        if depth:
+            params['lastModification'] = str(depth)[:10] + 'T00:00:00Z'
         _, data = api_get(
             f'/api/read-reservation/v1/properties/{property_id}/bookings',
             params, f'Список броней (страница {page})')
@@ -362,22 +423,46 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
             break
         cont = data.get('continueToken')
         if not cont:
-            break
+            raise TLApiError(
+                'TravelLine сообщил о следующей странице, но не вернул continueToken.')
         time.sleep(0.4)
     details = []
+    detail_batch = []
+    batch_size = max(1, int(details_batch_size or 100))
     total = len(summaries)
-    for i, summary in enumerate(summaries, 1):
-        if cancelled():
-            raise TLCancelled()
-        _, data = api_get(
-            f'/api/read-reservation/v1/properties/{property_id}'
-            f'/bookings/{summary["number"]}',
-            stage=f'Бронь {summary["number"]}')
-        details.append(data.get('booking', {}))
-        if progress:
-            progress('details', i, total)
-        # Read Reservation limit for details: 200 requests/minute.
-        time.sleep(0.31)
+    try:
+        for i, summary in enumerate(summaries, 1):
+            if cancelled():
+                raise TLCancelled()
+            number = summary.get('number') if isinstance(summary, dict) else None
+            if not number:
+                raise TLApiError('В списке броней TravelLine отсутствует номер брони.')
+            _, data = api_get(
+                f'/api/read-reservation/v1/properties/{property_id}'
+                f'/bookings/{number}',
+                stage=f'Бронь {number}')
+            booking = data.get('booking', {})
+            if not isinstance(booking, dict):
+                booking = {}
+            if not booking.get('number'):
+                booking = dict(booking, number=str(number))
+            if retain_details:
+                details.append(booking)
+            if details_callback:
+                detail_batch.append(booking)
+                if len(detail_batch) >= batch_size:
+                    details_callback(detail_batch)
+                    detail_batch = []
+            if progress:
+                progress('details', i, total)
+            # Read Reservation limit for details: 200 requests/minute.
+            time.sleep(0.31)
+    except TLCancelled:
+        if detail_batch and details_callback:
+            details_callback(detail_batch)
+        raise
+    if detail_batch and details_callback:
+        details_callback(detail_batch)
     return (details, inventory) if include_room_inventory else details
 
 

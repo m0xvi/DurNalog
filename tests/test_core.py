@@ -495,12 +495,27 @@ def test_agents_hotel_filter():
     assert match_agent("Ostrovok.ru", agents, hotel='dna')[1] == 'Островок'
 
 
+def test_agent_zero_commission_override_preserves_configured_rates():
+    from agents import default_agents, match_agent
+
+    agents = default_agents()
+    agent = next(a for a in agents if a['name'] == 'Островок')
+    configured_rates = [dict(rate) for rate in agent['rates']]
+    assert match_agent('Ostrovok.ru', agents, hotel='dna') == (15, 'Островок')
+    agent['commission_zero'] = True
+    assert match_agent('Ostrovok.ru', agents, hotel='dna') == (0, 'Островок')
+    assert agent['rates'] == configured_rates
+    agent['commission_zero'] = False
+    assert match_agent('Ostrovok.ru', agents, hotel='dna') == (15, 'Островок')
+
+
 def test_import_export_roundtrip(tmp_path):
     from agents import default_agents, export_agents, import_agents
     agents = default_agents()
     agents.append({'name': 'Extra Channel', 'aliases': ['extraxyz'], 'hotels': ['dna'],
                    'rates': [{'from': '', 'to': '31.03.2026', 'pct': 12},
-                             {'from': '01.04.2026', 'to': '', 'pct': 15}]})
+                             {'from': '01.04.2026', 'to': '', 'pct': 15}],
+                   'commission_zero': True})
     p_x = str(tmp_path / "agents.xlsx")
     p_c = str(tmp_path / "agents.csv")
     export_agents(agents, p_x)
@@ -510,6 +525,7 @@ def test_import_export_roundtrip(tmp_path):
         oz = next(a for a in back if a['name'] == 'Extra Channel')
         assert len(oz['rates']) == 2 and oz['rates'][1]['pct'] == 15
         assert 'extraxyz' in oz['aliases']
+        assert oz['commission_zero'] is True
         ost = next(a for a in back if a['name'] == 'Островок')
         assert ost['rates'][0]['pct'] == 15
 
@@ -770,3 +786,47 @@ def test_travelline_cache_crud_and_refresh(tmp_path):
 
         db.delete_travelline_cache(key)
         assert db.get_travelline_cache(key) is None
+
+
+def test_travelline_full_archive_persists_compressed_bookings_and_sync_state(tmp_path):
+    path = str(tmp_path / 'travelline-archive.db')
+    booking = {
+        'number': 'TL-2026-1', 'status': 'Active', 'guest': 'Иван Петров',
+        'roomStays': [{
+            'stayDates': {'arrivalDateTime': '2026-08-01T14:00:00',
+                          'departureDateTime': '2026-08-03T12:00:00'},
+            'total': {'priceAfterTax': 12000},
+        }],
+    }
+    inventory = {'accommodationInventory': {'buildings': [{'name': 'Корпус 1'}]}}
+    with HistoryDB(path) as db:
+        db.begin_travelline_archive_sync('tch', '8186', full=True)
+        saved = db.upsert_travelline_archive_bookings('tch', '8186', [booking])
+        assert saved == {'saved': 1, 'skipped': 0}
+        db.put_travelline_inventory('tch', '8186', inventory)
+        partial = db.get_travelline_archive_sync_state('tch', '8186')
+        assert partial['full_sync_complete'] == 0
+    with HistoryDB(path) as db:
+        db.finish_travelline_archive_sync('tch', '8186', full=True)
+    with HistoryDB(path) as db:
+        stats = db.get_travelline_archive_stats('tch', '8186')
+        assert stats['booking_count'] == 1
+        assert stats['archive_bytes'] > 0 and stats['database_bytes'] > 0
+        assert stats['full_sync_complete'] is True
+        archived = db.get_travelline_archive_bookings(
+            'tch', '8186', '2026-08-02', '2026-08-03')
+        assert archived == [booking]
+        assert db.get_travelline_archive_bookings(
+            'tch', '8186', '2026-08-03', '2026-08-04') == []
+        assert db.get_travelline_inventory('tch', '8186') == inventory
+        old_full_sync = stats['last_full_sync_at']
+        changed = dict(booking, status='Cancelled')
+        db.begin_travelline_archive_sync('tch', '8186', full=False)
+        db.upsert_travelline_archive_bookings('tch', '8186', [changed])
+        db.finish_travelline_archive_sync('tch', '8186', full=False)
+        updated = db.get_travelline_archive_stats('tch', '8186')
+        assert updated['booking_count'] == 1
+        assert updated['full_sync_complete'] is True
+        assert updated['last_full_sync_at'] == old_full_sync
+        assert db.get_travelline_archive_bookings(
+            'tch', '8186', '2026-08-01', '2026-08-04')[0]['status'] == 'Cancelled'

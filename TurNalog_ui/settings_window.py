@@ -260,6 +260,8 @@ class AgentsPane(ctk.CTkFrame):
         GhostButton(bar, "Проверить", command=lambda: self._stub("Проверка синонимов"), width=100).pack(
             side="left", padx=6
         )
+        GhostButton(bar, "Кампании TL…", command=self._open_tl_campaigns,
+                    width=125).pack(side="left", padx=6)
 
         split = ctk.CTkFrame(self, fg_color="transparent")
         split.pack(fill="both", expand=True)
@@ -328,6 +330,25 @@ class AgentsPane(ctk.CTkFrame):
                 border_color=COLORS["line"],
             ).pack(padx=8, pady=6)
 
+        self.commission_zero_var = tk.BooleanVar(value=False)
+        override_row = ctk.CTkFrame(form, fg_color="transparent")
+        override_row.pack(fill="x", pady=(0, 10))
+        ctk.CTkCheckBox(
+            override_row,
+            text="Автоматически устанавливать комиссию 0%",
+            variable=self.commission_zero_var,
+            font=_f("ui_b"),
+            text_color=COLORS["text"],
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            border_color=COLORS["line"],
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            override_row,
+            text="Ставки и периоды сохраняются и снова применяются после снятия галочки.",
+            anchor="w", font=_f("xs"), text_color=COLORS["muted"],
+        ).pack(anchor="w", padx=(28, 0), pady=(2, 0))
+
         box, self.syn_ent = labeled_entry(form, "Синонимы", "балтма, baltma")
         box.pack(fill="x", pady=(0, 10))
 
@@ -358,6 +379,11 @@ class AgentsPane(ctk.CTkFrame):
 
         self._rebuild_list()
         self._load_current()
+
+    def _open_tl_campaigns(self) -> None:
+        window = self.winfo_toplevel()
+        if hasattr(window, "_show") and "tl_campaigns" in window.panes:
+            window._show("tl_campaigns")
 
     def _stub(self, title: str) -> None:
         messagebox.showinfo(title, "Макет GUI — логика не подключена.", parent=self.winfo_toplevel())
@@ -568,10 +594,16 @@ class TlCampaignsPane(ctk.CTkScrollableFrame):
         if not isinstance(tl_cfg, dict):
             tl_cfg = {}
 
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 8))
+        GhostButton(
+            header, "← К агентам",
+            command=lambda: self.winfo_toplevel()._show("agents"),
+            width=120).pack(side="right")
         ctk.CTkLabel(
-            self, text="Кампании TravelLine: считать налог со скидкой",
+            header, text="Агенты · исключения скидок TravelLine",
             anchor="w", font=_f("h2"), text_color=COLORS["text"]
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(side="left", anchor="w")
         ctk.CTkLabel(
             self,
             text=("По правилу расчёта скидка обычно добавляется обратно к "
@@ -997,7 +1029,6 @@ class SettingsWindow(ctk.CTkToplevel):
         self.panes["data"] = DataPane(self.host, app)
         self._nav_btn("data", "База данных")
         self.panes["tl_campaigns"] = TlCampaignsPane(self.host, app)
-        self._nav_btn("tl_campaigns", "Кампании TL")
         self.panes["updates"] = UpdatesPane(self.host, app)
         self._nav_btn("updates", "Обновления")
 
@@ -1040,8 +1071,9 @@ class SettingsWindow(ctk.CTkToplevel):
     def _show(self, key: str) -> None:
         for k, pane in self.panes.items():
             pane.pack_forget()
+        active_nav_key = "agents" if key == "tl_campaigns" else key
         for k, btn in self.nav_btns.items():
-            if k == key:
+            if k == active_nav_key:
                 btn.configure(fg_color=COLORS["accent_soft"], text_color=COLORS["accent"], font=_f("ui_b"))
             else:
                 btn.configure(fg_color="transparent", text_color=COLORS["text"], font=_f("ui"))

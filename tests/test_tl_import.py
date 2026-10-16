@@ -1032,6 +1032,83 @@ def test_fetch_details_progress(monkeypatch):
     assert ('details', 2, 2) in calls
 
 
+def test_fetch_details_full_archive_batches_without_retaining_all_details(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    seen, batches = [], []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            seen.append(params)
+            return 200, {'bookingSummaries': [{'number': f'n{i}'} for i in range(3)],
+                         'hasMoreData': False}
+        return 200, {'booking': {'number': path.rsplit('/', 1)[-1]}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details(
+        'id', 'secret', '8186', depth=None, details_callback=batches.append,
+        retain_details=False, details_batch_size=2)
+
+    assert out == []
+    assert len(batches) == 2
+    assert [[b['number'] for b in batch] for batch in batches] == [
+        ['n0', 'n1'], ['n2']]
+    assert 'lastModification' not in seen[0]
+    assert seen[0]['count'] == 1000
+
+
+def test_fetch_details_uses_summary_number_when_detail_omits_it(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'TL-17'}],
+                         'hasMoreData': False}
+        return 200, {'booking': {'status': 'Active'}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    assert tl_client.fetch_details('id', 'secret', '8186', depth=None) == [
+        {'status': 'Active', 'number': 'TL-17'}]
+
+
+def test_fetch_details_rejects_missing_continuation_token(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client, '_http', lambda *args, **kwargs: (
+        200, {'bookingSummaries': [], 'hasMoreData': True}))
+    try:
+        tl_client.fetch_details('id', 'secret', '8186', depth=None)
+    except tl_client.TLApiError as exc:
+        assert 'continueToken' in str(exc)
+    else:
+        raise AssertionError('an incomplete paginated response must not be archived')
+
+
+def test_month_week_quarter_presets_are_clipped_to_quarter():
+    from tl_client import period_preset_options
+
+    qstart, qend = '2026-04-01', '2026-07-01'
+    months = period_preset_options('month', qstart, qend)
+    assert [label for label, _, _ in months] == [
+        'Апрель 2026', 'Май 2026', 'Июнь 2026']
+    assert [(start, end) for _, start, end in months] == [
+        ('2026-04-01', '2026-05-01'),
+        ('2026-05-01', '2026-06-01'),
+        ('2026-06-01', '2026-07-01')]
+
+    weeks = period_preset_options('week', qstart, qend)
+    assert len(weeks) == 14
+    assert weeks[0][1:] == ('2026-04-01', '2026-04-06')
+    assert weeks[-1][1:] == ('2026-06-29', '2026-07-01')
+    assert all(qstart <= start < end <= qend for _, start, end in weeks)
+
+    assert period_preset_options('quarter', qstart, qend) == [
+        ('Весь квартал', qstart, qend)]
+
+
 def test_fetch_details_can_also_request_pms_room_inventory(monkeypatch):
     import tl_client
     inventory = {'accommodationInventory': {'buildings': []}}

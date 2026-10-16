@@ -5,6 +5,7 @@
 поменять комиссию — правьте список DONA_AGENTS: (комиссия %, имя, [ключи]).
 Комиссия — число, либо [(с, по, %)] для плавающей ставки; СКИДКА по договору = 0%.
 """
+import math
 import re
 
 DONA_AGENTS = [
@@ -278,6 +279,11 @@ def match_agent(source, agents, date=None, hotel=None):
 
     if best_agent is None:
         return 0, None
+    override = best_agent.get('commission_zero', False)
+    if isinstance(override, str):
+        override = override.strip().casefold() in {'1', 'true', 'yes', 'да', 'on'}
+    if override:
+        return 0, best_agent['name']
     return rate_for(best_agent, date), best_agent['name']
 
 
@@ -300,7 +306,7 @@ def match_dona_agent(source, overrides=None, extra_aliases=None,
 
 # ================================================================
 # ИМПОРТ / ЭКСПОРТ ТАБЛИЦЫ АГЕНТОВ (Excel / CSV)
-# Колонки: Название | Отели | Синонимы | С даты | По дату | Комиссия %
+# Колонки: Название | Отели | Синонимы | С даты | По дату | Комиссия % | Комиссия 0%
 # Несколько строк с одним названием = периоды комиссии.
 # ================================================================
 def agents_to_rows(agents):
@@ -314,6 +320,7 @@ def agents_to_rows(agents):
                 'С даты': r.get('from', ''),
                 'По дату': r.get('to', ''),
                 'Комиссия %': r.get('pct', 0),
+                'Комиссия 0%': bool(a.get('commission_zero', False)),
             })
     return rows
 
@@ -327,9 +334,21 @@ def rows_to_agents(rows):
         if not name:
             continue
         if name not in by_name:
-            by_name[name] = {'name': name, 'aliases': [], 'hotels': ['dna'], 'rates': []}
+            by_name[name] = {'name': name, 'aliases': [], 'hotels': ['dna'],
+                             'rates': []}
             order.append(name)
         a = by_name[name]
+        if 'Комиссия 0%' in row:
+            zero_value = row.get('Комиссия 0%')
+            if zero_value is None or (isinstance(zero_value, float)
+                                      and math.isnan(zero_value)):
+                zero_value = False
+            elif isinstance(zero_value, str):
+                zero_value = zero_value.strip().casefold() in {
+                    '1', 'true', 'yes', 'да', 'on', 'x', '✓'}
+            else:
+                zero_value = zero_value is True or zero_value == 1
+            a['commission_zero'] = bool(a.get('commission_zero') or zero_value)
         hotels = str(row.get('Отели') or '').replace(';', '|').split('|')
         hotels = [h.strip() for h in hotels if h.strip()]
         if hotels:
@@ -355,7 +374,8 @@ def rows_to_agents(rows):
 def export_agents(agents, path):
     import pandas as pd
     df = pd.DataFrame(agents_to_rows(agents),
-                      columns=['Название', 'Отели', 'Синонимы', 'С даты', 'По дату', 'Комиссия %'])
+                      columns=['Название', 'Отели', 'Синонимы', 'С даты', 'По дату',
+                               'Комиссия %', 'Комиссия 0%'])
     if str(path).lower().endswith('.csv'):
         df.to_csv(path, index=False, encoding='utf-8-sig', sep=';')
     else:

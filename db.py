@@ -9,11 +9,13 @@
 Файл БД лежит рядом с приложением: turnalog_history.db
 """
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
 import sys
-from datetime import datetime
+import zlib
+from datetime import date, datetime, timezone
 
 from tax import dates_overlap
 
@@ -94,6 +96,37 @@ class HistoryDB:
             fetched_at   TEXT NOT NULL,
             row_count    INTEGER NOT NULL DEFAULT 0,
             payload_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS travelline_archive (
+            hotel_code      TEXT NOT NULL,
+            property_id     TEXT NOT NULL,
+            booking_number  TEXT NOT NULL,
+            arrival_date    TEXT,
+            departure_date  TEXT,
+            modified_at     TEXT,
+            fetched_at      TEXT NOT NULL,
+            payload_blob    BLOB NOT NULL,
+            PRIMARY KEY (hotel_code, property_id, booking_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_travelline_archive_period
+            ON travelline_archive(hotel_code, property_id, arrival_date, departure_date);
+        CREATE TABLE IF NOT EXISTS travelline_archive_state (
+            hotel_code       TEXT NOT NULL,
+            property_id      TEXT NOT NULL,
+            full_sync_complete INTEGER NOT NULL DEFAULT 0,
+            last_sync_at     TEXT,
+            last_full_sync_at TEXT,
+            sync_started_at  TEXT,
+            sync_kind        TEXT,
+            last_error       TEXT,
+            PRIMARY KEY (hotel_code, property_id)
+        );
+        CREATE TABLE IF NOT EXISTS travelline_inventory (
+            hotel_code   TEXT NOT NULL,
+            property_id  TEXT NOT NULL,
+            fetched_at   TEXT NOT NULL,
+            inventory_json TEXT NOT NULL,
+            PRIMARY KEY (hotel_code, property_id)
         );
         """)
         self.con.commit()
@@ -197,6 +230,221 @@ class HistoryDB:
     def delete_travelline_cache(self, cache_key):
         self.con.execute(
             "DELETE FROM travelline_cache WHERE cache_key=?", (cache_key,))
+
+    def delete_travelline_caches_for_property(self, hotel_code, property_id):
+        self.con.execute(
+            "DELETE FROM travelline_cache WHERE hotel_code=? AND property_id=?",
+            (hotel_code, str(property_id)))
+
+    @staticmethod
+    def _tl_archive_now():
+        return (datetime.now(timezone.utc).replace(microsecond=0)
+                .isoformat().replace('+00:00', 'Z'))
+
+    @staticmethod
+    def _tl_archive_day(value):
+        if isinstance(value, datetime):
+            value = value.date()
+        if isinstance(value, date):
+            return value.isoformat()
+        try:
+            return date.fromisoformat(str(value or '')[:10]).isoformat()
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _tl_booking_period(cls, booking):
+        room_stays = booking.get('roomStays') or []
+        if isinstance(room_stays, dict):
+            room_stays = [room_stays]
+        arrivals, departures = [], []
+        for stay in room_stays:
+            if not isinstance(stay, dict):
+                continue
+            dates = stay.get('stayDates') or {}
+            if not isinstance(dates, dict):
+                continue
+            arrival = cls._tl_archive_day(dates.get('arrivalDateTime'))
+            departure = cls._tl_archive_day(dates.get('departureDateTime'))
+            if arrival:
+                arrivals.append(arrival)
+            if departure:
+                departures.append(departure)
+        if not arrivals and not departures:
+            dates = booking.get('stayDates') or {}
+            if isinstance(dates, dict):
+                arrival = cls._tl_archive_day(dates.get('arrivalDateTime'))
+                departure = cls._tl_archive_day(dates.get('departureDateTime'))
+                if arrival:
+                    arrivals.append(arrival)
+                if departure:
+                    departures.append(departure)
+        return (min(arrivals) if arrivals else None,
+                max(departures) if departures else None)
+
+    def upsert_travelline_archive_bookings(self, hotel_code, property_id,
+                                           bookings):
+        """Сохраняет детали брони целиком в сжатом локальном архиве."""
+        now = self._tl_archive_now()
+        records = []
+        skipped = 0
+        for booking in bookings or []:
+            if not isinstance(booking, dict):
+                skipped += 1
+                continue
+            number = (booking.get('number') or booking.get('bookingNumber')
+                      or booking.get('id') or booking.get('bookingId'))
+            if number is None or str(number).strip() == '':
+                skipped += 1
+                continue
+            arrival, departure = self._tl_booking_period(booking)
+            modified = (booking.get('lastModification')
+                        or booking.get('lastModified') or '')
+            payload = json.dumps(
+                booking, ensure_ascii=False, separators=(',', ':'),
+                default=lambda value: value.isoformat()
+                if hasattr(value, 'isoformat') else str(value))
+            records.append((
+                str(hotel_code), str(property_id), str(number), arrival,
+                departure, str(modified) if modified else '', now,
+                sqlite3.Binary(zlib.compress(payload.encode('utf-8'), level=6))))
+        self.con.executemany(
+            """INSERT INTO travelline_archive
+               (hotel_code, property_id, booking_number, arrival_date,
+                departure_date, modified_at, fetched_at, payload_blob)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(hotel_code, property_id, booking_number) DO UPDATE SET
+                 arrival_date=excluded.arrival_date,
+                 departure_date=excluded.departure_date,
+                 modified_at=excluded.modified_at,
+                 fetched_at=excluded.fetched_at,
+                 payload_blob=excluded.payload_blob""",
+            records)
+        return {'saved': len(records), 'skipped': skipped}
+
+    def get_travelline_archive_bookings(self, hotel_code, property_id,
+                                        period_start, period_end_exclusive):
+        """Возвращает архивные брони с ночами, пересекающими [start, end)."""
+        rows = self.con.execute(
+            """SELECT payload_blob FROM travelline_archive
+               WHERE hotel_code=? AND property_id=?
+                 AND arrival_date IS NOT NULL AND departure_date IS NOT NULL
+                 AND departure_date>? AND arrival_date<?
+               ORDER BY arrival_date, booking_number""",
+            (str(hotel_code), str(property_id), str(period_start),
+             str(period_end_exclusive))).fetchall()
+        return [json.loads(zlib.decompress(row['payload_blob']).decode('utf-8'))
+                for row in rows]
+
+    def get_travelline_archive_stats(self, hotel_code, property_id):
+        hotel_code, property_id = str(hotel_code), str(property_id)
+        state = self.con.execute(
+            """SELECT * FROM travelline_archive_state
+               WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()
+        totals = self.con.execute(
+            """SELECT COUNT(*) AS booking_count,
+                      COALESCE(SUM(length(payload_blob)), 0) AS archive_bytes
+               FROM travelline_archive WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()
+        inventory = self.con.execute(
+            """SELECT COALESCE(length(CAST(inventory_json AS BLOB)), 0)
+               FROM travelline_inventory WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()
+        try:
+            database_bytes = os.path.getsize(self.path)
+        except (OSError, TypeError, ValueError):
+            database_bytes = 0
+        result = {
+            'booking_count': int(totals['booking_count']),
+            'archive_bytes': int(totals['archive_bytes']),
+            'inventory_bytes': int(inventory[0]) if inventory else 0,
+            'database_bytes': int(database_bytes),
+            'database_path': self.path,
+            'full_sync_complete': False,
+            'last_sync_at': None,
+            'last_full_sync_at': None,
+            'sync_started_at': None,
+            'sync_kind': None,
+            'last_error': None,
+        }
+        if state:
+            result.update({
+                'full_sync_complete': bool(state['full_sync_complete']),
+                'last_sync_at': state['last_sync_at'],
+                'last_full_sync_at': state['last_full_sync_at'],
+                'sync_started_at': state['sync_started_at'],
+                'sync_kind': state['sync_kind'],
+                'last_error': state['last_error'],
+            })
+        return result
+
+    def get_travelline_archive_sync_state(self, hotel_code, property_id):
+        row = self.con.execute(
+            """SELECT * FROM travelline_archive_state
+               WHERE hotel_code=? AND property_id=?""",
+            (str(hotel_code), str(property_id))).fetchone()
+        return dict(row) if row else None
+
+    def begin_travelline_archive_sync(self, hotel_code, property_id, full=False):
+        now = self._tl_archive_now()
+        self.con.execute(
+            """INSERT INTO travelline_archive_state
+               (hotel_code, property_id, full_sync_complete, sync_started_at,
+                sync_kind, last_error)
+               VALUES (?,?,0,?,?,NULL)
+               ON CONFLICT(hotel_code, property_id) DO UPDATE SET
+                 sync_started_at=excluded.sync_started_at,
+                 sync_kind=excluded.sync_kind, last_error=NULL""",
+            (str(hotel_code), str(property_id), now,
+             'full' if full else 'incremental'))
+
+    def finish_travelline_archive_sync(self, hotel_code, property_id, full=False):
+        now = self._tl_archive_now()
+        self.con.execute(
+            """INSERT INTO travelline_archive_state
+               (hotel_code, property_id, full_sync_complete, last_sync_at,
+                last_full_sync_at, sync_started_at, sync_kind, last_error)
+               VALUES (?,?,?, ?, ?, NULL, NULL, NULL)
+               ON CONFLICT(hotel_code, property_id) DO UPDATE SET
+                 full_sync_complete=MAX(
+                     travelline_archive_state.full_sync_complete,
+                     excluded.full_sync_complete),
+                 last_sync_at=excluded.last_sync_at,
+                 last_full_sync_at=COALESCE(
+                     excluded.last_full_sync_at,
+                     travelline_archive_state.last_full_sync_at),
+                 sync_started_at=NULL, sync_kind=NULL, last_error=NULL""",
+            (str(hotel_code), str(property_id), 1 if full else 0, now,
+             now if full else None))
+
+    def fail_travelline_archive_sync(self, hotel_code, property_id, error):
+        self.con.execute(
+            """INSERT INTO travelline_archive_state
+               (hotel_code, property_id, full_sync_complete, last_error)
+               VALUES (?,?,0,?)
+               ON CONFLICT(hotel_code, property_id) DO UPDATE SET
+                 sync_started_at=NULL, sync_kind=NULL, last_error=excluded.last_error""",
+            (str(hotel_code), str(property_id), str(error or 'Ошибка синхронизации')[:2000]))
+
+    def put_travelline_inventory(self, hotel_code, property_id, inventory):
+        payload = json.dumps(inventory or {}, ensure_ascii=False,
+                             separators=(',', ':'))
+        self.con.execute(
+            """INSERT INTO travelline_inventory
+               (hotel_code, property_id, fetched_at, inventory_json)
+               VALUES (?,?,?,?)
+               ON CONFLICT(hotel_code, property_id) DO UPDATE SET
+                 fetched_at=excluded.fetched_at,
+                 inventory_json=excluded.inventory_json""",
+            (str(hotel_code), str(property_id), self._tl_archive_now(), payload))
+
+    def get_travelline_inventory(self, hotel_code, property_id):
+        row = self.con.execute(
+            """SELECT inventory_json FROM travelline_inventory
+               WHERE hotel_code=? AND property_id=?""",
+            (str(hotel_code), str(property_id))).fetchone()
+        return json.loads(row['inventory_json']) if row else None
 
     # ------------------------------------------------------------------
     # Дубли (переход кварталов)

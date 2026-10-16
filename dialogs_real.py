@@ -340,18 +340,25 @@ class TlConfigDialog(ctk.CTkToplevel):
 
 
 class TlPeriodDialog(ctk.CTkToplevel):
-    """Пользовательский диапазон ночей внутри выбранного квартала."""
+    """Выбор готового месяца, календарной недели или квартала."""
+
+    MODES = {'Месяц': 'month', 'Неделя': 'week', 'Квартал': 'quarter'}
 
     def __init__(self, master, quarter_label, quarter_start, quarter_end_exclusive):
         super().__init__(master)
+        from tl_client import period_preset_options
+
         self.title('TravelLine — период выгрузки')
-        self.geometry('560x370')
+        self.geometry('560x360')
         self.resizable(False, False)
         self.transient(master)
         self.result = None
         self.quarter_label = quarter_label
         self.quarter_start = date.fromisoformat(str(quarter_start)[:10])
         self.quarter_end = date.fromisoformat(str(quarter_end_exclusive)[:10])
+        self._preset_options = period_preset_options(
+            'quarter', self.quarter_start, self.quarter_end)
+        self._presets_by_label = {}
         self.protocol('WM_DELETE_WINDOW', self.cancel)
 
         ctk.CTkLabel(
@@ -359,76 +366,71 @@ class TlPeriodDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(16, 5))
         ctk.CTkLabel(
             self,
-            text=('Границы периода включительные, формат ДД.ММ.ГГГГ. '
-                  'Считаются ночи проживания; дата фактического выезда — не ночь.\n'
-                  'Для пересекающего границу проживания нужны полные dailyRates. '
-                  'Без них строка проживания будет пропущена, причина появится в '
-                  'предупреждениях. Допуслуги в частичный период попадают только '
-                  'при наличии даты в API.'),
-            text_color='gray', justify='left', wraplength=500
+            text=('Выберите месяц, неделю или весь квартал. Произвольный диапазон '
+                  'дат не используется. Считаются ночи проживания: дата выезда '
+                  'не включается.\nНеделя: понедельник–воскресенье; на границе '
+                  'квартала неделя ограничивается датами выбранного квартала. '
+                  'Частичные проживания требуют полных dailyRates.'),
+            text_color='gray', justify='left', wraplength=510
         ).pack(padx=24, pady=(0, 14), anchor='w')
 
-        self.start_var = tk.StringVar(
-            value=self.quarter_start.strftime('%d.%m.%Y'))
-        self.end_var = tk.StringVar(
-            value=(self.quarter_end - timedelta(days=1)).strftime('%d.%m.%Y'))
-        fields = ctk.CTkFrame(self, fg_color='transparent')
-        fields.pack(fill='x', padx=36, pady=(0, 10))
-        ctk.CTkLabel(fields, text='С даты (включительно)', anchor='w').grid(
-            row=0, column=0, sticky='w', padx=(0, 12), pady=5)
-        ctk.CTkEntry(fields, textvariable=self.start_var, width=150).grid(
-            row=0, column=1, sticky='e', pady=5)
-        ctk.CTkLabel(fields, text='По дату (включительно)', anchor='w').grid(
-            row=1, column=0, sticky='w', padx=(0, 12), pady=5)
-        ctk.CTkEntry(fields, textvariable=self.end_var, width=150).grid(
-            row=1, column=1, sticky='e', pady=5)
-        fields.grid_columnconfigure(0, weight=1)
+        self.mode_var = tk.StringVar(value='Квартал')
+        self.mode_selector = ctk.CTkSegmentedButton(
+            self, values=list(self.MODES), variable=self.mode_var,
+            command=self._set_mode, height=34, width=420,
+            dynamic_resizing=False)
+        self.mode_selector.pack(padx=24, pady=(0, 12))
+        self.mode_selector.set('Квартал')
+
+        row = ctk.CTkFrame(self, fg_color='transparent')
+        row.pack(fill='x', padx=36, pady=(0, 10))
+        ctk.CTkLabel(row, text='Период', anchor='w').pack(side='left')
+        self.period_var = tk.StringVar()
+        self.period_menu = ctk.CTkOptionMenu(
+            row, variable=self.period_var, values=['Весь квартал'],
+            width=300, height=34, dynamic_resizing=False)
+        self.period_menu.pack(side='right')
+        self._set_mode('Квартал')
+
+        self.period_hint = ctk.CTkLabel(
+            self, text='', text_color='gray', anchor='w', wraplength=500,
+            justify='left')
+        self.period_hint.pack(fill='x', padx=36, pady=(0, 8))
 
         buttons = ctk.CTkFrame(self, fg_color='transparent')
-        buttons.pack(pady=(5, 14))
-        ctk.CTkButton(buttons, text='Весь квартал', width=130,
-                      fg_color='gray', command=self.reset).pack(
-                          side='left', padx=5)
-        ctk.CTkButton(buttons, text='Продолжить', width=130,
+        buttons.pack(pady=(8, 14))
+        ctk.CTkButton(buttons, text='Продолжить', width=140,
                       fg_color='green', command=self.ok).pack(
                           side='left', padx=5)
-        ctk.CTkButton(buttons, text='Отмена', width=110,
-                      fg_color='gray', command=self.cancel).pack(
-                          side='left', padx=5)
+        ctk.CTkButton(buttons, text='Отмена', width=120, fg_color='gray',
+                      command=self.cancel).pack(side='left', padx=5)
         self.grab_set()
         self.lift()
         self.focus_force()
 
-    def reset(self):
-        self.start_var.set(self.quarter_start.strftime('%d.%m.%Y'))
-        self.end_var.set(
-            (self.quarter_end - timedelta(days=1)).strftime('%d.%m.%Y'))
+    def _set_mode(self, mode_label):
+        from tl_client import period_preset_options
+
+        mode = self.MODES.get(mode_label, 'quarter')
+        self._preset_options = period_preset_options(
+            mode, self.quarter_start, self.quarter_end)
+        self._presets_by_label = {
+            label: (start, end) for label, start, end in self._preset_options}
+        labels = list(self._presets_by_label)
+        self.period_menu.configure(values=labels)
+        if self.period_var.get() not in self._presets_by_label:
+            self.period_var.set(labels[0])
+        last_day = self.quarter_end - timedelta(days=1)
+        self.period_hint.configure(
+            text=(f'Даты выбранного квартала: {self.quarter_start:%d.%m.%Y}–'
+                  f'{last_day:%d.%m.%Y}. Конец периода включителен по ночам.'))
 
     def ok(self):
-        try:
-            start = datetime.strptime(
-                self.start_var.get().strip(), '%d.%m.%Y').date()
-            end = datetime.strptime(
-                self.end_var.get().strip(), '%d.%m.%Y').date()
-        except ValueError:
-            messagebox.showerror(
-                'TravelLine', 'Введите даты в формате ДД.ММ.ГГГГ.', parent=self)
+        selected = self._presets_by_label.get(self.period_var.get())
+        if not selected:
+            messagebox.showerror('TravelLine', 'Выберите период.', parent=self)
             return
-        if end < start:
-            messagebox.showerror(
-                'TravelLine', 'Дата окончания должна быть не раньше даты начала.',
-                parent=self)
-            return
-        last_quarter_day = self.quarter_end - timedelta(days=1)
-        if start < self.quarter_start or end > last_quarter_day:
-            messagebox.showerror(
-                'TravelLine',
-                'Период должен находиться внутри выбранного квартала '
-                f'({self.quarter_start:%d.%m.%Y}–{last_quarter_day:%d.%m.%Y}).',
-                parent=self)
-            return
-        from tl_client import inclusive_period_bounds
-        self.result = inclusive_period_bounds(start.isoformat(), end.isoformat())
+        self.result = selected
         self.destroy()
 
     def cancel(self):
@@ -489,6 +491,117 @@ class TlCacheDialog(ctk.CTkToplevel):
             .grid(row=1, column=0, padx=5, pady=4)
         ctk.CTkButton(grid, text='Отмена', width=190, fg_color='gray',
                       command=self.cancel).grid(row=1, column=1, padx=5, pady=4)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def finish(self, result):
+        self.result = result
+        self.destroy()
+
+    def cancel(self):
+        self.result = 'cancel'
+        self.destroy()
+
+
+class TlArchiveDialog(ctk.CTkToplevel):
+    """Выбор локального архива TravelLine или его синхронизации."""
+
+    def __init__(self, master, hotel_name, period_label, stats):
+        super().__init__(master)
+        self.title('TravelLine — локальный архив')
+        self.geometry('560x430')
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        self.stats = stats or {}
+        complete = bool(self.stats.get('full_sync_complete'))
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+
+        def size_text(value):
+            size = max(0, int(value or 0))
+            for unit in ('Б', 'КБ', 'МБ', 'ГБ', 'ТБ'):
+                if size < 1024 or unit == 'ТБ':
+                    return f'{size:.0f} {unit}' if unit == 'Б' else f'{size:.1f} {unit}'
+                size /= 1024
+
+        title = ('Архив TravelLine готов' if complete
+                 else 'Нужна полная загрузка архива')
+        ctk.CTkLabel(
+            self, text=title,
+            font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(16, 5))
+        ctk.CTkLabel(
+            self, text=f'{hotel_name} · {period_label}',
+            font=ctk.CTkFont(size=12, weight='bold'), text_color='#344054'
+        ).pack(pady=(0, 6))
+
+        last_sync = self.stats.get('last_sync_at') or 'ещё не выполнялась'
+        details = (
+            f'В локальном архиве: {int(self.stats.get("booking_count", 0)):,} броней\n'
+            f'Сжатые данные броней: {size_text(self.stats.get("archive_bytes", 0))}\n'
+            f'Инвентарь комнат: {size_text(self.stats.get("inventory_bytes", 0))}\n'
+            f'Файл базы данных целиком: {size_text(self.stats.get("database_bytes", 0))}\n'
+            f'Последняя синхронизация: {last_sync}'
+        ).replace(',', ' ')
+        ctk.CTkLabel(
+            self, text=details, justify='left', anchor='w',
+            text_color='#344054', wraplength=500
+        ).pack(fill='x', padx=34, pady=(5, 4))
+        if self.stats.get('database_path'):
+            ctk.CTkLabel(
+                self, text=f'Файл БД: {self.stats["database_path"]}',
+                text_color='#667085', font=ctk.CTkFont(size=10),
+                justify='left', wraplength=500
+            ).pack(fill='x', padx=34, pady=(0, 4))
+
+        if self.stats.get('last_error'):
+            error = str(self.stats['last_error']).replace('\n', ' ')
+            if len(error) > 220:
+                error = error[:217] + '…'
+            ctk.CTkLabel(
+                self, text=f'Последняя ошибка: {error}',
+                text_color='#B42318', justify='left', wraplength=500
+            ).pack(fill='x', padx=34, pady=(0, 6))
+
+        if complete:
+            message = (
+                'Выбор месяца/недели/квартала будет применён к этому архиву локально. '
+                'Обновление синхронизирует изменённые брони, а не скачивает период заново.'
+            )
+        else:
+            message = (
+                'Первичная полная загрузка может занять время. Данные сохраняются '
+                'партиями в локальную базу; незавершённую загрузку можно повторить.'
+            )
+        ctk.CTkLabel(
+            self, text=message, text_color='gray', justify='left',
+            wraplength=500
+        ).pack(fill='x', padx=30, pady=(2, 8))
+        ctk.CTkLabel(
+            self, text='Записи хранятся в локальной базе приложения.',
+            text_color='#667085', font=ctk.CTkFont(size=10)
+        ).pack(pady=(0, 4))
+
+        buttons = ctk.CTkFrame(self, fg_color='transparent')
+        buttons.pack(pady=(8, 14))
+        if complete:
+            ctk.CTkButton(
+                buttons, text='Использовать локальный архив', width=230,
+                fg_color='green', command=lambda: self.finish('use')
+            ).grid(row=0, column=0, padx=5, pady=4)
+            ctk.CTkButton(
+                buttons, text='Синхронизировать изменения', width=230,
+                command=lambda: self.finish('sync')
+            ).grid(row=0, column=1, padx=5, pady=4)
+        else:
+            ctk.CTkButton(
+                buttons, text='Загрузить полный архив', width=230,
+                fg_color='green', command=lambda: self.finish('sync')
+            ).grid(row=0, column=0, columnspan=2, padx=5, pady=4)
+        ctk.CTkButton(
+            buttons, text='Отмена', width=140, fg_color='gray',
+            command=self.cancel
+        ).grid(row=1, column=0, columnspan=2, padx=5, pady=4)
         self.grab_set()
         self.lift()
         self.focus_force()
