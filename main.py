@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.36"
+APP_VERSION = "3.37"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -710,7 +710,7 @@ class RealApp(TurNalogApp):
             save_config(self.cfg)
             return True
 
-        # Property ID is needed to locate even an offline local archive.
+        # Property ID is needed to locate the cached copy of this period.
         if not property_id or not property_id.isdigit():
             if not configure_travelline():
                 return
@@ -718,7 +718,8 @@ class RealApp(TurNalogApp):
 
         try:
             with HistoryDB() as db:
-                archive_stats = db.get_travelline_archive_stats(code, property_id)
+                archive_stats = db.get_travelline_archive_stats(
+                    code, property_id, qs, qe)
         except Exception as exc:
             log.exception('tl_archive_stats')
             messagebox.showerror(
@@ -750,7 +751,7 @@ class RealApp(TurNalogApp):
                 try:
                     with HistoryDB() as db:
                         archive_stats = db.get_travelline_archive_stats(
-                            code, property_id)
+                            code, property_id, qs, qe)
                 except Exception as exc:
                     log.exception('tl_archive_stats_after_config')
                     messagebox.showerror(
@@ -772,124 +773,104 @@ class RealApp(TurNalogApp):
             return
 
         cancel_event = threading.Event()
-        sync_completed = threading.Event()
+        period_saved = threading.Event()
         prog = TlProgressDialog(self, cancel_event)
         if not sync_requested:
-            prog.set_stage('Подготовка выгрузки из локального архива…')
+            prog.set_stage('Подготовка выгрузки из сохранённого периода…')
         self._tl_busy = True
-        self.set_status('TravelLine: синхронизация архива…' if sync_requested
-                        else 'TravelLine: фильтр по локальному архиву…')
+        self.set_status('TravelLine: загрузка выбранного периода…' if sync_requested
+                        else 'TravelLine: чтение локальной копии периода…')
 
         def work():
-            full_sync = False
-            sync_since = None
             inventory_warning = None
+            details = []
+            room_inventory = None
             if cancel_event.is_set():
                 raise TLCancelled()
 
             if sync_requested:
-                with HistoryDB() as db:
-                    state = db.get_travelline_archive_sync_state(code, property_id)
-                full_sync = not state or not bool(state.get('full_sync_complete'))
-                last_sync = (state or {}).get('last_sync_at')
-                if not full_sync and last_sync:
-                    try:
-                        sync_since = (date.fromisoformat(str(last_sync)[:10])
-                                      - timedelta(days=1)).isoformat()
-                    except ValueError:
-                        full_sync = True
-                elif not full_sync:
-                    full_sync = True
-                with HistoryDB() as db:
-                    db.begin_travelline_archive_sync(
-                        code, property_id, full=full_sync)
-
-                def save_batch(batch):
-                    with HistoryDB() as db:
-                        db.upsert_travelline_archive_bookings(
-                            code, property_id, batch)
-
                 def progress(stage, done, total):
                     try:
                         if stage == 'list':
-                            prefix = ('Полный архив: ' if full_sync
-                                      else 'Синхронизация: ')
                             self.after(0, lambda: (
-                                prog.set_stage(f'{prefix}список броней ({done})…'),
+                                prog.set_stage(
+                                    f'Список броней за {period_label} ({done})…'),
                                 self.set_status(
-                                    f'TravelLine: список броней ({done})…')))
+                                    f'TravelLine: список периода ({done})…')))
                         elif stage == 'inventory':
                             self.after(0, lambda: (
                                 prog.set_stage('Загрузка комнат и корпусов…'),
                                 self.set_status('TravelLine: номерной фонд…')))
                         else:
-                            prefix = ('Полный архив' if full_sync
-                                      else 'Обновление архива')
                             self.after(0, lambda: (
-                                prog.set_stage(f'{prefix}: детали броней…'),
+                                prog.set_stage(
+                                    f'Загружены детали броней периода: {done}/{total}…'),
                                 prog.set_determinate(),
                                 prog.set_progress(done, total),
                                 self.set_status(
-                                    f'TravelLine: {prefix.lower()} {done}/{total}…')))
+                                    f'TravelLine: детали броней периода {done}/{total}…')))
                     except Exception:
                         pass
 
+                include_inventory = code == 'tch'
                 try:
-                    include_inventory = code == 'tch'
                     try:
                         fetched = fetch_details(
                             tl_cfg['client_id'], tl_cfg['client_secret'],
-                            property_id, depth=sync_since,
-                            progress=progress, cancel_event=cancel_event,
+                            property_id, progress=progress,
+                            cancel_event=cancel_event,
                             include_room_inventory=include_inventory,
-                            details_callback=save_batch,
-                            retain_details=False)
+                            period_start=qs, period_end_exclusive=qe)
                     except TLApiError as inventory_error:
                         if (not include_inventory
                                 or 'номерной фонд' not in str(inventory_error).casefold()):
                             raise
-                        # Missing PMS permission must not prevent archiving bookings.
+                        # Номерной фонд необязателен для выгрузки броней.
                         inventory_warning = str(inventory_error)
                         log.warning('tl_inventory_unavailable: %s', inventory_warning)
                         fetched = fetch_details(
                             tl_cfg['client_id'], tl_cfg['client_secret'],
-                            property_id, depth=sync_since,
-                            progress=progress, cancel_event=cancel_event,
+                            property_id, progress=progress,
+                            cancel_event=cancel_event,
                             include_room_inventory=False,
-                            details_callback=save_batch,
-                            retain_details=False)
+                            period_start=qs, period_end_exclusive=qe)
                         include_inventory = False
 
-                    room_inventory = None
-                    if code == 'tch' and include_inventory:
-                        _, room_inventory = fetched
+                    if include_inventory:
+                        details, room_inventory = fetched
+                    else:
+                        details = fetched
                     if cancel_event.is_set():
                         raise TLCancelled()
+                    # Store a completed snapshot only after all period details
+                    # have arrived, so cancellation/failure leaves old cache intact.
                     with HistoryDB() as db:
+                        db.replace_travelline_archive_snapshot(
+                            code, property_id, qs, qe, details)
                         if room_inventory is not None:
                             db.put_travelline_inventory(
                                 code, property_id, room_inventory)
-                        db.finish_travelline_archive_sync(
-                            code, property_id, full=full_sync)
                         db.delete_travelline_caches_for_property(
                             code, property_id)
-                    sync_completed.set()
-                except Exception as sync_error:
-                    try:
-                        with HistoryDB() as db:
-                            db.fail_travelline_archive_sync(
-                                code, property_id,
-                                'Отменено пользователем' if isinstance(
-                                    sync_error, TLCancelled) else str(sync_error))
-                    except Exception:
-                        log.exception('tl_archive_mark_failed')
+                        details = db.get_travelline_archive_snapshot_bookings(
+                            code, property_id, qs, qe) or []
+                        if code == 'tch':
+                            room_inventory = db.get_travelline_inventory(
+                                code, property_id)
+                    period_saved.set()
+                except Exception:
                     raise
+            else:
+                with HistoryDB() as db:
+                    details = db.get_travelline_archive_snapshot_bookings(
+                        code, property_id, qs, qe)
+                    room_inventory = (db.get_travelline_inventory(code, property_id)
+                                      if code == 'tch' else None)
+                if details is None:
+                    raise TLApiError(
+                        'Для выбранного периода нет сохранённой копии. '
+                        'Выберите «Загрузить выбранный период».')
 
-            with HistoryDB() as db:
-                details = db.get_travelline_archive_bookings(
-                    code, property_id, qs, qe)
-                room_inventory = (db.get_travelline_inventory(code, property_id)
-                                  if code == 'tch' else None)
             if code == 'tch' and room_inventory is None and not inventory_warning:
                 inventory_warning = (
                     'Локальный номерной фонд ещё не сохранён. '
@@ -922,9 +903,10 @@ class RealApp(TurNalogApp):
                 log.exception('tl_inspection_export')
                 inspection_path = None
             with HistoryDB() as db:
-                final_stats = db.get_travelline_archive_stats(code, property_id)
+                final_stats = db.get_travelline_archive_stats(
+                    code, property_id, qs, qe)
             return (rows, rep, details, data_path, rooms_path, inspection_path,
-                    final_stats, inventory_warning, full_sync, sync_since)
+                    final_stats, inventory_warning)
 
         def format_bytes(value):
             size = max(0, int(value or 0))
@@ -943,22 +925,21 @@ class RealApp(TurNalogApp):
                 try:
                     with HistoryDB() as db:
                         partial_stats = db.get_travelline_archive_stats(
-                            code, property_id)
+                            code, property_id, qs, qe)
                     if not sync_requested:
-                        summary = ('Подготовка выгрузки отменена; локальный архив '
-                                   'не изменён.')
-                    elif sync_completed.is_set():
-                        summary = ('Синхронизация архива завершена; отменена только '
-                                   'подготовка файлов периода.')
+                        summary = ('Подготовка выгрузки отменена; сохранённая '
+                                   'копия периода не изменена.')
+                    elif period_saved.is_set():
+                        summary = ('Загрузка периода завершена; отменена только '
+                                   'подготовка файлов Excel.')
                     else:
-                        summary = ('Синхронизация отменена. Полученные партии '
-                                   'остались в базе; повторите её, чтобы завершить '
-                                   'обновление.')
-                    summary += (f'\nБроней сейчас в архиве: '
-                                f'{partial_stats["booking_count"]}.')
+                        summary = ('Загрузка периода отменена; прежняя сохранённая '
+                                   'копия периода не изменена.')
+                    summary += (f'\nБроней в сохранённой копии периода: '
+                                f'{partial_stats["period_booking_count"]}.')
                     self.set_status(
                         f'TravelLine: отменено · '
-                        f'{partial_stats["booking_count"]} броней в архиве')
+                        f'{partial_stats["period_booking_count"]} броней в периоде')
                     messagebox.showinfo('TravelLine', summary, parent=self)
                 except Exception:
                     self.set_status('TravelLine: отменено пользователем')
@@ -970,14 +951,16 @@ class RealApp(TurNalogApp):
                     try:
                         with HistoryDB() as db:
                             failed_stats = db.get_travelline_archive_stats(
-                                code, property_id)
-                        state_text = (
-                            'полная архивация ещё не завершена; повторите её.'
-                            if not failed_stats['full_sync_complete'] else
-                            'готовый архив сохранён; повторите синхронизацию для проверки изменений.')
-                        extra = (
-                            f'\n\nБроней в локальном архиве: '
-                            f'{failed_stats["booking_count"]}. {state_text}')
+                                code, property_id, qs, qe)
+                        if failed_stats['period_cached']:
+                            extra = (
+                                f'\n\nВ прежней локальной копии периода: '
+                                f'{failed_stats["period_booking_count"]} броней; '
+                                'она не перезаписана.')
+                        else:
+                            extra = (
+                                '\n\nКопия выбранного периода не сохранена; '
+                                'проверьте доступ к PMS API/PropertyReservation и повторите.')
                     except Exception:
                         pass
                 messagebox.showerror(
@@ -986,30 +969,33 @@ class RealApp(TurNalogApp):
                     parent=self)
                 return
             (rows, rep, details, data_path, rooms_path, inspection_path,
-             final_stats, inventory_warning, full_sync, sync_since) = result
+             final_stats, inventory_warning) = result
             pv.set_tl_files(data_path, rooms_path, inspection_path)
             self.set_status(
                 f'TravelLine: {rep["rows"]} строк за {quarter}/{year}, '
-                f'{period_label} · архив {final_stats["booking_count"]} броней')
+                f'{period_label} · периодных броней '
+                f'{final_stats["period_booking_count"]}')
             lines = [
                 f'Брони с ночами в выбранном периоде ({period_label}): '
                 f'{rep["in_quarter"]} (строк: {rep["rows"]})',
                 f'Пропущено отменённых: {rep["cancelled"]}',
-                f'В локальном архиве: {final_stats["booking_count"]:,} броней; '
+                f'В сохранённой копии периода: '
+                f'{final_stats["period_booking_count"]} броней.',
+                f'В локальной базе всего: {final_stats["booking_count"]:,} броней '
+                f'из {final_stats["archive_period_count"]} сохранённых периодов; '
                 f'сжатые данные: {format_bytes(final_stats["archive_bytes"])}; '
                 f'размер файла БД: {format_bytes(final_stats["database_bytes"])}.',
             ]
             if sync_requested:
-                if full_sync:
-                    lines.append('Первичная полная архивация завершена.')
-                else:
-                    lines.append(
-                        f'Архив синхронизирован по изменениям с {sync_since}; '
-                        'период выгрузки отфильтрован локально.')
+                lines.append(
+                    'Запрошены только брони, затрагивающие выбранный период; '
+                    'копия периода сохранена локально.')
             else:
-                lines.append('Использован локальный архив; запросов к API не было.')
-            if final_stats.get('last_sync_at'):
-                lines.append(f'Последняя синхронизация: {final_stats["last_sync_at"]}.')
+                lines.append(
+                    'Использована локальная копия периода; запросов к API не было.')
+            if final_stats.get('period_fetched_at'):
+                lines.append(
+                    f'Копия периода обновлена: {final_stats["period_fetched_at"]}.')
             if inventory_warning:
                 lines.append(f'⚠ Номерной фонд не обновлён: {inventory_warning}')
 
@@ -1103,8 +1089,8 @@ class RealApp(TurNalogApp):
                     log.warning('TL mismatch %s', mismatch)
             lines.append('Файлы подставлены — нажмите «Обработать и сохранить».')
             if inspection_path:
-                lines.append('Просмотр данных архива/диагностики доступен кнопкой '
-                             '«Просмотр данных API» под кнопкой TravelLine.')
+                lines.append('Просмотр данных выбранного периода/диагностики доступен '
+                             'кнопкой «Просмотр данных API» под кнопкой TravelLine.')
             else:
                 lines.append('⚠ Не удалось создать книгу просмотра; подробности '
                              'записаны в turnalog.log.')

@@ -110,6 +110,31 @@ class HistoryDB:
         );
         CREATE INDEX IF NOT EXISTS idx_travelline_archive_period
             ON travelline_archive(hotel_code, property_id, arrival_date, departure_date);
+        CREATE TABLE IF NOT EXISTS travelline_archive_snapshots (
+            hotel_code          TEXT NOT NULL,
+            property_id         TEXT NOT NULL,
+            period_start        TEXT NOT NULL,
+            period_end_exclusive TEXT NOT NULL,
+            fetched_at          TEXT NOT NULL,
+            booking_count       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (hotel_code, property_id, period_start, period_end_exclusive)
+        );
+        CREATE TABLE IF NOT EXISTS travelline_snapshot_bookings (
+            hotel_code           TEXT NOT NULL,
+            property_id          TEXT NOT NULL,
+            period_start         TEXT NOT NULL,
+            period_end_exclusive TEXT NOT NULL,
+            booking_number       TEXT NOT NULL,
+            arrival_date         TEXT,
+            departure_date       TEXT,
+            payload_blob         BLOB NOT NULL,
+            PRIMARY KEY (hotel_code, property_id, period_start,
+                         period_end_exclusive, booking_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_travelline_snapshot_period
+            ON travelline_snapshot_bookings(
+                hotel_code, property_id, period_start, period_end_exclusive,
+                arrival_date, departure_date);
         CREATE TABLE IF NOT EXISTS travelline_archive_state (
             hotel_code       TEXT NOT NULL,
             property_id      TEXT NOT NULL,
@@ -336,17 +361,134 @@ class HistoryDB:
         return [json.loads(zlib.decompress(row['payload_blob']).decode('utf-8'))
                 for row in rows]
 
-    def get_travelline_archive_stats(self, hotel_code, property_id):
+    def _find_travelline_archive_snapshot(self, hotel_code, property_id,
+                                          period_start, period_end_exclusive):
+        return self.con.execute(
+            """SELECT * FROM travelline_archive_snapshots
+               WHERE hotel_code=? AND property_id=?
+                 AND period_start<=? AND period_end_exclusive>=?
+               ORDER BY (julianday(period_end_exclusive)-julianday(period_start)),
+                        fetched_at DESC
+               LIMIT 1""",
+            (str(hotel_code), str(property_id), str(period_start),
+             str(period_end_exclusive))).fetchone()
+
+    def replace_travelline_archive_snapshot(self, hotel_code, property_id,
+                                            period_start, period_end_exclusive,
+                                            bookings):
+        """Атомарно сохраняет полную копию только выбранного периода."""
+        hotel_code, property_id = str(hotel_code), str(property_id)
+        period_start, period_end_exclusive = (
+            str(period_start), str(period_end_exclusive))
+        now = self._tl_archive_now()
+        records_by_number = {}
+        skipped = 0
+        for booking in bookings or []:
+            if not isinstance(booking, dict):
+                skipped += 1
+                continue
+            number = (booking.get('number') or booking.get('bookingNumber')
+                      or booking.get('id') or booking.get('bookingId'))
+            if number is None or str(number).strip() == '':
+                skipped += 1
+                continue
+            arrival, departure = self._tl_booking_period(booking)
+            payload = json.dumps(
+                booking, ensure_ascii=False, separators=(',', ':'),
+                default=lambda value: value.isoformat()
+                if hasattr(value, 'isoformat') else str(value))
+            records_by_number[str(number)] = (
+                hotel_code, property_id, period_start, period_end_exclusive,
+                str(number), arrival, departure,
+                sqlite3.Binary(zlib.compress(payload.encode('utf-8'), level=6)))
+        records = list(records_by_number.values())
+        self.con.execute('SAVEPOINT tl_period_snapshot')
+        try:
+            self.con.execute(
+                """DELETE FROM travelline_snapshot_bookings
+                   WHERE hotel_code=? AND property_id=? AND period_start=?
+                     AND period_end_exclusive=?""",
+                (hotel_code, property_id, period_start, period_end_exclusive))
+            self.con.executemany(
+                """INSERT INTO travelline_snapshot_bookings
+                   (hotel_code, property_id, period_start, period_end_exclusive,
+                    booking_number, arrival_date, departure_date, payload_blob)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                records)
+            self.con.execute(
+                """INSERT INTO travelline_archive_snapshots
+                   (hotel_code, property_id, period_start, period_end_exclusive,
+                    fetched_at, booking_count)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(hotel_code, property_id, period_start,
+                               period_end_exclusive) DO UPDATE SET
+                     fetched_at=excluded.fetched_at,
+                     booking_count=excluded.booking_count""",
+                (hotel_code, property_id, period_start, period_end_exclusive,
+                 now, len(records)))
+            self.con.execute('RELEASE SAVEPOINT tl_period_snapshot')
+        except Exception:
+            self.con.execute('ROLLBACK TO SAVEPOINT tl_period_snapshot')
+            self.con.execute('RELEASE SAVEPOINT tl_period_snapshot')
+            raise
+        return {'saved': len(records), 'skipped': skipped, 'fetched_at': now}
+
+    def get_travelline_archive_snapshot_bookings(
+            self, hotel_code, property_id, period_start, period_end_exclusive):
+        """Return a covering cached period or None when it is not complete."""
+        hotel_code, property_id = str(hotel_code), str(property_id)
+        period_start, period_end_exclusive = (
+            str(period_start), str(period_end_exclusive))
+        snapshot = self._find_travelline_archive_snapshot(
+            hotel_code, property_id, period_start, period_end_exclusive)
+        if not snapshot:
+            return None
+        rows = self.con.execute(
+            """SELECT payload_blob FROM travelline_snapshot_bookings
+               WHERE hotel_code=? AND property_id=? AND period_start=?
+                 AND period_end_exclusive=?
+                 AND (arrival_date IS NULL OR departure_date IS NULL
+                      OR (departure_date>? AND arrival_date<?))
+               ORDER BY arrival_date, booking_number""",
+            (hotel_code, property_id, snapshot['period_start'],
+             snapshot['period_end_exclusive'], period_start,
+             period_end_exclusive)).fetchall()
+        return [json.loads(zlib.decompress(row['payload_blob']).decode('utf-8'))
+                for row in rows]
+
+    def get_travelline_archive_stats(self, hotel_code, property_id,
+                                     period_start=None,
+                                     period_end_exclusive=None):
         hotel_code, property_id = str(hotel_code), str(property_id)
         state = self.con.execute(
             """SELECT * FROM travelline_archive_state
                WHERE hotel_code=? AND property_id=?""",
             (hotel_code, property_id)).fetchone()
-        totals = self.con.execute(
-            """SELECT COUNT(*) AS booking_count,
-                      COALESCE(SUM(length(payload_blob)), 0) AS archive_bytes
+        legacy_totals = self.con.execute(
+            """SELECT COALESCE(SUM(length(payload_blob)), 0)
                FROM travelline_archive WHERE hotel_code=? AND property_id=?""",
             (hotel_code, property_id)).fetchone()
+        snapshot_totals = self.con.execute(
+            """SELECT COALESCE(SUM(length(payload_blob)), 0)
+               FROM travelline_snapshot_bookings
+               WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()
+        booking_total = self.con.execute(
+            """SELECT COUNT(*) FROM (
+                   SELECT booking_number FROM travelline_archive
+                    WHERE hotel_code=? AND property_id=?
+                   UNION
+                   SELECT booking_number FROM travelline_snapshot_bookings
+                    WHERE hotel_code=? AND property_id=?)""",
+            (hotel_code, property_id, hotel_code, property_id)).fetchone()[0]
+        snapshot_count = self.con.execute(
+            """SELECT COUNT(*) FROM travelline_archive_snapshots
+               WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()[0]
+        latest_snapshot = self.con.execute(
+            """SELECT MAX(fetched_at) FROM travelline_archive_snapshots
+               WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()[0]
         inventory = self.con.execute(
             """SELECT COALESCE(length(CAST(inventory_json AS BLOB)), 0)
                FROM travelline_inventory WHERE hotel_code=? AND property_id=?""",
@@ -356,27 +498,57 @@ class HistoryDB:
         except (OSError, TypeError, ValueError):
             database_bytes = 0
         result = {
-            'booking_count': int(totals['booking_count']),
-            'archive_bytes': int(totals['archive_bytes']),
+            'booking_count': int(booking_total),
+            'archive_bytes': int(legacy_totals[0] or 0)
+                             + int(snapshot_totals[0] or 0),
+            'archive_period_count': int(snapshot_count),
             'inventory_bytes': int(inventory[0]) if inventory else 0,
             'database_bytes': int(database_bytes),
             'database_path': self.path,
+            'period_cached': False,
+            'period_booking_count': 0,
+            'period_fetched_at': None,
+            'period_snapshot_start': None,
+            'period_snapshot_end_exclusive': None,
             'full_sync_complete': False,
-            'last_sync_at': None,
+            'last_sync_at': latest_snapshot,
             'last_full_sync_at': None,
             'sync_started_at': None,
             'sync_kind': None,
             'last_error': None,
         }
-        if state:
+        if state and period_start is None and period_end_exclusive is None:
             result.update({
                 'full_sync_complete': bool(state['full_sync_complete']),
-                'last_sync_at': state['last_sync_at'],
+                'last_sync_at': latest_snapshot or state['last_sync_at'],
                 'last_full_sync_at': state['last_full_sync_at'],
                 'sync_started_at': state['sync_started_at'],
                 'sync_kind': state['sync_kind'],
                 'last_error': state['last_error'],
             })
+        if period_start is not None or period_end_exclusive is not None:
+            if period_start is None or period_end_exclusive is None:
+                raise ValueError('Для статистики периода нужны обе даты.')
+            snapshot = self._find_travelline_archive_snapshot(
+                hotel_code, property_id, period_start, period_end_exclusive)
+            if snapshot:
+                period_count = self.con.execute(
+                    """SELECT COUNT(*) FROM travelline_snapshot_bookings
+                       WHERE hotel_code=? AND property_id=? AND period_start=?
+                         AND period_end_exclusive=?
+                         AND (arrival_date IS NULL OR departure_date IS NULL
+                              OR (departure_date>? AND arrival_date<?))""",
+                    (hotel_code, property_id, snapshot['period_start'],
+                     snapshot['period_end_exclusive'], str(period_start),
+                     str(period_end_exclusive))).fetchone()[0]
+                result.update({
+                    'period_cached': True,
+                    'period_booking_count': int(period_count),
+                    'period_fetched_at': snapshot['fetched_at'],
+                    'period_snapshot_start': snapshot['period_start'],
+                    'period_snapshot_end_exclusive':
+                        snapshot['period_end_exclusive'],
+                })
         return result
 
     def get_travelline_archive_sync_state(self, hotel_code, property_id):

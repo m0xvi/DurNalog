@@ -291,7 +291,7 @@ class TlConfigDialog(ctk.CTkToplevel):
     def __init__(self, master, preset=None, hotel_name=''):
         super().__init__(master)
         self.title('TravelLine — подключение')
-        self.geometry('460x350')
+        self.geometry('460x390')
         self.resizable(False, False)
         self.transient(master)
         self.result = None
@@ -302,8 +302,10 @@ class TlConfigDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text='Данные из кабинета TravelLine: Настройки гостиницы →\n'
-                 'Подключения API. Для Чайковского также нужен доступ к\n'
-                 'PMS API/PropertyRoom (номерной фонд). Сохраняются локально.',
+                 'Подключения API. Для поиска по датам нужен PMS API/\n'
+                 'PropertyReservation; детали — через Read Reservation API.\n'
+                 'Для Чайковского нужен также PMS API/PropertyRoom.\n'
+                 'Данные сохраняются локально.',
             text_color='gray').pack(pady=(0, 10))
         self.vars = {}
         for key, label, secret in (
@@ -506,17 +508,17 @@ class TlCacheDialog(ctk.CTkToplevel):
 
 
 class TlArchiveDialog(ctk.CTkToplevel):
-    """Выбор локального архива TravelLine или его синхронизации."""
+    """Использование или обновление локального снимка выбранного периода."""
 
     def __init__(self, master, hotel_name, period_label, stats):
         super().__init__(master)
-        self.title('TravelLine — локальный архив')
+        self.title('TravelLine — данные периода')
         self.geometry('560x430')
         self.resizable(False, False)
         self.transient(master)
         self.result = None
         self.stats = stats or {}
-        complete = bool(self.stats.get('full_sync_complete'))
+        complete = bool(self.stats.get('period_cached'))
         self.protocol('WM_DELETE_WINDOW', self.cancel)
 
         def size_text(value):
@@ -526,8 +528,8 @@ class TlArchiveDialog(ctk.CTkToplevel):
                     return f'{size:.0f} {unit}' if unit == 'Б' else f'{size:.1f} {unit}'
                 size /= 1024
 
-        title = ('Архив TravelLine готов' if complete
-                 else 'Нужна полная загрузка архива')
+        title = ('Данные периода уже сохранены' if complete
+                 else 'Нужно загрузить выбранный период')
         ctk.CTkLabel(
             self, text=title,
             font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(16, 5))
@@ -536,13 +538,24 @@ class TlArchiveDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=12, weight='bold'), text_color='#344054'
         ).pack(pady=(0, 6))
 
-        last_sync = self.stats.get('last_sync_at') or 'ещё не выполнялась'
+        last_sync = self.stats.get('period_fetched_at') or 'ещё не выполнялась'
+        period_count = int(self.stats.get('period_booking_count', 0))
+        if complete:
+            period_info = (
+                f'В локальной копии периода: {period_count:,} броней\n'
+                f'Сохранено периодов: {int(self.stats.get("archive_period_count", 0))}'
+            )
+        else:
+            period_info = 'Локальная копия этого периода ещё не сохранена.'
         details = (
-            f'В локальном архиве: {int(self.stats.get("booking_count", 0)):,} броней\n'
-            f'Сжатые данные броней: {size_text(self.stats.get("archive_bytes", 0))}\n'
+            f'{period_info}\n'
+            f'Всего броней в локальной базе: '
+            f'{int(self.stats.get("booking_count", 0)):,}\n'
+            f'Сжатые данные: {size_text(self.stats.get("archive_bytes", 0))}\n'
             f'Инвентарь комнат: {size_text(self.stats.get("inventory_bytes", 0))}\n'
             f'Файл базы данных целиком: {size_text(self.stats.get("database_bytes", 0))}\n'
-            f'Последняя синхронизация: {last_sync}'
+            f'Последняя загрузка периода: '
+            f'{self.stats.get("period_fetched_at") or last_sync}'
         ).replace(',', ' ')
         ctk.CTkLabel(
             self, text=details, justify='left', anchor='w',
@@ -566,13 +579,13 @@ class TlArchiveDialog(ctk.CTkToplevel):
 
         if complete:
             message = (
-                'Выбор месяца/недели/квартала будет применён к этому архиву локально. '
-                'Обновление синхронизирует изменённые брони, а не скачивает период заново.'
+                'Можно использовать сохранённую копию без API или заново запросить '
+                'только брони, затрагивающие выбранный период.'
             )
         else:
             message = (
-                'Первичная полная загрузка может занять время. Данные сохраняются '
-                'партиями в локальную базу; незавершённую загрузку можно повторить.'
+                'TravelLine запросит только брони, затрагивающие выбранный период. '
+                'Всю историю объекта приложение не загружает.'
             )
         ctk.CTkLabel(
             self, text=message, text_color='gray', justify='left',
@@ -587,16 +600,16 @@ class TlArchiveDialog(ctk.CTkToplevel):
         buttons.pack(pady=(8, 14))
         if complete:
             ctk.CTkButton(
-                buttons, text='Использовать локальный архив', width=230,
+                buttons, text='Использовать сохранённый период', width=230,
                 fg_color='green', command=lambda: self.finish('use')
             ).grid(row=0, column=0, padx=5, pady=4)
             ctk.CTkButton(
-                buttons, text='Синхронизировать изменения', width=230,
+                buttons, text='Обновить только этот период', width=230,
                 command=lambda: self.finish('sync')
             ).grid(row=0, column=1, padx=5, pady=4)
         else:
             ctk.CTkButton(
-                buttons, text='Загрузить полный архив', width=230,
+                buttons, text='Загрузить выбранный период', width=230,
                 fg_color='green', command=lambda: self.finish('sync')
             ).grid(row=0, column=0, columnspan=2, padx=5, pady=4)
         ctk.CTkButton(
@@ -675,7 +688,7 @@ class TlProgressDialog(ctk.CTkToplevel):
         try:
             if total:
                 self.bar.set(min(1.0, max(0.0, done / total)))
-                self.count_lbl.configure(text=f'{done} / {total}')
+                self.count_lbl.configure(text=f'{done} / {total} броней')
         except Exception:
             pass
 

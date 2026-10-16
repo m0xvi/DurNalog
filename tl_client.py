@@ -295,15 +295,19 @@ def get_token(client_id, secret, cancel_event=None):
 def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                   progress=None, cancel_event=None,
                   include_room_inventory=False, details_callback=None,
-                  retain_details=True, details_batch_size=100):
-    """Получает список и детали броней, при необходимости — инвентарь.
+                  retain_details=True, details_batch_size=100,
+                  period_start=None, period_end_exclusive=None):
+    """Получает детали броней, при необходимости — номерной фонд.
 
-    Если задан ``depth``, брони фильтруются по lastModification >= depth;
-    ``depth=None`` запрашивает полный доступный архив. При
-    ``include_room_inventory`` возвращается также ответ PMS API. Callback
-    ``details_callback`` получает небольшие партии деталей по мере загрузки;
-    ``retain_details=False`` позволяет архивировать большие выгрузки, не
-    удерживая все записи в памяти. progress(stage, done, total); HTTP 401
+    Если переданы ``period_start`` и ``period_end_exclusive``, список броней
+    ищется через PMS PropertyReservation только в этом периоде, отдельно для
+    Active/Cancelled. Это не запускает полную историю. Без этих аргументов
+    действует прежний Read Reservation поток по ``lastModification``; при
+    ``depth=None`` он запрашивает всю доступную историю.
+
+    При ``include_room_inventory`` возвращается также ответ PMS API. Callback
+    ``details_callback`` получает партии деталей; ``retain_details=False``
+    отключает их накопление в памяти. progress(stage, done, total); HTTP 401
     обновляет OAuth-токен один раз. Ошибки никогда не содержат client_secret.
     """
     def cancelled():
@@ -324,8 +328,11 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                     f'{stage}: {text}. Проверьте соединение с интернетом; '
                     'TravelLine мог временно не ответить, повторите запрос позже.')
             if 'HTTP 403' in text:
-                if 'номерной фонд' in stage.casefold():
+                stage_key = stage.casefold()
+                if 'номерной фонд' in stage_key:
                     permission = 'чтение номерного фонда (PMS API/PropertyRoom)'
+                elif 'pms api' in stage_key or 'период' in stage_key:
+                    permission = 'поиск броней за период (PMS API/PropertyReservation)'
                 else:
                     permission = 'Read Reservation API'
                 return TLApiError(
@@ -371,8 +378,13 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                     'GET', path, token, params, cancel_event=cancel_event)
             except TLApiError as retry_error:
                 if 'HTTP 401' in str(retry_error):
-                    permission = ('PMS API/PropertyRoom' if 'номерной фонд'
-                                  in stage.casefold() else 'Read Reservation API')
+                    stage_key = stage.casefold()
+                    if 'номерной фонд' in stage_key:
+                        permission = 'PMS API/PropertyRoom'
+                    elif 'pms api' in stage_key or 'период' in stage_key:
+                        permission = 'PMS API/PropertyReservation'
+                    else:
+                        permission = 'Read Reservation API'
                     raise TLApiError(
                         f'{stage}: HTTP 401 даже после выдачи нового токена. '
                         'TravelLine не принимает авторизацию этого API-запроса. '
@@ -397,44 +409,118 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
         if progress:
             progress('inventory', 1, 1)
 
-    summaries, cont, page = [], None, 0
-    seen_tokens = set()
-    while True:
-        if cancelled():
-            raise TLCancelled()
-        page += 1
-        params = {'count': 1000}
-        if cont:
-            if cont in seen_tokens:
-                raise TLApiError('TravelLine повторил continueToken списка броней.')
-            seen_tokens.add(cont)
-            params['continueToken'] = cont
-        if depth:
-            params['lastModification'] = str(depth)[:10] + 'T00:00:00Z'
-        _, data = api_get(
-            f'/api/read-reservation/v1/properties/{property_id}/bookings',
-            params, f'Список броней (страница {page})')
-        if cancelled():
-            raise TLCancelled()
-        summaries.extend(data.get('bookingSummaries', []))
-        if progress:
-            progress('list', len(summaries), 0)
-        if not data.get('hasMoreData'):
-            break
-        cont = data.get('continueToken')
-        if not cont:
-            raise TLApiError(
-                'TravelLine сообщил о следующей странице, но не вернул continueToken.')
-        time.sleep(0.4)
+    summaries = []
+    period_query = period_start is not None or period_end_exclusive is not None
+    if period_query:
+        if period_start is None or period_end_exclusive is None:
+            raise ValueError('Для поиска по периоду нужны обе граничные даты.')
+        try:
+            from_day = date.fromisoformat(str(period_start)[:10])
+            to_day = date.fromisoformat(str(period_end_exclusive)[:10])
+        except (TypeError, ValueError):
+            raise ValueError('Границы периода должны быть датами ГГГГ-ММ-ДД.')
+        if to_day <= from_day:
+            raise ValueError('Конец периода должен быть позже его начала.')
+        if (to_day - from_day).days > 365:
+            raise ValueError('TravelLine ограничивает поиск периода 365 днями.')
+
+        seen_numbers = set()
+        for state in ('Active', 'Cancelled'):
+            page_token = None
+            seen_page_tokens = set()
+            page = 0
+            while True:
+                if cancelled():
+                    raise TLCancelled()
+                page += 1
+                params = {
+                    'state': state,
+                    'startAffectPeriodDateTime': f'{from_day.isoformat()}T00:00',
+                    'endAffectPeriodDateTime': f'{to_day.isoformat()}T00:00',
+                    'maxPageSize': 100,
+                }
+                if page_token:
+                    if page_token in seen_page_tokens:
+                        raise TLApiError(
+                            'TravelLine повторил pageToken поиска броней за период.')
+                    seen_page_tokens.add(page_token)
+                    params['pageToken'] = page_token
+                _, data = api_get(
+                    f'/api/pms/v2/properties/{property_id}/reservations/search',
+                    params,
+                    f'PMS API: список броней за период ({state}, страница {page})')
+                if cancelled():
+                    raise TLCancelled()
+                if not isinstance(data, dict):
+                    raise TLApiError(
+                        'TravelLine вернул некорректный ответ поиска броней за период.')
+                page_items = data.get('reservations') or []
+                if not isinstance(page_items, list):
+                    raise TLApiError(
+                        'TravelLine вернул некорректный список броней за период.')
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    number = (item.get('number') or item.get('bookingNumber'))
+                    if number is None or str(number).strip() == '':
+                        raise TLApiError(
+                            'В поиске TravelLine за период отсутствует номер брони.')
+                    number = str(number)
+                    if number not in seen_numbers:
+                        summaries.append({'number': number})
+                        seen_numbers.add(number)
+                if progress:
+                    progress('list', len(summaries), 0)
+                if not data.get('hasNextPage'):
+                    break
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    raise TLApiError(
+                        'TravelLine сообщил о следующей странице, но не вернул nextPageToken.')
+                time.sleep(0.4)
+    else:
+        cont, page = None, 0
+        seen_tokens = set()
+        while True:
+            if cancelled():
+                raise TLCancelled()
+            page += 1
+            params = {'count': 1000}
+            if cont:
+                if cont in seen_tokens:
+                    raise TLApiError(
+                        'TravelLine повторил continueToken списка броней.')
+                seen_tokens.add(cont)
+                params['continueToken'] = cont
+            if depth:
+                params['lastModification'] = str(depth)[:10] + 'T00:00:00Z'
+            _, data = api_get(
+                f'/api/read-reservation/v1/properties/{property_id}/bookings',
+                params, f'Список броней (страница {page})')
+            if cancelled():
+                raise TLCancelled()
+            summaries.extend(data.get('bookingSummaries', []))
+            if progress:
+                progress('list', len(summaries), 0)
+            if not data.get('hasMoreData'):
+                break
+            cont = data.get('continueToken')
+            if not cont:
+                raise TLApiError(
+                    'TravelLine сообщил о следующей странице, но не вернул continueToken.')
+            time.sleep(0.4)
     details = []
     detail_batch = []
     batch_size = max(1, int(details_batch_size or 100))
     total = len(summaries)
+    if progress:
+        progress('details', 0, total)
     try:
         for i, summary in enumerate(summaries, 1):
             if cancelled():
                 raise TLCancelled()
-            number = summary.get('number') if isinstance(summary, dict) else None
+            number = ((summary.get('number') or summary.get('bookingNumber'))
+                      if isinstance(summary, dict) else None)
             if not number:
                 raise TLApiError('В списке броней TravelLine отсутствует номер брони.')
             _, data = api_get(

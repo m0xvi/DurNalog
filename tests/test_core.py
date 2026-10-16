@@ -788,6 +788,53 @@ def test_travelline_cache_crud_and_refresh(tmp_path):
         assert db.get_travelline_cache(key) is None
 
 
+def test_travelline_period_snapshot_is_persistent_covering_and_replaceable(tmp_path):
+    path = str(tmp_path / 'travelline-periods.db')
+    def booking(number, arrival, departure, status='Active'):
+        return {
+            'number': number, 'status': status,
+            'roomStays': [{'stayDates': {
+                'arrivalDateTime': f'{arrival}T14:00:00',
+                'departureDateTime': f'{departure}T12:00:00'},
+                'total': {'priceAfterTax': 1000}}],
+        }
+
+    quarter = [
+        booking('TL-JUL', '2026-07-10', '2026-07-12'),
+        booking('TL-AUG', '2026-08-10', '2026-08-12'),
+        booking('TL-SEP', '2026-09-10', '2026-09-12'),
+    ]
+    with HistoryDB(path) as db:
+        assert db.get_travelline_archive_snapshot_bookings(
+            'tch', '8186', '2026-08-01', '2026-09-01') is None
+        saved = db.replace_travelline_archive_snapshot(
+            'tch', '8186', '2026-07-01', '2026-10-01', quarter)
+        assert saved['saved'] == 3 and saved['skipped'] == 0
+        assert [item['number'] for item in
+                db.get_travelline_archive_snapshot_bookings(
+                    'tch', '8186', '2026-08-01', '2026-09-01')] == ['TL-AUG']
+        stats = db.get_travelline_archive_stats(
+            'tch', '8186', '2026-08-01', '2026-09-01')
+        assert stats['period_cached'] is True
+        assert stats['period_booking_count'] == 1
+        assert stats['archive_period_count'] == 1
+        assert stats['archive_bytes'] > 0 and stats['database_bytes'] > 0
+
+    # Refreshing the same query replaces the snapshot, not appends stale bookings.
+    with HistoryDB(path) as db:
+        db.replace_travelline_archive_snapshot(
+            'tch', '8186', '2026-07-01', '2026-10-01', [
+                booking('TL-JUL', '2026-07-10', '2026-07-12', 'Cancelled'),
+                booking('TL-SEP', '2026-09-10', '2026-09-12'),
+            ])
+        assert db.get_travelline_archive_snapshot_bookings(
+            'tch', '8186', '2026-08-01', '2026-09-01') == []
+        stats = db.get_travelline_archive_stats(
+            'tch', '8186', '2026-08-01', '2026-09-01')
+        assert stats['period_cached'] is True
+        assert stats['period_booking_count'] == 0
+
+
 def test_travelline_full_archive_persists_compressed_bookings_and_sync_state(tmp_path):
     path = str(tmp_path / 'travelline-archive.db')
     booking = {

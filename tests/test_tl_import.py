@@ -1087,6 +1087,89 @@ def test_fetch_details_rejects_missing_continuation_token(monkeypatch):
         raise AssertionError('an incomplete paginated response must not be archived')
 
 
+def test_fetch_details_searches_only_selected_period_via_pms(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    progress = []
+    search_calls, detail_calls = [], []
+    search_path = '/api/pms/v2/properties/8186/reservations/search'
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path == search_path:
+            search_calls.append(dict(params))
+            state, page_token = params['state'], params.get('pageToken')
+            if state == 'Active' and not page_token:
+                return 200, {
+                    'reservations': [{'number': 'n1'}, {'number': 'n2'}],
+                    'hasNextPage': True, 'nextPageToken': 'active-page-2',
+                }
+            if state == 'Active':
+                return 200, {
+                    'reservations': [{'number': 'n3'}], 'hasNextPage': False,
+                }
+            return 200, {
+                'reservations': [{'number': 'n2'}, {'number': 'n4'}],
+                'hasNextPage': False,
+            }
+        if path.startswith('/api/read-reservation/v1/properties/8186/bookings/'):
+            number = path.rsplit('/', 1)[-1]
+            detail_calls.append(number)
+            return 200, {'booking': {'number': number, 'status': 'Active'}}
+        raise AssertionError(f'unexpected API request: {path}')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details(
+        'id', 'secret', '8186',
+        period_start='2026-07-01', period_end_exclusive='2026-10-01',
+        progress=lambda stage, done, total: progress.append((stage, done, total)))
+
+    assert [booking['number'] for booking in out] == ['n1', 'n2', 'n3', 'n4']
+    assert detail_calls == ['n1', 'n2', 'n3', 'n4']
+    assert len(search_calls) == 3
+    assert {call['state'] for call in search_calls} == {'Active', 'Cancelled'}
+    assert all(call['startAffectPeriodDateTime'] == '2026-07-01T00:00'
+               for call in search_calls)
+    assert all(call['endAffectPeriodDateTime'] == '2026-10-01T00:00'
+               for call in search_calls)
+    assert all(call['maxPageSize'] == 100 for call in search_calls)
+    assert all('lastModification' not in call for call in search_calls)
+    assert search_calls[1]['pageToken'] == 'active-page-2'
+    assert ('list', 4, 0) in progress
+    assert ('details', 4, 4) in progress
+
+
+def test_fetch_details_period_search_requires_next_page_token(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client, '_http', lambda *args, **kwargs: (
+        200, {'reservations': [], 'hasNextPage': True}))
+    try:
+        tl_client.fetch_details(
+            'id', 'secret', '8186', period_start='2026-07-01',
+            period_end_exclusive='2026-10-01')
+    except tl_client.TLApiError as exc:
+        assert 'nextPageToken' in str(exc)
+    else:
+        raise AssertionError('period search must not silently drop a result page')
+
+
+def test_fetch_details_period_search_403_names_the_required_api(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client, '_http', lambda *args, **kwargs: (
+        (_ for _ in ()).throw(tl_client.TLApiError('HTTP 403: forbidden'))))
+    try:
+        tl_client.fetch_details(
+            'id', 'secret', '8186', period_start='2026-07-01',
+            period_end_exclusive='2026-10-01')
+    except tl_client.TLApiError as exc:
+        assert 'PMS API/PropertyReservation' in str(exc)
+        assert 'secret' not in str(exc)
+    else:
+        raise AssertionError('period search should report missing PMS permission')
+
+
 def test_month_week_quarter_presets_are_clipped_to_quarter():
     from tl_client import period_preset_options
 
