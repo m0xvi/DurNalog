@@ -835,6 +835,33 @@ def test_travelline_period_snapshot_is_persistent_covering_and_replaceable(tmp_p
         assert stats['period_booking_count'] == 0
 
 
+def test_travelline_period_staging_resumes_and_clears_on_snapshot_commit(tmp_path):
+    path = str(tmp_path / 'travelline-staging.db')
+    start, end = '2026-07-01', '2026-10-01'
+    partial = {'number': 'TL-1', 'status': 'Active'}
+    complete = [partial, {'number': 'TL-2', 'status': 'Cancelled'}]
+
+    with HistoryDB(path) as db:
+        saved = db.upsert_travelline_period_staging_bookings(
+            'tch', '8186', start, end, [partial])
+        assert saved == {'saved': 1, 'skipped': 0}
+        stats = db.get_travelline_archive_stats('tch', '8186', start, end)
+        assert stats['period_cached'] is False
+        assert stats['period_staged_count'] == 1
+        assert db.get_travelline_period_staging_bookings(
+            'tch', '8186', start, end) == {'TL-1': partial}
+
+    with HistoryDB(path) as db:
+        db.replace_travelline_archive_snapshot(
+            'tch', '8186', start, end, complete)
+        assert db.get_travelline_period_staging_bookings(
+            'tch', '8186', start, end) == {}
+        stats = db.get_travelline_archive_stats('tch', '8186', start, end)
+        assert stats['period_cached'] is True
+        assert stats['period_booking_count'] == 2
+        assert stats['period_staged_count'] == 0
+
+
 def test_travelline_full_archive_persists_compressed_bookings_and_sync_state(tmp_path):
     path = str(tmp_path / 'travelline-archive.db')
     booking = {

@@ -528,8 +528,10 @@ class TlArchiveDialog(ctk.CTkToplevel):
                     return f'{size:.0f} {unit}' if unit == 'Б' else f'{size:.1f} {unit}'
                 size /= 1024
 
-        title = ('Данные периода уже сохранены' if complete
-                 else 'Нужно загрузить выбранный период')
+        staged_count = int(self.stats.get('period_staged_count', 0))
+        title = ('Данные периода уже сохранены' if complete else
+                 'Загрузка периода приостановлена' if staged_count else
+                 'Нужно загрузить выбранный период')
         ctk.CTkLabel(
             self, text=title,
             font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(16, 5))
@@ -545,6 +547,13 @@ class TlArchiveDialog(ctk.CTkToplevel):
                 f'В локальной копии периода: {period_count:,} броней\n'
                 f'Сохранено периодов: {int(self.stats.get("archive_period_count", 0))}'
             )
+            if staged_count:
+                period_info += (
+                    f'\nЗагружено для обновления: {staged_count} броней')
+        elif staged_count:
+            period_info = (
+                f'Пока сохранено деталей: {staged_count} броней. '
+                'Их можно не загружать повторно.')
         else:
             period_info = 'Локальная копия этого периода ещё не сохранена.'
         details = (
@@ -579,8 +588,13 @@ class TlArchiveDialog(ctk.CTkToplevel):
 
         if complete:
             message = (
-                'Можно использовать сохранённую копию без API или заново запросить '
-                'только брони, затрагивающие выбранный период.'
+                'Можно использовать сохранённую копию без API или обновить только '
+                'этот период. Уже сохранённые детали будут переиспользованы.'
+            )
+        elif staged_count:
+            message = (
+                'Продолжение пропустит уже сохранённые детали и запросит только '
+                'недостающие брони выбранного периода.'
             )
         else:
             message = (
@@ -609,8 +623,11 @@ class TlArchiveDialog(ctk.CTkToplevel):
             ).grid(row=0, column=1, padx=5, pady=4)
         else:
             ctk.CTkButton(
-                buttons, text='Загрузить выбранный период', width=230,
-                fg_color='green', command=lambda: self.finish('sync')
+                buttons,
+                text=('Продолжить загрузку периода' if staged_count
+                      else 'Загрузить выбранный период'),
+                width=230, fg_color='green',
+                command=lambda: self.finish('sync')
             ).grid(row=0, column=0, columnspan=2, padx=5, pady=4)
         ctk.CTkButton(
             buttons, text='Отмена', width=140, fg_color='gray',

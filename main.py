@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.37"
+APP_VERSION = "3.38"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -801,6 +801,12 @@ class RealApp(TurNalogApp):
                             self.after(0, lambda: (
                                 prog.set_stage('Загрузка комнат и корпусов…'),
                                 self.set_status('TravelLine: номерной фонд…')))
+                        elif stage == 'rate_limit':
+                            self.after(0, lambda: (
+                                prog.set_stage(
+                                    f'Лимит TravelLine: повтор через {done} с…'),
+                                self.set_status(
+                                    f'TravelLine: пауза API, повтор через {done} с…')))
                         else:
                             self.after(0, lambda: (
                                 prog.set_stage(
@@ -812,6 +818,15 @@ class RealApp(TurNalogApp):
                     except Exception:
                         pass
 
+                with HistoryDB() as db:
+                    staged_details = db.get_travelline_period_staging_bookings(
+                        code, property_id, qs, qe)
+
+                def save_staged_details(batch):
+                    with HistoryDB() as db:
+                        db.upsert_travelline_period_staging_bookings(
+                            code, property_id, qs, qe, batch)
+
                 include_inventory = code == 'tch'
                 try:
                     try:
@@ -820,6 +835,9 @@ class RealApp(TurNalogApp):
                             property_id, progress=progress,
                             cancel_event=cancel_event,
                             include_room_inventory=include_inventory,
+                            details_callback=save_staged_details,
+                            details_batch_size=25,
+                            cached_details=staged_details,
                             period_start=qs, period_end_exclusive=qe)
                     except TLApiError as inventory_error:
                         if (not include_inventory
@@ -833,6 +851,9 @@ class RealApp(TurNalogApp):
                             property_id, progress=progress,
                             cancel_event=cancel_event,
                             include_room_inventory=False,
+                            details_callback=save_staged_details,
+                            details_batch_size=25,
+                            cached_details=staged_details,
                             period_start=qs, period_end_exclusive=qe)
                         include_inventory = False
 
@@ -937,6 +958,10 @@ class RealApp(TurNalogApp):
                                    'копия периода не изменена.')
                     summary += (f'\nБроней в сохранённой копии периода: '
                                 f'{partial_stats["period_booking_count"]}.')
+                    if partial_stats['period_staged_count']:
+                        summary += (
+                            f'\nУже сохранено для продолжения: '
+                            f'{partial_stats["period_staged_count"]} броней.')
                     self.set_status(
                         f'TravelLine: отменено · '
                         f'{partial_stats["period_booking_count"]} броней в периоде')
@@ -952,15 +977,38 @@ class RealApp(TurNalogApp):
                         with HistoryDB() as db:
                             failed_stats = db.get_travelline_archive_stats(
                                 code, property_id, qs, qe)
-                        if failed_stats['period_cached']:
+                        error_text = str(err).casefold()
+                        if 'http 429' in error_text:
+                            extra = (
+                                '\n\nTravelLine ограничил частоту запросов. '
+                                'Дождитесь снятия лимита и продолжите загрузку '
+                                'того же периода.')
+                            if failed_stats['period_staged_count']:
+                                extra += (
+                                    f' Уже сохранены детали {failed_stats["period_staged_count"]} '
+                                    'броней; повторный запуск их пропустит.')
+                        elif '403' in error_text or 'доступ запрещён' in error_text:
+                            required = (
+                                'PMS API/PropertyReservation'
+                                if 'propertyreservation' in error_text or 'pms api' in error_text
+                                else 'Read Reservation API')
+                            extra = (
+                                f'\n\nПроверьте разрешение {required} '
+                                'в подключении TravelLine.')
+                        elif failed_stats['period_cached']:
                             extra = (
                                 f'\n\nВ прежней локальной копии периода: '
                                 f'{failed_stats["period_booking_count"]} броней; '
                                 'она не перезаписана.')
+                            if failed_stats['period_staged_count']:
+                                extra += (
+                                    f' Детали {failed_stats["period_staged_count"]} '
+                                    'броней сохранены для продолжения.')
                         else:
                             extra = (
                                 '\n\nКопия выбранного периода не сохранена; '
-                                'проверьте доступ к PMS API/PropertyReservation и повторите.')
+                                'запустите её загрузку ещё раз — уже полученные '
+                                'детали будут восстановлены из локальной базы.')
                     except Exception:
                         pass
                 messagebox.showerror(

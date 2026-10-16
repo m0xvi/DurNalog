@@ -1170,6 +1170,164 @@ def test_fetch_details_period_search_403_names_the_required_api(monkeypatch):
         raise AssertionError('period search should report missing PMS permission')
 
 
+def test_retry_after_parser_accepts_seconds_and_http_dates():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    from tl_client import _retry_after_seconds
+
+    assert _retry_after_seconds('7200') == 7200
+    assert _retry_after_seconds('inf') is None
+    value = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30),
+                            usegmt=True)
+    parsed = _retry_after_seconds(value)
+    assert parsed is not None and 0 <= parsed <= 30
+
+
+def test_fetch_details_retries_rate_limit_and_honors_retry_after(monkeypatch):
+    import tl_client
+    waits, detail_calls, progress = [], [], []
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', waits.append)
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}],
+                         'hasMoreData': False}
+        detail_calls.append(path)
+        if len(detail_calls) == 1:
+            raise tl_client.TLRateLimitError(
+                'HTTP 429: API rate limit exceeded', retry_after_seconds=3)
+        return 200, {'booking': {'number': 'n1', 'status': 'Active'}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details(
+        'id', 'secret', '8186', progress=lambda *args: progress.append(args))
+
+    assert out == [{'number': 'n1', 'status': 'Active'}]
+    assert len(detail_calls) == 2
+    assert waits == [3]
+    assert ('rate_limit', 3, 1) in progress
+
+
+def test_fetch_details_exponential_rate_limit_backoff(monkeypatch):
+    import tl_client
+    waits, detail_calls = [], []
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', waits.append)
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}],
+                         'hasMoreData': False}
+        detail_calls.append(path)
+        if len(detail_calls) <= 2:
+            raise tl_client.TLRateLimitError('HTTP 429: API rate limit exceeded')
+        return 200, {'booking': {'number': 'n1'}}
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    assert tl_client.fetch_details('id', 'secret', '8186') == [
+        {'number': 'n1'}]
+    assert waits == [10.0] * 18  # 60 s + 120 s, cancellable in 10 s slices
+
+
+def test_fetch_details_rate_limit_wait_can_be_cancelled(monkeypatch):
+    import threading
+    import tl_client
+    cancel_event = threading.Event()
+    detail_calls, stages, batches = [], [], []
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path.endswith('/bookings'):
+            return 200, {'bookingSummaries': [{'number': 'n1'}, {'number': 'n2'}],
+                         'hasMoreData': False}
+        number = path.rsplit('/', 1)[-1]
+        detail_calls.append(number)
+        if number == 'n1':
+            return 200, {'booking': {'number': number}}
+        raise tl_client.TLRateLimitError('HTTP 429: API rate limit exceeded')
+
+    def progress(stage, done, total):
+        stages.append(stage)
+        if stage == 'rate_limit':
+            cancel_event.set()
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    try:
+        tl_client.fetch_details(
+            'id', 'secret', '8186', cancel_event=cancel_event,
+            progress=progress, details_callback=batches.append,
+            details_batch_size=25)
+    except tl_client.TLCancelled:
+        pass
+    else:
+        raise AssertionError('rate-limit backoff should be cancellable')
+
+    assert detail_calls == ['n1', 'n2']
+    assert 'rate_limit' in stages
+    assert [[booking['number'] for booking in batch] for batch in batches] == [['n1']]
+
+
+def test_fetch_details_reuses_cached_period_details_and_checkpoints_batches(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    detail_calls, batches = [], []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path == '/api/pms/v2/properties/8186/reservations/search':
+            return 200, {
+                'reservations': [{'number': 'n1'}, {'number': 'n2'}],
+                'hasNextPage': False,
+            }
+        if path.startswith('/api/read-reservation/v1/properties/8186/bookings/'):
+            detail_calls.append(path.rsplit('/', 1)[-1])
+            return 200, {'booking': {'number': detail_calls[-1],
+                                     'status': 'Active'}}
+        raise AssertionError(f'unexpected API request: {path}')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    out = tl_client.fetch_details(
+        'id', 'secret', '8186', period_start='2026-07-01',
+        period_end_exclusive='2026-10-01',
+        cached_details={'n1': {'number': 'n1', 'status': 'Active'}},
+        details_callback=batches.append, details_batch_size=1)
+
+    assert [booking['number'] for booking in out] == ['n1', 'n2']
+    assert detail_calls == ['n2']
+    assert [[booking['number'] for booking in batch] for batch in batches] == [['n2']]
+
+
+def test_fetch_details_flushes_downloaded_batch_before_failure(monkeypatch):
+    import tl_client
+    monkeypatch.setattr(tl_client, 'get_token', lambda *args: 'tok')
+    monkeypatch.setattr(tl_client.time, 'sleep', lambda seconds: None)
+    batches = []
+
+    def fake(method, path, token=None, params=None, data=None, ctype=None):
+        if path == '/api/pms/v2/properties/8186/reservations/search':
+            return 200, {
+                'reservations': [{'number': 'n1'}, {'number': 'n2'}],
+                'hasNextPage': False,
+            }
+        if path.endswith('/n1'):
+            return 200, {'booking': {'number': 'n1'}}
+        raise tl_client.TLApiError('HTTP 500: temporary API error')
+
+    monkeypatch.setattr(tl_client, '_http', fake)
+    try:
+        tl_client.fetch_details(
+            'id', 'secret', '8186', period_start='2026-07-01',
+            period_end_exclusive='2026-10-01', details_callback=batches.append,
+            details_batch_size=25)
+    except tl_client.TLApiError:
+        pass
+    else:
+        raise AssertionError('the test booking should fail')
+    assert [[booking['number'] for booking in batch] for batch in batches] == [['n1']]
+
+
 def test_month_week_quarter_presets_are_clipped_to_quarter():
     from tl_client import period_preset_options
 
@@ -1401,6 +1559,26 @@ def test_http_converts_read_timeout_to_diagnostic(monkeypatch):
         assert '90 с' in str(exc)
     else:
         raise AssertionError('socket read timeout should be diagnosed')
+
+
+def test_http_converts_429_and_preserves_retry_after(monkeypatch):
+    import io
+    import urllib.error
+    import tl_client
+
+    def rate_limited(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            'https://partner.tlintegration.com/test', 429, 'Too Many Requests',
+            {'Retry-After': '42'}, io.BytesIO(b'API rate limit exceeded'))
+
+    monkeypatch.setattr(tl_client.urllib.request, 'urlopen', rate_limited)
+    try:
+        tl_client._http('GET', '/test')
+    except tl_client.TLRateLimitError as exc:
+        assert 'HTTP 429' in str(exc)
+        assert exc.retry_after_seconds == 42
+    else:
+        raise AssertionError('HTTP 429 should retain rate-limit metadata')
 
 
 def test_fetch_details_retries_a_transient_timeout(monkeypatch):

@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import sys
 import zlib
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from tax import dates_overlap
 
@@ -135,6 +135,19 @@ class HistoryDB:
             ON travelline_snapshot_bookings(
                 hotel_code, property_id, period_start, period_end_exclusive,
                 arrival_date, departure_date);
+        CREATE TABLE IF NOT EXISTS travelline_period_staging (
+            hotel_code           TEXT NOT NULL,
+            property_id          TEXT NOT NULL,
+            period_start         TEXT NOT NULL,
+            period_end_exclusive TEXT NOT NULL,
+            booking_number       TEXT NOT NULL,
+            fetched_at           TEXT NOT NULL,
+            payload_blob         BLOB NOT NULL,
+            PRIMARY KEY (hotel_code, property_id, period_start,
+                         period_end_exclusive, booking_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_travelline_period_staging_age
+            ON travelline_period_staging(hotel_code, property_id, fetched_at);
         CREATE TABLE IF NOT EXISTS travelline_archive_state (
             hotel_code       TEXT NOT NULL,
             property_id      TEXT NOT NULL,
@@ -373,6 +386,73 @@ class HistoryDB:
             (str(hotel_code), str(property_id), str(period_start),
              str(period_end_exclusive))).fetchone()
 
+    @staticmethod
+    def _tl_archive_staging_cutoff():
+        return (datetime.now(timezone.utc) - timedelta(hours=24)
+                ).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+    def upsert_travelline_period_staging_bookings(
+            self, hotel_code, property_id, period_start,
+            period_end_exclusive, bookings):
+        """Сохраняет частичный прогресс, чтобы продолжить без повтора деталей."""
+        now = self._tl_archive_now()
+        records_by_number = {}
+        skipped = 0
+        for booking in bookings or []:
+            if not isinstance(booking, dict):
+                skipped += 1
+                continue
+            number = (booking.get('number') or booking.get('bookingNumber')
+                      or booking.get('id') or booking.get('bookingId'))
+            if number is None or str(number).strip() == '':
+                skipped += 1
+                continue
+            payload = json.dumps(
+                booking, ensure_ascii=False, separators=(',', ':'),
+                default=lambda value: value.isoformat()
+                if hasattr(value, 'isoformat') else str(value))
+            records_by_number[str(number)] = (
+                str(hotel_code), str(property_id), str(period_start),
+                str(period_end_exclusive), str(number), now,
+                sqlite3.Binary(zlib.compress(payload.encode('utf-8'), level=6)))
+        self.con.executemany(
+            """INSERT INTO travelline_period_staging
+               (hotel_code, property_id, period_start, period_end_exclusive,
+                booking_number, fetched_at, payload_blob)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(hotel_code, property_id, period_start,
+                           period_end_exclusive, booking_number) DO UPDATE SET
+                 fetched_at=excluded.fetched_at,
+                 payload_blob=excluded.payload_blob""",
+            list(records_by_number.values()))
+        return {'saved': len(records_by_number), 'skipped': skipped}
+
+    def get_travelline_period_staging_bookings(
+            self, hotel_code, property_id, period_start, period_end_exclusive):
+        """Возвращает незавершённые детали не старше 24 часов."""
+        hotel_code, property_id = str(hotel_code), str(property_id)
+        period_start, period_end_exclusive = (
+            str(period_start), str(period_end_exclusive))
+        cutoff = self._tl_archive_staging_cutoff()
+        self.con.execute(
+            """DELETE FROM travelline_period_staging
+               WHERE hotel_code=? AND property_id=? AND period_start=?
+                 AND period_end_exclusive=? AND fetched_at<?""",
+            (hotel_code, property_id, period_start, period_end_exclusive, cutoff))
+        rows = self.con.execute(
+            """SELECT booking_number, payload_blob
+               FROM travelline_period_staging
+               WHERE hotel_code=? AND property_id=? AND period_start=?
+                 AND period_end_exclusive=? AND fetched_at>=?
+               ORDER BY booking_number""",
+            (hotel_code, property_id, period_start, period_end_exclusive,
+             cutoff)).fetchall()
+        return {
+            row['booking_number']:
+                json.loads(zlib.decompress(row['payload_blob']).decode('utf-8'))
+            for row in rows
+        }
+
     def replace_travelline_archive_snapshot(self, hotel_code, property_id,
                                             period_start, period_end_exclusive,
                                             bookings):
@@ -426,6 +506,11 @@ class HistoryDB:
                      booking_count=excluded.booking_count""",
                 (hotel_code, property_id, period_start, period_end_exclusive,
                  now, len(records)))
+            self.con.execute(
+                """DELETE FROM travelline_period_staging
+                   WHERE hotel_code=? AND property_id=? AND period_start=?
+                     AND period_end_exclusive=?""",
+                (hotel_code, property_id, period_start, period_end_exclusive))
             self.con.execute('RELEASE SAVEPOINT tl_period_snapshot')
         except Exception:
             self.con.execute('ROLLBACK TO SAVEPOINT tl_period_snapshot')
@@ -464,6 +549,10 @@ class HistoryDB:
             """SELECT * FROM travelline_archive_state
                WHERE hotel_code=? AND property_id=?""",
             (hotel_code, property_id)).fetchone()
+        staging_cutoff = self._tl_archive_staging_cutoff()
+        self.con.execute(
+            'DELETE FROM travelline_period_staging WHERE fetched_at<?',
+            (staging_cutoff,))
         legacy_totals = self.con.execute(
             """SELECT COALESCE(SUM(length(payload_blob)), 0)
                FROM travelline_archive WHERE hotel_code=? AND property_id=?""",
@@ -473,14 +562,23 @@ class HistoryDB:
                FROM travelline_snapshot_bookings
                WHERE hotel_code=? AND property_id=?""",
             (hotel_code, property_id)).fetchone()
+        staging_totals = self.con.execute(
+            """SELECT COALESCE(SUM(length(payload_blob)), 0)
+               FROM travelline_period_staging
+               WHERE hotel_code=? AND property_id=?""",
+            (hotel_code, property_id)).fetchone()
         booking_total = self.con.execute(
             """SELECT COUNT(*) FROM (
                    SELECT booking_number FROM travelline_archive
                     WHERE hotel_code=? AND property_id=?
                    UNION
                    SELECT booking_number FROM travelline_snapshot_bookings
+                    WHERE hotel_code=? AND property_id=?
+                   UNION
+                   SELECT booking_number FROM travelline_period_staging
                     WHERE hotel_code=? AND property_id=?)""",
-            (hotel_code, property_id, hotel_code, property_id)).fetchone()[0]
+            (hotel_code, property_id, hotel_code, property_id,
+             hotel_code, property_id)).fetchone()[0]
         snapshot_count = self.con.execute(
             """SELECT COUNT(*) FROM travelline_archive_snapshots
                WHERE hotel_code=? AND property_id=?""",
@@ -499,9 +597,11 @@ class HistoryDB:
             database_bytes = 0
         result = {
             'booking_count': int(booking_total),
-            'archive_bytes': int(legacy_totals[0] or 0)
-                             + int(snapshot_totals[0] or 0),
+            'archive_bytes': (int(legacy_totals[0] or 0)
+                              + int(snapshot_totals[0] or 0)
+                              + int(staging_totals[0] or 0)),
             'archive_period_count': int(snapshot_count),
+            'period_staged_count': 0,
             'inventory_bytes': int(inventory[0]) if inventory else 0,
             'database_bytes': int(database_bytes),
             'database_path': self.path,
@@ -529,6 +629,13 @@ class HistoryDB:
         if period_start is not None or period_end_exclusive is not None:
             if period_start is None or period_end_exclusive is None:
                 raise ValueError('Для статистики периода нужны обе даты.')
+            staged_count = self.con.execute(
+                """SELECT COUNT(*) FROM travelline_period_staging
+                   WHERE hotel_code=? AND property_id=? AND period_start=?
+                     AND period_end_exclusive=? AND fetched_at>=?""",
+                (hotel_code, property_id, str(period_start),
+                 str(period_end_exclusive), staging_cutoff)).fetchone()[0]
+            result['period_staged_count'] = int(staged_count)
             snapshot = self._find_travelline_archive_snapshot(
                 hotel_code, property_id, period_start, period_end_exclusive)
             if snapshot:

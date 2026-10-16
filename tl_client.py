@@ -14,11 +14,13 @@ import hashlib
 import json
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from email.utils import parsedate_to_datetime
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import openpyxl
 
@@ -26,6 +28,8 @@ HOST = 'https://partner.tlintegration.com'
 HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
+TL_DETAILS_REQUESTS_PER_HOUR = 3800  # ниже лимита TravelLine с запасом
+TL_DETAILS_MIN_INTERVAL_SECONDS = 0.36
 # Increment if the prepared-row/report cache format changes incompatibly.
 TL_CACHE_VERSION = 7
 
@@ -81,6 +85,14 @@ class TLApiError(Exception):
 
 class TLNetworkError(TLApiError):
     """Временная ошибка соединения/тайм-аут, которую можно повторить."""
+
+
+class TLRateLimitError(TLApiError):
+    """HTTP 429 с необязательным интервалом Retry-After от TravelLine."""
+
+    def __init__(self, message, retry_after_seconds=None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class TLCancelled(Exception):
@@ -225,6 +237,22 @@ def decode_tl_import_cache(payload):
     return rows, report
 
 
+def _retry_after_seconds(value):
+    if value in (None, ''):
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
 def _http(method, path, token=None, params=None, data=None, ctype=None):
     url = HOST + path
     if params:
@@ -244,6 +272,12 @@ def _http(method, path, token=None, params=None, data=None, ctype=None):
             detail = e.read().decode('utf-8', 'replace')[:300]
         except Exception:
             detail = ''
+        if e.code == 429:
+            headers = getattr(e, 'headers', None)
+            retry_after = _retry_after_seconds(
+                headers.get('Retry-After') if headers else None)
+            raise TLRateLimitError(
+                f'HTTP 429: {detail}', retry_after_seconds=retry_after)
         raise TLApiError(f'HTTP {e.code}: {detail}')
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, 'reason', e)
@@ -296,7 +330,8 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                   progress=None, cancel_event=None,
                   include_room_inventory=False, details_callback=None,
                   retain_details=True, details_batch_size=100,
-                  period_start=None, period_end_exclusive=None):
+                  period_start=None, period_end_exclusive=None,
+                  cached_details=None):
     """Получает детали броней, при необходимости — номерной фонд.
 
     Если переданы ``period_start`` и ``period_end_exclusive``, список броней
@@ -306,12 +341,34 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
     ``depth=None`` он запрашивает всю доступную историю.
 
     При ``include_room_inventory`` возвращается также ответ PMS API. Callback
-    ``details_callback`` получает партии деталей; ``retain_details=False``
-    отключает их накопление в памяти. progress(stage, done, total); HTTP 401
-    обновляет OAuth-токен один раз. Ошибки никогда не содержат client_secret.
+    ``details_callback`` получает партии деталей; ``cached_details`` содержит
+    уже сохранённые детали для возобновления загрузки без повторных запросов.
+    ``retain_details=False`` отключает накопление ответов в памяти.
+    progress(stage, done, total); HTTP 401 обновляет OAuth-токен один раз.
+    Ошибки никогда не содержат client_secret.
     """
     def cancelled():
         return cancel_event is not None and cancel_event.is_set()
+
+    def wait_with_progress(seconds, attempt=0):
+        remaining = max(0.0, float(seconds))
+        last_reported = None
+        while remaining > 0:
+            if cancelled():
+                raise TLCancelled()
+            seconds_left = math.ceil(remaining)
+            if (progress and seconds_left != last_reported
+                    and (last_reported is None or seconds_left % 10 == 0
+                         or seconds_left <= 5)):
+                progress('rate_limit', seconds_left, attempt)
+                last_reported = seconds_left
+            interval = min(10.0, remaining)
+            if cancel_event is not None:
+                if cancel_event.wait(interval):
+                    raise TLCancelled()
+            else:
+                time.sleep(interval)
+            remaining -= interval
 
     if cancelled():
         raise TLCancelled()
@@ -352,17 +409,28 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                 'GET', path, token, params, cancel_event=cancel_event)
         except TLApiError as first:
             if 'HTTP 429' in str(first):
-                # Учитываем лимит TravelLine, но оставляем пользователю отмену.
-                for _ in range(60):
-                    if cancelled():
-                        raise TLCancelled()
-                    time.sleep(1)
-                try:
-                    return _http_with_retry(
-                        'GET', path, token, params,
-                        cancel_event=cancel_event)
-                except TLApiError as retry_error:
-                    raise contextual(retry_error)
+                # Сначала уважаем Retry-After, иначе используем растущий backoff.
+                # Ждать можно отменить; детали предыдущих броней сохраняются batch-callback.
+                rate_error = first
+                max_retries = 8
+                for retry in range(max_retries):
+                    retry_after = getattr(rate_error, 'retry_after_seconds', None)
+                    if retry_after is None:
+                        delay = min(60 * (2 ** retry), 1800)
+                    else:
+                        delay = max(1.0, retry_after)
+                    wait_with_progress(delay, retry + 1)
+                    try:
+                        return _http_with_retry(
+                            'GET', path, token, params,
+                            cancel_event=cancel_event)
+                    except TLCancelled:
+                        raise
+                    except TLApiError as retry_error:
+                        if 'HTTP 429' not in str(retry_error):
+                            raise contextual(retry_error)
+                        rate_error = retry_error
+                raise contextual(rate_error)
             if 'HTTP 401' not in str(first):
                 raise contextual(first)
             # Токен действует 15 минут. Обновляем его по 401 и повторяем
@@ -513,8 +581,32 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
     detail_batch = []
     batch_size = max(1, int(details_batch_size or 100))
     total = len(summaries)
+    cached_by_number = {
+        str(number): booking for number, booking in (cached_details or {}).items()
+        if isinstance(booking, dict)
+    }
+    detail_request_times = deque()
     if progress:
         progress('details', 0, total)
+
+    def wait_for_hourly_slot():
+        while True:
+            if cancelled():
+                raise TLCancelled()
+            now = time.monotonic()
+            while (detail_request_times
+                   and now - detail_request_times[0] >= 3600):
+                detail_request_times.popleft()
+            if len(detail_request_times) < TL_DETAILS_REQUESTS_PER_HOUR:
+                return
+            wait_with_progress(3600 - (now - detail_request_times[0]))
+
+    def flush_detail_batch():
+        nonlocal detail_batch
+        if detail_batch and details_callback:
+            batch, detail_batch = detail_batch, []
+            details_callback(batch)
+
     try:
         for i, summary in enumerate(summaries, 1):
             if cancelled():
@@ -523,32 +615,39 @@ def fetch_details(client_id, secret, property_id, depth='2024-01-01',
                       if isinstance(summary, dict) else None)
             if not number:
                 raise TLApiError('В списке броней TravelLine отсутствует номер брони.')
-            _, data = api_get(
-                f'/api/read-reservation/v1/properties/{property_id}'
-                f'/bookings/{number}',
-                stage=f'Бронь {number}')
-            booking = data.get('booking', {})
-            if not isinstance(booking, dict):
-                booking = {}
-            if not booking.get('number'):
-                booking = dict(booking, number=str(number))
-            if retain_details:
+            number = str(number)
+            booking = cached_by_number.get(number)
+            if booking is None:
+                wait_for_hourly_slot()
+                _, data = api_get(
+                    f'/api/read-reservation/v1/properties/{property_id}'
+                    f'/bookings/{number}',
+                    stage=f'Бронь {number}')
+                booking = data.get('booking', {})
+                if not isinstance(booking, dict):
+                    booking = {}
+                if not booking.get('number'):
+                    booking = dict(booking, number=number)
+                detail_request_times.append(time.monotonic())
+                if retain_details:
+                    details.append(booking)
+                if details_callback:
+                    detail_batch.append(booking)
+                    if len(detail_batch) >= batch_size:
+                        flush_detail_batch()
+                if i < total:
+                    # Keep below the minute quota even when responses are fast.
+                    time.sleep(TL_DETAILS_MIN_INTERVAL_SECONDS)
+            elif retain_details:
                 details.append(booking)
-            if details_callback:
-                detail_batch.append(booking)
-                if len(detail_batch) >= batch_size:
-                    details_callback(detail_batch)
-                    detail_batch = []
             if progress:
                 progress('details', i, total)
-            # Read Reservation limit for details: 200 requests/minute.
-            time.sleep(0.31)
-    except TLCancelled:
-        if detail_batch and details_callback:
-            details_callback(detail_batch)
+    except Exception:
+        # Checkpoint successful details even when a later request is rate-limited
+        # or the user cancels; a retry will skip these booking numbers.
+        flush_detail_batch()
         raise
-    if detail_batch and details_callback:
-        details_callback(detail_batch)
+    flush_detail_batch()
     return (details, inventory) if include_room_inventory else details
 
 
