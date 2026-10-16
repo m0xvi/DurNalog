@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """Импорт броней и номерного фонда из TravelLine API.
 
-Покрывает Чайковский (8186) и Дону (479): забирает брони за квартал,
-раскладывает проживание/допуслуги/каналы и пишет Excel той же формы,
+Покрывает Чайковский (8186) и Дону (479): загружает изменённые брони,
+отбирает ночи выбранного периода внутри квартала, раскладывает проживание/
+допуслуги/каналы и пишет Excel той же формы,
 что ожидает обработка (канонический маппинг — диалог колонок не нужен).
 Read Reservation возвращает roomStays[].roomId; для Чайковского он
 сопоставляется с комнатами/корпусами из PMS API PropertyRoom. Если
@@ -17,7 +18,7 @@ from collections import defaultdict
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import openpyxl
 
@@ -26,7 +27,7 @@ HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
-TL_CACHE_VERSION = 6
+TL_CACHE_VERSION = 7
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -54,6 +55,8 @@ COL_TL_DISCOUNT_ADDED = 'Скидка добавлена к налоговой �
 COL_TL_DISCOUNT_RETAINED = 'Скидка сохранена в базе, ₽'
 COL_TL_DISCOUNT_RULE = 'Правило скидки TravelLine'
 COL_TL_TAX_BASE = 'Налоговая база TravelLine, ₽'
+COL_TL_PERIOD_PRICE = 'Стоимость проживания за выбранный период TravelLine, ₽'
+COL_TL_PERIOD_STATUS = 'Распределение по периоду TravelLine'
 COL_TL_DAILY_SUM = 'Сумма dailyRates'
 COL_TL_DAILY_CHECK = 'Сверка dailyRates'
 ROOM_LABEL_TEXT_PREFIX = '__TL_ROOM_LABEL__:'
@@ -67,7 +70,7 @@ TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL,
             COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
             COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
             COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
-            COL_TL_TAX_BASE]
+            COL_TL_TAX_BASE, COL_TL_PERIOD_PRICE, COL_TL_PERIOD_STATUS]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
                 'building_name': COL_BUILDING_NAME, 'bron': COL_BRON}
 
@@ -116,6 +119,18 @@ def _campaign_name_list(values):
             seen.add(key)
             names.append(name)
     return names
+
+
+def inclusive_period_bounds(start_value, end_value):
+    """Convert inclusive YYYY-MM-DD dates to an ISO [start, end) interval."""
+    try:
+        start = date.fromisoformat(str(start_value)[:10])
+        end = date.fromisoformat(str(end_value)[:10])
+    except (TypeError, ValueError):
+        raise ValueError('Даты периода должны быть в формате ГГГГ-ММ-ДД.')
+    if end < start:
+        raise ValueError('Дата окончания периода должна быть не раньше даты начала.')
+    return start.isoformat(), (end + timedelta(days=1)).isoformat()
 
 
 def tl_import_cache_key(hotel_code, property_id, period_start, period_end,
@@ -539,13 +554,169 @@ def _daily_rate_audit(stay):
     return daily_sum, f'Расхождение {difference:+.2f} ₽'
 
 
-def _stay_overlaps(stay_dates, qs, qe):
+def _parse_day(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     try:
-        a = (stay_dates.get('arrivalDateTime') or '')[:10]
-        d = (stay_dates.get('departureDateTime') or '')[:10]
-        return bool(a and d and a < qe and d > qs)
-    except Exception:
-        return False
+        return date.fromisoformat(str(value or '')[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _stay_period(stay_dates, qs, qe):
+    """Return stay-night and selected-period bounds; checkout is exclusive."""
+    stay_dates = stay_dates if isinstance(stay_dates, dict) else {}
+    arrival = _parse_day(stay_dates.get('arrivalDateTime'))
+    departure = _parse_day(stay_dates.get('departureDateTime'))
+    period_start, period_end = _parse_day(qs), _parse_day(qe)
+    if (not arrival or not departure or not period_start or not period_end
+            or departure <= arrival or period_end <= period_start):
+        return None
+    nights = (departure - arrival).days
+    selected_start = max(arrival, period_start)
+    selected_end = min(departure, period_end)
+    selected_nights = max(0, (selected_end - selected_start).days)
+    if selected_nights <= 0:
+        return None
+    return {
+        'arrival': arrival, 'departure': departure, 'nights': nights,
+        'start': selected_start, 'end': selected_end,
+        'period_nights': selected_nights,
+        'full': selected_nights == nights,
+    }
+
+
+def _stay_overlaps(stay_dates, qs, qe):
+    return _stay_period(stay_dates, qs, qe) is not None
+
+
+def _complete_daily_rate_map(stay, arrival, departure, expected_total):
+    """Use complete, reconciling nightly rates for a partial-period split."""
+    rates = stay.get('dailyRates') or []
+    if not isinstance(rates, list) or not rates:
+        return None, 'Нет dailyRates'
+    expected_dates = [arrival + timedelta(days=offset)
+                      for offset in range((departure - arrival).days)]
+    if len(rates) != len(expected_dates):
+        return None, 'dailyRates неполные: число тарифов не равно числу ночей'
+
+    by_date = {}
+    for rate in rates:
+        if not isinstance(rate, dict):
+            return None, 'dailyRates неполные: некорректная строка тарифа'
+        rate_date = _parse_day(rate.get('date'))
+        if rate_date is None or rate_date in by_date:
+            return None, 'dailyRates неполные: отсутствует или повторяется дата'
+        by_date[rate_date] = rate
+    if set(by_date) != set(expected_dates):
+        return None, 'dailyRates не покрывают каждую ночь проживания'
+
+    expected_total = _number(expected_total)
+    if expected_total is None:
+        return None, 'Не удалось определить полную стоимость проживания'
+    # Prefer after-tax values when they reconcile to the unchanged stay total;
+    # otherwise accept before-tax values only when they reconcile exactly too.
+    for field in ('priceAfterTax', 'priceBeforeTax'):
+        values = {}
+        for rate_date, rate in by_date.items():
+            price = _number(rate.get(field))
+            if price is None:
+                break
+            values[rate_date] = price
+        if len(values) == len(expected_dates):
+            total = round(sum(values.values()), 2)
+            if abs(total - expected_total) <= 0.02:
+                return values, ''
+    return None, 'Сумма dailyRates не совпадает со стоимостью проживания'
+
+
+_SERVICE_DATE_KEYS = {
+    'date', 'servicedate', 'servicedatetime', 'dateofservice',
+    'operationdate', 'startdate', 'startdatetime', 'datetime',
+    'performedat', 'servicedatefrom',
+}
+
+
+def _service_day(service):
+    """Return a service date only when the API supplied a date field."""
+    if not isinstance(service, dict):
+        return None
+    for key, value in service.items():
+        normalized = re.sub(r'[^a-z]', '', str(key).casefold())
+        if normalized in _SERVICE_DATE_KEYS:
+            parsed = _parse_day(value)
+            if parsed is not None:
+                return parsed
+    for value in service.values():
+        if isinstance(value, dict):
+            parsed = _service_day(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _services_in_period(services, start, end):
+    selected, undated = [], 0
+    for service in services or []:
+        if not isinstance(service, dict):
+            continue
+        service_date = _service_day(service)
+        if service_date is None:
+            if _money(service.get('total')) > 0:
+                undated += 1
+        elif start <= service_date < end:
+            selected.append(service)
+    return selected, undated
+
+
+def _discount_for_period(discount, stay_period):
+    """Allocate only discounts whose affected nights are identified."""
+    if stay_period['full']:
+        return {
+            'amount': discount['amount'], 'added': discount['added'],
+            'retained': discount['retained'], 'unallocated': False,
+            'rule': discount['rule'],
+        }
+    if discount['amount'] <= 0:
+        return {'amount': 0.0, 'added': 0.0, 'retained': 0.0,
+                'unallocated': False, 'rule': discount['rule']}
+    dates = []
+    if discount.get('dates') and discount['dates'] != 'Не распределена по датам':
+        dates = [parsed for parsed in
+                 (_parse_day(value) for value in discount['dates'].split(', '))
+                 if parsed is not None]
+    if not dates:
+        return {
+            'amount': None, 'added': 0.0, 'retained': 0.0,
+            'unallocated': True,
+            'rule': ('Частичный период: дата агрегированной скидки не '
+                     'определена; скидка не добавлена к базе'),
+        }
+    selected = [day for day in dates
+                if stay_period['start'] <= day < stay_period['end']]
+    if not selected:
+        return {'amount': 0.0, 'added': 0.0, 'retained': 0.0,
+                'unallocated': False,
+                'rule': 'Ночи со скидкой находятся вне выбранного периода'}
+    share = len(selected) / len(set(dates))
+    if len(selected) == len(set(dates)):
+        amount = discount['amount']
+        added = discount['added']
+        retained = discount['retained']
+    else:
+        amount = round(discount['amount'] * share, 2)
+        added = round(discount['added'] * share, 2)
+        retained = round(discount['retained'] * share, 2)
+    return {
+        'amount': amount, 'added': added, 'retained': retained,
+        'unallocated': False,
+        'rule': ('Ночи скидки определены по dailyRates; в базу добавлена '
+                 'только часть выбранного периода'
+                 if added else
+                 'Кампания-исключение: скидка сохранена по подтверждённым ночам'),
+    }
 
 
 def _parse_dt(s):
@@ -721,32 +892,46 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
                      campaigns_with_discount=None):
     """Детали броней -> (строки Excel, отчёт).
 
-    qs/qe — 'YYYY-MM-DD' границ квартала. Отменённые пропускаются.
-    Арифметика каждой брони с платными допами самопроверяется:
-    A: итог == проживание + допы; B: итог == проживание (допы внутри).
-    Иначе бронь помечается расхождением (база = проживание как есть).
-    При наличии инвентаря roomId сопоставляется с номером/корпусом; ID
-    незанятого или неизвестного номера не переносится в отчёт как номер.
-    Скидка корректирует только отдельную налоговую базу; импортированная
-    цена проживания остаётся со скидкой. Исключения задаются в
-    ``campaigns_with_discount``.
+    ``qs``/``qe`` задают выбранные ночи полуоткрытым интервалом
+    ``[qs, qe)``; дата выезда не считается ночью. Каждый ``roomStay`` —
+    отдельная строка с собственными ценой, номером и налоговой базой.
+    Если выбран лишь фрагмент проживания, сумма проживания берётся только
+    из полного набора сверяющихся ``dailyRates``. Без него строка пропускается
+    и попадает в предупреждения, без пропорциональной оценки.
+
+    Исходные COL_PRICE и COL_TOTAL остаются API-значениями для комиссии и
+    аудита. Периодная сумма и налоговая база хранятся отдельно.
     """
+    period_start, period_end = _parse_day(qs), _parse_day(qe)
     room_map = accommodation_room_map(accommodation_inventory)
     has_room_inventory = accommodation_inventory is not None
     rows, votes = [], {'A': 0, 'B': 0, '?': 0}
-    rep = {'total': len(details), 'in_quarter': 0, 'cancelled': 0,
-           'rows': 0, 'mismatch': [], 'channels': {},
-           'discount_audit': {
-               'stays_with_discount': 0, 'discount_amount': 0.0,
-               'discount_base_added': 0.0,
-               'discount_exception_retained': 0.0,
-               'discount_exception_stays': 0,
-               'discounts_missing_campaign_name': 0,
-               'nights_with_discount_identified': 0,
-               'discounts_without_night_attribution': 0,
-               'daily_rates_checked': 0, 'daily_rates_matched': 0,
-               'daily_rates_mismatched': 0, 'daily_rates_missing': 0,
-           }}
+    rep = {
+        'total': len(details), 'in_quarter': 0, 'cancelled': 0,
+        'rows': 0, 'mismatch': [], 'channels': {},
+        'period': {
+            'start': qs, 'end_exclusive': qe,
+            'end_inclusive': ((period_end - timedelta(days=1)).isoformat()
+                              if period_end else ''),
+        },
+        'period_warnings': [],
+        'period_allocation': {
+            'partial_stays': 0, 'allocated_partial_stays': 0,
+            'skipped_partial_stays': 0, 'undated_services': 0,
+            'discounts_without_night_attribution': 0,
+        },
+        'discount_audit': {
+            'stays_with_discount': 0, 'discount_amount': 0.0,
+            'discount_base_added': 0.0,
+            'discount_exception_retained': 0.0,
+            'discount_exception_stays': 0,
+            'discounts_missing_campaign_name': 0,
+            'nights_with_discount_identified': 0,
+            'discounts_without_night_attribution': 0,
+            'daily_rates_checked': 0, 'daily_rates_matched': 0,
+            'daily_rates_mismatched': 0, 'daily_rates_missing': 0,
+        },
+    }
     if has_room_inventory:
         rep['room_assignments'] = {
             'inventory_rooms': len(room_map), 'assigned': 0, 'unassigned': 0,
@@ -754,6 +939,20 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
             'room_id_not_in_inventory': 0, 'inventory_no_display': 0,
             'unknown_room_id_samples': [],
         }
+
+    def add_period_warning(booking, stay, stay_period, kind, reason):
+        stay_dates = stay.get('stayDates') or {}
+        rep['period_warnings'].append({
+            'number': booking.get('number') or '',
+            'pmsRoomStayId': stay.get('pmsRoomStayId') or '',
+            'arrival': stay_dates.get('arrivalDateTime') or '',
+            'departure': stay_dates.get('departureDateTime') or '',
+            'period_nights': stay_period['period_nights'],
+            'stay_nights': stay_period['nights'],
+            'type': kind,
+            'reason': reason,
+        })
+
     for b in details or []:
         if b.get('status') == 'Cancelled':
             rep['cancelled'] += 1
@@ -762,21 +961,22 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
         room = svc_stay = svc_book = extra = 0.0
         for rs in stays:
             room += _money(rs.get('total'))
-            for s in rs.get('services') or []:
-                svc_stay += _money(s.get('total'))
-            ex = rs.get('extraStayCharges') or {}
-            for k in ('earlyArrival', 'lateDeparture'):
-                extra += _money((ex.get(k) or {}).get('total'))
-        for s in b.get('services') or []:
-            svc_book += _money(s.get('total'))
-        tot = _money(b.get('total'))
+            for service in rs.get('services') or []:
+                svc_stay += _money(service.get('total'))
+            extra_charges = rs.get('extraStayCharges') or {}
+            for key in ('earlyArrival', 'lateDeparture'):
+                charge = extra_charges.get(key) or {}
+                extra += _money(charge.get('total'))
+        for service in b.get('services') or []:
+            svc_book += _money(service.get('total'))
+        total = _money(b.get('total'))
         paid_extras = svc_stay + svc_book + extra
         if paid_extras < 0.01:
             mode = 'A'
-        elif abs(tot - (room + paid_extras)) < 0.02:
+        elif abs(total - (room + paid_extras)) < 0.02:
             mode = 'A'
             votes['A'] += 1
-        elif abs(tot - room) < 0.02:
+        elif abs(total - room) < 0.02:
             mode = 'B'
             votes['B'] += 1
         else:
@@ -785,45 +985,33 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
             rep['mismatch'].append(
                 {'number': b.get('number'), 'room': round(room, 2),
                  'svc': round(svc_stay + svc_book, 2),
-                 'extra': round(extra, 2), 'total': round(tot, 2)})
-        hit = [rs for rs in stays
-               if _stay_overlaps(rs.get('stayDates') or {}, qs, qe)]
+                 'extra': round(extra, 2), 'total': round(total, 2)})
+
+        hit = []
+        for rs in stays:
+            stay_period = _stay_period(rs.get('stayDates') or {}, qs, qe)
+            if stay_period:
+                hit.append((rs, stay_period))
         if not hit:
             continue
         rep['in_quarter'] += 1
         src = channel_label(b.get('source'))
-        ch = rep['channels'].setdefault(src, [0, 0.0, 0.0])
-        ch[0] += 1
+        channel = rep['channels'].setdefault(src, [0, 0.0, 0.0])
+        channel[0] += 1
         first = True
-        for rs in hit:
-            sd = rs.get('stayDates') or {}
-            dt_in = _parse_dt(sd.get('arrivalDateTime') or '')
-            dt_out = _parse_dt(sd.get('departureDateTime') or '')
-            if dt_in and dt_out:
-                nights = max(1, (dt_out.date() - dt_in.date()).days)
-            else:
-                nights = 1
+
+        for rs, stay_period in hit:
+            stay_dates = rs.get('stayDates') or {}
+            dt_in = _parse_dt(stay_dates.get('arrivalDateTime') or '')
+            dt_out = _parse_dt(stay_dates.get('departureDateTime') or '')
+            nights = stay_period['period_nights']
             stay_room = _money(rs.get('total'))
-            stay_svc = sum(_money(s.get('total'))
-                           for s in rs.get('services') or [])
+            stay_services = rs.get('services') or []
+            stay_svc = sum(_money(service.get('total'))
+                           for service in stay_services)
             discount = _discount_details(rs, campaigns_with_discount)
             daily_rate_sum, daily_rate_check = _daily_rate_audit(rs)
             discount_stats = rep['discount_audit']
-            if discount['amount'] > 0:
-                discount_stats['stays_with_discount'] += 1
-                discount_stats['discount_amount'] += discount['amount']
-                discount_stats['discount_base_added'] += discount['added']
-                discount_stats['discount_exception_retained'] += (
-                    discount['retained'])
-                if discount['retained'] > 0:
-                    discount_stats['discount_exception_stays'] += 1
-                if discount['missing_campaign_name']:
-                    discount_stats['discounts_missing_campaign_name'] += 1
-                if discount['dates'] == 'Не распределена по датам':
-                    discount_stats['discounts_without_night_attribution'] += 1
-                else:
-                    discount_stats['nights_with_discount_identified'] += len(
-                        discount['dates'].split(', '))
             if daily_rate_sum is None or daily_rate_check.startswith(
                     ('Нет', 'Неполные')):
                 discount_stats['daily_rates_missing'] += 1
@@ -833,43 +1021,150 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
                     discount_stats['daily_rates_matched'] += 1
                 else:
                     discount_stats['daily_rates_mismatched'] += 1
-            row_svc = stay_svc + (svc_book + extra if first else 0.0)
-            row_svc_extension = _extension_amount(rs.get('services') or [])
-            row_svc_names = _service_descriptions(rs.get('services') or [])
+
+            full_row_svc = stay_svc + (svc_book + extra if first else 0.0)
+            if mode == 'B':
+                full_base = max(stay_room - full_row_svc, 0.0)
+            else:
+                full_base = stay_room
+
+            period_status = 'Полное проживание в выбранном периоде'
+            period_price = full_base
+            row_svc = full_row_svc
+            row_svc_extension = _extension_amount(stay_services)
+            row_svc_names = _service_descriptions(stay_services)
             if first:
                 booking_services = b.get('services') or []
                 row_svc_extension += _extension_amount(booking_services)
                 row_svc_names.extend(_service_descriptions(booking_services))
-                for extra_rs in stays:
-                    ex = extra_rs.get('extraStayCharges') or {}
+                for extra_stay in stays:
+                    charges = extra_stay.get('extraStayCharges') or {}
                     for key, label in (('earlyArrival', 'Ранний заезд'),
                                        ('lateDeparture', 'Поздний выезд')):
-                        charge = ex.get(key) or {}
+                        charge = charges.get(key) or {}
                         if _is_extension_service(charge):
                             row_svc_extension += _money(charge.get('total'))
                         if _money(charge.get('total')) > 0:
                             row_svc_names.append(
                                 _service_description(charge, label))
-            if mode == 'B':
-                base = stay_room - row_svc
-                base = base if base > 0 else 0.0
-            else:
-                base = stay_room
-            # Keep the imported accommodation price unchanged for the existing
-            # agent-commission calculation. Reconstruct the tax-only base in a
-            # separate column; campaign exceptions leave it discounted.
-            tax_base = base + discount['added']
-            guests = ', '.join(_guest_name(g) for g in rs.get('guests') or []
-                               if _guest_name(g))
-            rt = rs.get('roomType') or {}
-            rps = rs.get('ratePlans') or []
+
+            period_discount = _discount_for_period(discount, stay_period)
+
+            if not stay_period['full']:
+                rep['period_allocation']['partial_stays'] += 1
+                rate_map, rate_error = _complete_daily_rate_map(
+                    rs, stay_period['arrival'], stay_period['departure'],
+                    full_base)
+                if rate_map is None:
+                    rep['period_allocation']['skipped_partial_stays'] += 1
+                    add_period_warning(
+                        b, rs, stay_period, 'проживание',
+                        f'Строка пропущена: {rate_error}')
+                    continue
+                period_price = round(sum(
+                    price for day, price in rate_map.items()
+                    if stay_period['start'] <= day < stay_period['end']), 2)
+                rep['period_allocation']['allocated_partial_stays'] += 1
+                period_status = 'Частичное проживание распределено по dailyRates'
+
+                selected_stay_services, stay_undated = _services_in_period(
+                    stay_services, period_start, period_end)
+                selected_booking_services, booking_undated = [], 0
+                if first:
+                    selected_booking_services, booking_undated = (
+                        _services_in_period(b.get('services') or [],
+                                            period_start, period_end))
+                selected_charges, extra_undated = [], 0
+                charges = rs.get('extraStayCharges') or {}
+                for key, label in (('earlyArrival', 'Ранний заезд'),
+                                   ('lateDeparture', 'Поздний выезд')):
+                    charge = charges.get(key) or {}
+                    selected, undated = _services_in_period(
+                        [charge] if charge else [], period_start, period_end)
+                    for service in selected:
+                        selected_charges.append((service, label))
+                    extra_undated += undated
+
+                selected_services = (selected_stay_services
+                                     + selected_booking_services
+                                     + [service for service, _ in selected_charges])
+                row_svc = sum(_money(service.get('total'))
+                              for service in selected_services)
+                row_svc_extension = _extension_amount(selected_stay_services)
+                row_svc_names = _service_descriptions(selected_stay_services)
+                if first:
+                    row_svc_extension += _extension_amount(
+                        selected_booking_services)
+                    row_svc_names.extend(
+                        _service_descriptions(selected_booking_services))
+                for service, label in selected_charges:
+                    if _is_extension_service(service):
+                        row_svc_extension += _money(service.get('total'))
+                    row_svc_names.append(_service_description(service, label))
+
+                undated_services = stay_undated + booking_undated + extra_undated
+                if undated_services:
+                    rep['period_allocation']['undated_services'] += (
+                        undated_services)
+                    period_status += '; допуслуги без даты исключены'
+                    add_period_warning(
+                        b, rs, stay_period, 'допуслуга',
+                        f'{undated_services} допуслуг без даты не включены '
+                        'в сумму частичного периода')
+
+            if discount['amount'] > 0:
+                discount_stats['stays_with_discount'] += 1
+                if period_discount['amount'] is None:
+                    discount_stats[
+                        'discounts_without_night_attribution'] += 1
+                    rep['period_allocation'][
+                        'discounts_without_night_attribution'] += 1
+                else:
+                    discount_stats['discount_amount'] += (
+                        period_discount['amount'])
+                    if discount.get('dates') == 'Не распределена по датам':
+                        discount_stats[
+                            'discounts_without_night_attribution'] += 1
+                discount_stats['discount_base_added'] += period_discount['added']
+                discount_stats['discount_exception_retained'] += (
+                    period_discount['retained'])
+                if period_discount['retained'] > 0:
+                    discount_stats['discount_exception_stays'] += 1
+                if discount['missing_campaign_name']:
+                    discount_stats['discounts_missing_campaign_name'] += 1
+                if discount.get('dates') and discount.get('dates') != (
+                        'Не распределена по датам'):
+                    known_dates = [day for day in
+                                   (_parse_day(value) for value in
+                                    discount['dates'].split(', '))
+                                   if day is not None]
+                    selected_dates = [day for day in known_dates
+                                      if stay_period['start'] <= day
+                                      < stay_period['end']]
+                    discount_stats['nights_with_discount_identified'] += len(
+                        selected_dates)
+
+            if period_discount['unallocated']:
+                period_status += '; скидка без даты не восстановлена'
+                add_period_warning(
+                    b, rs, stay_period, 'скидка',
+                    'Агрегированная скидка не добавлена к налоговой базе '
+                    'частичного периода: API не указал затронутую ночь')
+            tax_base = round(period_price + period_discount['added'], 2)
+
+            guests = ', '.join(_guest_name(guest)
+                               for guest in rs.get('guests') or []
+                               if _guest_name(guest))
+            room_type = rs.get('roomType') or {}
+            rate_plans = rs.get('ratePlans') or []
             room_key = _room_id_key(rs.get('roomId'))
             if not room_key:
                 room_key = _room_id_key(rs.get('room'))
             assignment = room_map.get(room_key) if room_key else None
             room_number = assignment.get('room') if assignment else None
             corpus = assignment.get('corpus') if assignment else None
-            building_name = assignment.get('building_name', '') if assignment else ''
+            building_name = (assignment.get('building_name', '')
+                             if assignment else '')
             if has_room_inventory:
                 room_stats = rep['room_assignments']
                 room_stats['room_id_present' if room_key
@@ -883,43 +1178,48 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
                     room_stats['inventory_no_display'] += 1
                 bucket = 'assigned' if room_number is not None else 'unassigned'
                 room_stats[bucket] += 1
+
             rows.append({
                 COL_GUEST: guests,
-                COL_PRICE: round(base, 2),
+                COL_PRICE: round(full_base, 2),
+                COL_TL_PERIOD_PRICE: round(period_price, 2),
+                COL_TL_PERIOD_STATUS: period_status,
                 COL_IN: dt_in, COL_OUT: dt_out,
                 COL_SOURCE: src,
-                COL_CAT: rt.get('name') or '',
+                COL_CAT: room_type.get('name') or '',
                 COL_BRON: b.get('number') or '',
                 COL_NIGHTS: nights,
                 COL_ROOM: room_number,
                 COL_CORPUS: corpus if room_number is not None else None,
                 COL_BUILDING_NAME: building_name if room_number is not None else '',
-                COL_TARIFF: ', '.join(r.get('name') or '' for r in rps),
+                COL_TARIFF: ', '.join(plan.get('name') or ''
+                                      for plan in rate_plans),
                 COL_SVC: round(row_svc, 2),
                 COL_SVC_NAME: '; '.join(row_svc_names),
                 COL_SVC_EXTENSION: round(row_svc_extension, 2),
-                COL_TOTAL: round(tot, 2),
+                # Keep the actual group-booking total from the API unchanged.
+                COL_TOTAL: round(total, 2),
                 COL_TL_DISCOUNT: discount['amount'],
                 COL_TL_DISCOUNT_PERCENT: discount['percent'],
                 COL_TL_DISCOUNT_DATES: discount['dates'],
                 COL_TL_DAILY_SUM: daily_rate_sum,
                 COL_TL_DAILY_CHECK: daily_rate_check,
                 COL_TL_DISCOUNT_CAMPAIGN: discount['campaigns'],
-                COL_TL_DISCOUNT_ADDED: discount['added'],
-                COL_TL_DISCOUNT_RETAINED: discount['retained'],
-                COL_TL_DISCOUNT_RULE: discount['rule'],
-                COL_TL_TAX_BASE: round(tax_base, 2),
+                COL_TL_DISCOUNT_ADDED: period_discount['added'],
+                COL_TL_DISCOUNT_RETAINED: period_discount['retained'],
+                COL_TL_DISCOUNT_RULE: period_discount['rule'],
+                COL_TL_TAX_BASE: tax_base,
             })
             first = False
-        ch[1] += room
-        ch[2] += paid_extras
+        channel[1] += room
+        channel[2] += paid_extras
+
     rep['rows'] = len(rows)
     rep['votes'] = votes
     for key in ('discount_amount', 'discount_base_added',
                 'discount_exception_retained'):
         rep['discount_audit'][key] = round(rep['discount_audit'][key], 2)
     return rows, rep
-
 
 def write_data_workbook(rows, path):
     wb = openpyxl.Workbook()
@@ -932,7 +1232,7 @@ def write_data_workbook(rows, path):
             COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
             COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
             COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
-            COL_TL_TAX_BASE]
+            COL_TL_TAX_BASE, COL_TL_PERIOD_PRICE, COL_TL_PERIOD_STATUS]
     ws.append(cols)
     for r in rows:
         values = []
@@ -948,7 +1248,7 @@ def write_data_workbook(rows, path):
         for cell in ws[col][1:]:
             if isinstance(cell.value, datetime):
                 cell.number_format = 'DD.MM.YYYY HH:MM'
-    for col in ('P', 'S', 'V', 'W', 'Y'):
+    for col in ('P', 'S', 'V', 'W', 'Y', 'Z'):
         for cell in ws[col][1:]:
             cell.number_format = '#,##0.00'
     # Room assignment is consumed by the processor but kept out of the way
@@ -1045,6 +1345,9 @@ def write_api_inspection_workbook(rows, report, path, details=None,
     summary.title = 'Сводка'
     stats = (report or {}).get('room_assignments') or {}
     discount_stats = (report or {}).get('discount_audit') or {}
+    period_info = (report or {}).get('period') or {}
+    period_allocation = (report or {}).get('period_allocation') or {}
+    period_warnings = (report or {}).get('period_warnings') or []
 
     def stat_value(key):
         return stats.get(key, '—' if details is None else 0)
@@ -1054,6 +1357,15 @@ def write_api_inspection_workbook(rows, report, path, details=None,
          else 'Локальный кэш (без исходных ответов API)'),
         ('Брони в ответе API', len(details) if details is not None else 'нет в кэше'),
         ('Подготовлено строк для приложения', len(rows or [])),
+        ('Выбранный период ночей',
+         f"{period_info.get('start', '—')} — "
+         f"{period_info.get('end_inclusive', '—')} (выездная дата не ночь)"),
+        ('Частичных проживаний распределено по dailyRates',
+         period_allocation.get('allocated_partial_stays', 0)),
+        ('Частичных проживаний пропущено без точного распределения',
+         period_allocation.get('skipped_partial_stays', 0)),
+        ('Допуслуг без даты не включено в частичные периоды',
+         period_allocation.get('undated_services', 0)),
         ('Комнат в извлечённом API-инвентаре', stats.get('inventory_rooms', 0)),
         ('Проживаний сопоставлено с номером', stats.get('assigned', 0)),
         ('Проживаний без номера', stats.get('unassigned', 0)),
@@ -1100,6 +1412,24 @@ def write_api_inspection_workbook(rows, report, path, details=None,
     summary.column_dimensions['B'].width = 100
     summary.freeze_panes = 'A1'
 
+    period_sheet = wb.create_sheet('Предупреждения периода')
+    period_sheet.append([
+        '№ брони', 'pmsRoomStayId', 'Заезд API', 'Выезд API',
+        'Ночей в проживании', 'Ночей в периоде', 'Тип', 'Причина',
+    ])
+    for warning in period_warnings:
+        period_sheet.append([
+            warning.get('number', ''), warning.get('pmsRoomStayId', ''),
+            warning.get('arrival', ''), warning.get('departure', ''),
+            warning.get('stay_nights', ''), warning.get('period_nights', ''),
+            warning.get('type', ''), warning.get('reason', ''),
+        ])
+    if not period_warnings:
+        period_sheet.append(['Предупреждений по распределению нет.'])
+    period_sheet.freeze_panes = 'A2'
+    for column, width in zip('ABCDEFGH', (26, 22, 22, 22, 18, 18, 18, 78)):
+        period_sheet.column_dimensions[column].width = width
+
     data_sheet = wb.create_sheet('Данные')
     data_columns = [COL_GUEST, COL_PRICE, COL_IN, COL_OUT, COL_SOURCE, COL_CAT,
                     COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
@@ -1109,11 +1439,12 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                     COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
                     COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
                     COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
-                    COL_TL_TAX_BASE]
+                    COL_TL_TAX_BASE, COL_TL_PERIOD_PRICE,
+                    COL_TL_PERIOD_STATUS]
     data_sheet.append(data_columns)
     for row in rows or []:
         data_sheet.append([row.get(column) for column in data_columns])
-    for col in ('Q', 'T', 'W', 'X', 'Z'):
+    for col in ('Q', 'T', 'W', 'X', 'Z', 'AA'):
         for cell in data_sheet[col][1:]:
             cell.number_format = '#,##0.00'
 

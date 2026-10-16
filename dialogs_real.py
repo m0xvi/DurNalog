@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Боевые диалоги: сопоставление колонок и нераспознанные источники."""
 import tkinter as tk
+from datetime import date, datetime, timedelta
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -335,6 +336,103 @@ class TlConfigDialog(ctk.CTkToplevel):
                                  parent=self)
             return
         self.result = res
+        self.destroy()
+
+
+class TlPeriodDialog(ctk.CTkToplevel):
+    """Пользовательский диапазон ночей внутри выбранного квартала."""
+
+    def __init__(self, master, quarter_label, quarter_start, quarter_end_exclusive):
+        super().__init__(master)
+        self.title('TravelLine — период выгрузки')
+        self.geometry('560x370')
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        self.quarter_label = quarter_label
+        self.quarter_start = date.fromisoformat(str(quarter_start)[:10])
+        self.quarter_end = date.fromisoformat(str(quarter_end_exclusive)[:10])
+        self.protocol('WM_DELETE_WINDOW', self.cancel)
+
+        ctk.CTkLabel(
+            self, text=f'Период TravelLine — {quarter_label}',
+            font=ctk.CTkFont(size=16, weight='bold')).pack(pady=(16, 5))
+        ctk.CTkLabel(
+            self,
+            text=('Границы периода включительные, формат ДД.ММ.ГГГГ. '
+                  'Считаются ночи проживания; дата фактического выезда — не ночь.\n'
+                  'Для пересекающего границу проживания нужны полные dailyRates. '
+                  'Без них строка проживания будет пропущена, причина появится в '
+                  'предупреждениях. Допуслуги в частичный период попадают только '
+                  'при наличии даты в API.'),
+            text_color='gray', justify='left', wraplength=500
+        ).pack(padx=24, pady=(0, 14), anchor='w')
+
+        self.start_var = tk.StringVar(
+            value=self.quarter_start.strftime('%d.%m.%Y'))
+        self.end_var = tk.StringVar(
+            value=(self.quarter_end - timedelta(days=1)).strftime('%d.%m.%Y'))
+        fields = ctk.CTkFrame(self, fg_color='transparent')
+        fields.pack(fill='x', padx=36, pady=(0, 10))
+        ctk.CTkLabel(fields, text='С даты (включительно)', anchor='w').grid(
+            row=0, column=0, sticky='w', padx=(0, 12), pady=5)
+        ctk.CTkEntry(fields, textvariable=self.start_var, width=150).grid(
+            row=0, column=1, sticky='e', pady=5)
+        ctk.CTkLabel(fields, text='По дату (включительно)', anchor='w').grid(
+            row=1, column=0, sticky='w', padx=(0, 12), pady=5)
+        ctk.CTkEntry(fields, textvariable=self.end_var, width=150).grid(
+            row=1, column=1, sticky='e', pady=5)
+        fields.grid_columnconfigure(0, weight=1)
+
+        buttons = ctk.CTkFrame(self, fg_color='transparent')
+        buttons.pack(pady=(5, 14))
+        ctk.CTkButton(buttons, text='Весь квартал', width=130,
+                      fg_color='gray', command=self.reset).pack(
+                          side='left', padx=5)
+        ctk.CTkButton(buttons, text='Продолжить', width=130,
+                      fg_color='green', command=self.ok).pack(
+                          side='left', padx=5)
+        ctk.CTkButton(buttons, text='Отмена', width=110,
+                      fg_color='gray', command=self.cancel).pack(
+                          side='left', padx=5)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+    def reset(self):
+        self.start_var.set(self.quarter_start.strftime('%d.%m.%Y'))
+        self.end_var.set(
+            (self.quarter_end - timedelta(days=1)).strftime('%d.%m.%Y'))
+
+    def ok(self):
+        try:
+            start = datetime.strptime(
+                self.start_var.get().strip(), '%d.%m.%Y').date()
+            end = datetime.strptime(
+                self.end_var.get().strip(), '%d.%m.%Y').date()
+        except ValueError:
+            messagebox.showerror(
+                'TravelLine', 'Введите даты в формате ДД.ММ.ГГГГ.', parent=self)
+            return
+        if end < start:
+            messagebox.showerror(
+                'TravelLine', 'Дата окончания должна быть не раньше даты начала.',
+                parent=self)
+            return
+        last_quarter_day = self.quarter_end - timedelta(days=1)
+        if start < self.quarter_start or end > last_quarter_day:
+            messagebox.showerror(
+                'TravelLine',
+                'Период должен находиться внутри выбранного квартала '
+                f'({self.quarter_start:%d.%m.%Y}–{last_quarter_day:%d.%m.%Y}).',
+                parent=self)
+            return
+        from tl_client import inclusive_period_bounds
+        self.result = inclusive_period_bounds(start.isoformat(), end.isoformat())
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
         self.destroy()
 
 

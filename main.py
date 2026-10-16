@@ -6,7 +6,7 @@ import tempfile
 import json
 import threading
 import copy
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, 'frozen', False):
@@ -44,13 +44,14 @@ from core import (read_table, read_headers, guess_mapping, mapping_valid,
                   process_tchaikovsky, process_dona, process_usadba,
                   usadba_sources, repair_notes_for)
 from dialogs_real import (MappingDialog, UnrecognizedSourcesDialog,
-                            TlCacheDialog, TlConfigDialog, TlProgressDialog)
+                            TlCacheDialog, TlConfigDialog, TlPeriodDialog,
+                            TlProgressDialog)
 from updater import (UpdateError, check_for_updates, download_release,
                      is_frozen, launch_install, plan_install, staging_dir,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.33"
+APP_VERSION = "3.34"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -666,10 +667,28 @@ class RealApp(TurNalogApp):
                                  parent=self)
             return
         qn, y = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}[quarter], int(year)
-        qs = f'{y}-{(qn - 1) * 3 + 1:02d}-01'
-        qe = f'{y + 1}-01-01' if qn == 4 else f'{y}-{qn * 3 + 1:02d}-01'
-        # Быстрый режим: API фильтрует по lastModification, не по stayDates.
-        depth = qs
+        try:
+            quarter_start = date(y, (qn - 1) * 3 + 1, 1)
+            quarter_end = (date(y + 1, 1, 1) if qn == 4
+                           else date(y, qn * 3 + 1, 1))
+        except ValueError:
+            messagebox.showerror('TravelLine', 'Укажите корректный год.',
+                                 parent=self)
+            return
+        period_dialog = TlPeriodDialog(
+            self, f'{quarter}/{year}', quarter_start, quarter_end)
+        self.wait_window(period_dialog)
+        if not period_dialog.result:
+            return
+        qs, qe = period_dialog.result
+        period_start = date.fromisoformat(qs)
+        period_end_exclusive = date.fromisoformat(qe)
+        period_end_inclusive = period_end_exclusive - timedelta(days=1)
+        period_label = (f'{period_start:%d.%m.%Y}–'
+                        f'{period_end_inclusive:%d.%m.%Y}')
+        # Быстрый режим остаётся привязан к началу квартала, не к началу
+        # пользовательского окна: TravelLine фильтрует по lastModification.
+        depth = quarter_start.isoformat()
         tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
         property_id = str(tl_cfg.get('property_id', '')).strip()
         campaigns_with_discount = tl_cfg.get('campaigns_with_discount') or []
@@ -694,7 +713,8 @@ class RealApp(TurNalogApp):
             except Exception:
                 pass
             cache_dlg = TlCacheDialog(
-                self, f'{quarter}/{year}', cache_record['fetched_at'],
+                self, f'{quarter}/{year} · {period_label}',
+                cache_record['fetched_at'],
                 cache_record['row_count'], room_stats=cache_room_stats)
             self.wait_window(cache_dlg)
             choice = cache_dlg.result or 'cancel'
@@ -737,10 +757,10 @@ class RealApp(TurNalogApp):
         if not cache_used:
             if not messagebox.askyesno(
                     'TravelLine — быстрый режим',
-                    f'Для ускорения запрос ограничен бронями, изменёнными с {qs}.\n\n'
+                    f'Для ускорения запрос ограничен бронями, изменёнными с {depth}.\n\n'
                     'TravelLine фильтрует по дате изменения, а не по датам проживания. '
                     'Бронь, созданная раньше и не изменявшаяся с этой даты, может не '
-                    'попасть в импорт, даже если проживание было в выбранном квартале.\n\n'
+                    'попасть в импорт, даже если ночи попадают в выбранный период.\n\n'
                     'Продолжить быстрый режим с этим ограничением?', parent=self):
                 return
             dlg = TlConfigDialog(self, tl_cfg, hname)
@@ -875,8 +895,9 @@ class RealApp(TurNalogApp):
                             (' → кэш не сохранён' if cache_error else
                              ' → сохранено в локальную базу'))
             self.set_status(f'TravelLine: {rep["rows"]} строк за '
-                            f'{quarter}/{year}{cache_status}')
-            lines = [f'Броней в квартале: {rep["in_quarter"]} '
+                            f'{quarter}/{year}, {period_label}{cache_status}')
+            lines = [f'Броней с ночами в выбранном периоде '
+                     f'({period_label}): {rep["in_quarter"]} '
                      f'(строк: {rep["rows"]})',
                      f'Пропущено отменённых: {rep["cancelled"]}']
             if from_cache:
@@ -955,6 +976,22 @@ class RealApp(TurNalogApp):
                     f"совпало {discount_audit.get('daily_rates_matched', 0)}, "
                     f'расхождений {daily_rates_mismatched}, '
                     f'нет данных {daily_rates_missing}.')
+            period_allocation = rep.get('period_allocation') or {}
+            period_warnings = rep.get('period_warnings') or []
+            if period_allocation.get('partial_stays'):
+                lines.append(
+                    'Частичных проживаний: '
+                    f'{period_allocation.get("allocated_partial_stays", 0)} '
+                    'распределено по полным dailyRates; '
+                    f'{period_allocation.get("skipped_partial_stays", 0)} '
+                    'пропущено без точных тарифов.')
+            if period_warnings:
+                lines.append(
+                    f'⚠ Замечаний по периоду: {len(period_warnings)}. '
+                    'Подробности — лист «Предупреждения периода» в просмотре API.')
+                for warning in period_warnings[:8]:
+                    booking_label = warning.get('number') or 'без номера брони'
+                    lines.append(f'• {booking_label}: {warning.get("reason", "")}')
             if rep['mismatch']:
                 lines.append(f'⚠ Расхождений арифметики: {len(rep["mismatch"])} '
                              '(номера в логе) — проверьте!')

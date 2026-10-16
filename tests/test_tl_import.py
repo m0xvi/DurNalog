@@ -13,7 +13,8 @@ from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        COL_TL_DAILY_CHECK, COL_TL_DISCOUNT_CAMPAIGN,
                        COL_TL_DISCOUNT_ADDED, COL_TL_DISCOUNT_RETAINED,
                        COL_TL_DISCOUNT_RULE, COL_TL_TAX_BASE,
-                       ROOM_LABEL_TEXT_PREFIX,
+                       COL_TL_PERIOD_PRICE, COL_TL_PERIOD_STATUS,
+                       ROOM_LABEL_TEXT_PREFIX, inclusive_period_bounds,
                        accommodation_room_map, bookings_to_rows, channel_label,
                        is_tl_export, write_api_inspection_workbook,
                        write_data_workbook, write_rooms_workbook)
@@ -120,9 +121,14 @@ def test_discount_night_is_inferred_only_from_unique_daily_rate_match(tmp_path):
     assert data['W2'].value == 551.80
     assert data['Z1'].value == COL_TL_TAX_BASE
     assert data['Z2'].value == 89000.0
-    assert workbook['Сводка']['B12'].value == 551.80
-    assert workbook['Сводка']['B12'].number_format == '#,##0.00'
-    assert workbook['Сводка']['B13'].value == 551.80
+    summary = workbook['Сводка']
+    summary_values = {summary.cell(row, 1).value: summary.cell(row, 2).value
+                      for row in range(1, summary.max_row + 1)}
+    discount_row = next(row for row in range(1, summary.max_row + 1)
+                        if summary.cell(row, 1).value == 'Общая скидка TravelLine, ₽')
+    assert summary_values['Общая скидка TravelLine, ₽'] == 551.80
+    assert summary.cell(discount_row, 2).number_format == '#,##0.00'
+    assert summary_values['Добавлено к стоимости для налоговой базы, ₽'] == 551.80
     stays = workbook['Проживания API']
     headers = [cell.value for cell in stays[1]]
     discounts_col = headers.index('Скидки API: название/тип/процент/сумма') + 1
@@ -337,6 +343,196 @@ def test_group_booking_two_rows():
     rows, rep = bookings_to_rows([b], QS, QE)
     assert len(rows) == 2 and rep['rows'] == 2
     assert [r['Гость'] for r in rows] == ['А А', 'Б Б']
+
+
+def test_group_booking_three_rooms_uses_each_room_stay_for_tax(tmp_path):
+    room_values = [(23, 60876.0), (26, 61176.0), (36, 60876.0)]
+    stays = []
+    for room_number, amount in room_values:
+        stay = _stay(
+            arr='2026-08-22T14:00', dep='2026-08-28T12:00', room=amount,
+            guests=(('Один', 'Гость'),))
+        stay.update({'roomId': f'room-{room_number}',
+                     'pmsRoomStayId': f'stay-{room_number}'})
+        stay['total']['discounts'] = [{
+            'amount': 15219.0, 'percent': 20.0,
+            'discountType': 'Percentage', 'name': 'Group campaign',
+        }]
+        stays.append(stay)
+    inventory = {'accommodationInventory': {'buildings': [{
+        'id': 'building-1', 'name': 'Корпус 1', 'floors': [{
+            'id': 'floor-1', 'rooms': [
+                {'id': f'room-{number}', 'displayName': str(number)}
+                for number, _ in room_values
+            ],
+        }],
+    }]}}
+    group_total = sum(amount for _, amount in room_values)
+    rows, report = bookings_to_rows(
+        [_book(number='group-3-rooms', stays=stays, total=group_total)],
+        QS, QE, accommodation_inventory=inventory)
+
+    assert len(rows) == 3 and report['rows'] == 3
+    assert [row['№ комнаты'] for row in rows] == [23, 26, 36]
+    assert [row['Стоимость'] for row in rows] == [60876.0, 61176.0, 60876.0]
+    assert [row[COL_TL_PERIOD_PRICE] for row in rows] == [
+        60876.0, 61176.0, 60876.0]
+    assert [row[COL_TL_TAX_BASE] for row in rows] == [76095.0, 76395.0, 76095.0]
+    assert [row['Итог брони'] for row in rows] == [group_total] * 3
+    assert [row['Ночей'] for row in rows] == [6, 6, 6]
+
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    output_path = str(tmp_path / 'group-report.xlsx')
+    write_data_workbook(rows, data_path)
+    write_rooms_workbook(rows, rooms_path)
+    import core
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP,
+        {'fio': 'ФИО', 'room': '№ комнаты', 'corpus': 'Корпус',
+         'bron': '№ брони'},
+        extra_data=TL_EXTRA, source_map={'TravelLine YAX': (0, '')})
+    import openpyxl
+    report_sheet = openpyxl.load_workbook(output_path, data_only=False)['1']
+    assert report_sheet.max_row == 5  # заголовок, три номера и строка итога
+    assert [report_sheet.cell(row, 19).value for row in (2, 3, 4)] == [23, 26, 36]
+    assert all('IF(ISNUMBER(' in report_sheet.cell(row, 9).value
+               for row in (2, 3, 4))
+
+
+def test_inclusive_period_bounds_include_selected_end_date():
+    assert inclusive_period_bounds('2026-09-15', '2026-09-30') == (
+        '2026-09-15', '2026-10-01')
+    try:
+        inclusive_period_bounds('2026-10-01', '2026-09-30')
+    except ValueError as exc:
+        assert 'раньше даты начала' in str(exc)
+    else:
+        raise AssertionError('reversed period must fail')
+
+
+def test_cross_period_stay_is_allocated_by_exact_nightly_rates():
+    from datetime import date, timedelta
+
+    stay = _stay(arr='2026-05-15T14:00', dep='2026-06-19T12:00',
+                 room=3500.0)
+    arrival = date(2026, 5, 15)
+    stay['dailyRates'] = [
+        {'date': (arrival + timedelta(days=offset)).isoformat(),
+         'priceAfterTax': 100.0, 'priceBeforeTax': 100.0}
+        for offset in range(35)
+    ]
+    stay['total'] = {'priceAfterTax': 3500.0, 'priceBeforeTax': 3500.0}
+    rows, report = bookings_to_rows(
+        [_book(number='cross-period', stays=[stay], total=3500.0)],
+        '2026-06-01', '2026-07-01')
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['Ночей'] == 18  # ночи 1–18 июня; checkout 19-го не считается
+    assert row['Заезд'].isoformat() == '2026-05-15T14:00:00'
+    assert row['Стоимость'] == 3500.0  # API amount kept for commission
+    assert row['Итог брони'] == 3500.0
+    assert row[COL_TL_PERIOD_PRICE] == 1800.0
+    assert row[COL_TL_TAX_BASE] == 1800.0
+    assert 'распределено по dailyRates' in row[COL_TL_PERIOD_STATUS]
+    assert report['period_allocation']['allocated_partial_stays'] == 1
+    assert not report['period_warnings']
+
+
+def test_cross_period_stay_without_complete_daily_rates_is_skipped_with_warning():
+    stay = _stay(arr='2026-05-15T14:00', dep='2026-06-19T12:00',
+                 room=3500.0)
+    stay['dailyRates'] = [{'date': '2026-05-15', 'priceBeforeTax': 100.0}]
+    rows, report = bookings_to_rows(
+        [_book(number='missing-rates', stays=[stay], total=3500.0)],
+        '2026-06-01', '2026-07-01')
+
+    assert rows == []
+    assert report['period_allocation']['skipped_partial_stays'] == 1
+    assert report['period_warnings'][0]['number'] == 'missing-rates'
+    assert 'dailyRates' in report['period_warnings'][0]['reason']
+
+
+def test_partial_period_discount_is_restored_only_on_identified_night():
+    stay = _stay(arr='2026-05-15T14:00', dep='2026-05-18T12:00', room=290.0)
+    stay['dailyRates'] = [
+        {'date': '2026-05-15', 'priceAfterTax': 90.0,
+         'priceBeforeTax': 90.0},
+        {'date': '2026-05-16', 'priceAfterTax': 100.0,
+         'priceBeforeTax': 100.0},
+        {'date': '2026-05-17', 'priceAfterTax': 100.0,
+         'priceBeforeTax': 100.0},
+    ]
+    stay['total'] = {
+        'priceAfterTax': 290.0, 'priceBeforeTax': 290.0,
+        'discounts': [{'amount': 10.0, 'percent': 10.0,
+                       'discountType': 'Percentage', 'name': 'First-night deal'}],
+    }
+    rows, report = bookings_to_rows(
+        [_book(number='dated-discount', stays=[stay], total=290.0)],
+        '2026-05-15', '2026-05-16')
+
+    assert len(rows) == 1
+    assert rows[0][COL_TL_PERIOD_PRICE] == 90.0
+    assert rows[0][COL_TL_DISCOUNT_DATES] == '2026-05-15'
+    assert rows[0][COL_TL_DISCOUNT_ADDED] == 10.0
+    assert rows[0][COL_TL_TAX_BASE] == 100.0
+    assert not report['period_warnings']
+
+
+def test_partial_period_keeps_discounted_daily_rate_when_discount_date_unknown():
+    stay = _stay(arr='2026-05-15T14:00', dep='2026-05-18T12:00', room=290.0)
+    stay['dailyRates'] = [
+        {'date': '2026-05-15', 'priceAfterTax': 90.0,
+         'priceBeforeTax': 90.0},
+        {'date': '2026-05-16', 'priceAfterTax': 100.0,
+         'priceBeforeTax': 100.0},
+        {'date': '2026-05-17', 'priceAfterTax': 100.0,
+         'priceBeforeTax': 100.0},
+    ]
+    stay['total'] = {
+        'priceAfterTax': 290.0, 'priceBeforeTax': 290.0,
+        'discounts': [{'amount': 10.0, 'discountType': 'Fixed',
+                       'name': 'Unattributed deal'}],
+    }
+    rows, report = bookings_to_rows(
+        [_book(number='unknown-discount-date', stays=[stay], total=290.0)],
+        '2026-05-15', '2026-05-16')
+
+    assert len(rows) == 1
+    assert rows[0][COL_TL_TAX_BASE] == 90.0
+    assert rows[0][COL_TL_DISCOUNT_ADDED] == 0.0
+    assert 'не восстановлена' in rows[0][COL_TL_PERIOD_STATUS]
+    assert any(warning['type'] == 'скидка'
+               for warning in report['period_warnings'])
+
+
+def test_partial_period_includes_only_dated_extra_services():
+    stay = _stay(arr='2026-05-15T14:00', dep='2026-05-17T12:00',
+                 room=2000.0,
+                 services=({'name': 'Завтрак', 'amount': 50.0,
+                            'serviceDate': '2026-05-15'},
+                           {'name': 'Услуга вне периода', 'amount': 60.0,
+                            'serviceDate': '2026-05-16'},
+                           {'name': 'Без даты', 'amount': 70.0}))
+    stay['dailyRates'] = [
+        {'date': '2026-05-15', 'priceAfterTax': 1000.0,
+         'priceBeforeTax': 1000.0},
+        {'date': '2026-05-16', 'priceAfterTax': 1000.0,
+         'priceBeforeTax': 1000.0},
+    ]
+    rows, report = bookings_to_rows(
+        [_book(number='dated-service', stays=[stay], total=2180.0)],
+        '2026-05-15', '2026-05-16')
+
+    assert len(rows) == 1
+    assert rows[0]['Допуслуги'] == 50.0
+    assert rows[0]['Сумма продления номера'] == 0.0
+    assert 'Завтрак — 50,00 ₽' in rows[0]['Наименование допуслуг']
+    assert rows[0][COL_TL_TAX_BASE] == 1000.0
+    assert 'допуслуги без даты исключены' in rows[0][COL_TL_PERIOD_STATUS]
+    assert report['period_allocation']['undated_services'] == 1
 
 
 def test_channels():
@@ -789,7 +985,9 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
                                 'Скидка добавлена к налоговой базе, ₽',
                                 'Скидка сохранена в базе, ₽',
                                 'Правило скидки TravelLine',
-                                'Налоговая база TravelLine, ₽']
+                                'Налоговая база TravelLine, ₽',
+                                'Стоимость проживания за выбранный период TravelLine, ₽',
+                                'Распределение по периоду TravelLine']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -1020,7 +1218,7 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v6|')
+    assert key.startswith('tlcache-v7|')
     assert tl_import_cache_key(*common) == key
     assert tl_import_cache_key(*common, campaigns_with_discount=['Promo A']) != key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
