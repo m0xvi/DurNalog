@@ -9,6 +9,7 @@ Read Reservation возвращает roomStays[].roomId; для Чайковс�
 проживание не назначено или его roomId отсутствует в номерном фонде, номер
 и корпус остаются пустыми — идентификаторы API не подменяются номером комнаты.
 """
+import hashlib
 import json
 import re
 import time
@@ -25,7 +26,7 @@ HTTP_TIMEOUT_SECONDS = 90
 NETWORK_RETRIES = 1
 NETWORK_RETRY_DELAY = 2
 # Increment if the prepared-row/report cache format changes incompatibly.
-TL_CACHE_VERSION = 5
+TL_CACHE_VERSION = 6
 
 # Канонические колонки выгрузки (имена пересекаются с алиасами схем,
 # но маппинг задаётся явно — автоподбор не нужен).
@@ -48,6 +49,11 @@ COL_BUILDING_NAME = 'Здание TravelLine'
 COL_TL_DISCOUNT = 'Скидка TravelLine, ₽'
 COL_TL_DISCOUNT_PERCENT = 'Процент скидки TravelLine'
 COL_TL_DISCOUNT_DATES = 'Предполагаемые ночи со скидкой TravelLine'
+COL_TL_DISCOUNT_CAMPAIGN = 'Название скидки/кампании TravelLine'
+COL_TL_DISCOUNT_ADDED = 'Скидка добавлена к налоговой базе, ₽'
+COL_TL_DISCOUNT_RETAINED = 'Скидка сохранена в базе, ₽'
+COL_TL_DISCOUNT_RULE = 'Правило скидки TravelLine'
+COL_TL_TAX_BASE = 'Налоговая база TravelLine, ₽'
 COL_TL_DAILY_SUM = 'Сумма dailyRates'
 COL_TL_DAILY_CHECK = 'Сверка dailyRates'
 ROOM_LABEL_TEXT_PREFIX = '__TL_ROOM_LABEL__:'
@@ -58,7 +64,10 @@ TL_DATA_MAP = {'guest': COL_GUEST, 'price': COL_PRICE, 'checkin': COL_IN,
                'room': COL_ROOM, 'corpus': COL_CORPUS}
 TL_EXTRA = [COL_TARIFF, COL_SVC, COL_SVC_NAME, COL_SVC_EXTENSION, COL_TOTAL,
             COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
-            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
+            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
+            COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
+            COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
+            COL_TL_TAX_BASE]
 TL_ROOMS_MAP = {'fio': 'ФИО', 'room': COL_ROOM, 'corpus': COL_CORPUS,
                 'building_name': COL_BUILDING_NAME, 'bron': COL_BRON}
 
@@ -91,10 +100,33 @@ def tl_export_paths(tmpdir, code, year, quarter):
             tmpdir + '/' + stem + 'rooms.xlsx')
 
 
+def _campaign_name_key(value):
+    return re.sub(r'\s+', ' ',
+                  str(value or '').strip().casefold().replace('ё', 'е'))
+
+
+def _campaign_name_list(values):
+    if isinstance(values, str):
+        values = values.splitlines() or [values]
+    names, seen = [], set()
+    for value in values or []:
+        name = str(value or '').strip()
+        key = _campaign_name_key(name)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
 def tl_import_cache_key(hotel_code, property_id, period_start, period_end,
-                        modified_since):
+                        modified_since, campaigns_with_discount=None):
+    campaign_keys = sorted({_campaign_name_key(name) for name in
+                            _campaign_name_list(campaigns_with_discount)})
+    campaign_hash = hashlib.sha256(
+        json.dumps(campaign_keys, ensure_ascii=False).encode('utf-8')
+    ).hexdigest()[:12]
     return (f'tlcache-v{TL_CACHE_VERSION}|{hotel_code}|{property_id}|'
-            f'{period_start}|{period_end}|{modified_since}')
+            f'{period_start}|{period_end}|{modified_since}|camp={campaign_hash}')
 
 
 def encode_tl_import_cache(rows, report):
@@ -350,14 +382,14 @@ def _number(value):
         return None
 
 
-def _discount_details(stay):
-    """Скидка по проживанию и даты ночей, если их можно определить однозначно.
+def _discount_details(stay, campaigns_with_discount=None):
+    """Разбирает скидки и решает, какие из них вернуть в стоимость.
 
-    API отдаёт скидки агрегированно в ``total.discounts``, а dailyRates — уже
-    итоговую цену каждой ночи. Для одного процентного правила распределяем
-    сумму на даты только когда одна группа одинаковых ночных цен точно
-    объясняет общую сумму скидки. В остальных случаях показываем сумму и не
-    угадываем даты.
+    По принятому бизнес-правилу сумма скидки добавляется обратно в налоговую
+    базу. Это расчётная корректировка, а не отдельная комиссия из API. Названия
+    из ручного списка — исключения: для них цена остаётся
+    со скидкой. Дату скидки по-прежнему выводим только при единственном
+    совпадении агрегированной скидки с группой nightly rates.
     """
     total = stay.get('total') or {}
     discounts = total.get('discounts') or []
@@ -365,12 +397,30 @@ def _discount_details(stay):
         discounts = [discounts]
     discounts = [item for item in discounts if isinstance(item, dict)]
     if not discounts:
-        return 0.0, '', ''
+        return {
+            'amount': 0.0, 'percent': '', 'dates': '', 'campaigns': '',
+            'added': 0.0, 'retained': 0.0, 'rule': 'Скидки нет',
+            'missing_campaign_name': False,
+        }
 
-    amount = round(sum(_number(item.get('amount')) or 0.0
-                       for item in discounts), 2)
-    percent_labels = []
+    exception_keys = {_campaign_name_key(name) for name in
+                      _campaign_name_list(campaigns_with_discount)}
+    amount = added = retained = 0.0
+    percent_labels, campaign_names = [], []
+    missing_campaign_name = False
     for item in discounts:
+        item_amount = _number(item.get('amount')) or 0.0
+        amount += item_amount
+        name = str(item.get('name') or '').strip()
+        if name and name not in campaign_names:
+            campaign_names.append(name)
+        if name and _campaign_name_key(name) in exception_keys:
+            retained += item_amount
+        else:
+            added += item_amount
+            if exception_keys and not name:
+                missing_campaign_name = True
+
         percent = _number(item.get('percent'))
         if percent is not None:
             label = f'{percent:g}%'
@@ -380,6 +430,20 @@ def _discount_details(stay):
             label = str(item.get('discountType') or 'скидка')
         if label not in percent_labels:
             percent_labels.append(label)
+
+    amount = round(amount, 2)
+    added = round(added, 2)
+    retained = round(retained, 2)
+    if retained and added:
+        rule = 'Часть скидки добавлена; кампания-исключение оставлена со скидкой'
+    elif retained:
+        rule = 'Кампания-исключение: скидка сохранена в налоговой базе'
+    elif exception_keys and missing_campaign_name:
+        rule = 'Название кампании не задано: применено правило добавления скидки'
+    elif exception_keys:
+        rule = 'Кампания не в списке исключений: скидка добавлена в налоговую базу'
+    else:
+        rule = 'Скидка добавлена к налоговой базе'
 
     dates = []
     daily_rates = stay.get('dailyRates') or []
@@ -415,13 +479,18 @@ def _discount_details(stay):
                 if len(candidates) == 1:
                     dates = sorted(set(candidates[0]))
 
-    if dates:
-        date_text = ', '.join(dates)
-    elif amount > 0:
-        date_text = 'Не распределена по датам'
-    else:
-        date_text = ''
-    return amount, '; '.join(percent_labels), date_text
+    date_text = ', '.join(dates) if dates else (
+        'Не распределена по датам' if amount > 0 else '')
+    return {
+        'amount': amount,
+        'percent': '; '.join(percent_labels),
+        'dates': date_text,
+        'campaigns': '; '.join(campaign_names),
+        'added': added,
+        'retained': retained,
+        'rule': rule,
+        'missing_campaign_name': missing_campaign_name,
+    }
 
 
 def _daily_rate_audit(stay):
@@ -648,7 +717,8 @@ def channel_label(source):
     return 'TravelLine ?'
 
 
-def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
+def bookings_to_rows(details, qs, qe, accommodation_inventory=None,
+                     campaigns_with_discount=None):
     """Детали броней -> (строки Excel, отчёт).
 
     qs/qe — 'YYYY-MM-DD' границ квартала. Отменённые пропускаются.
@@ -657,6 +727,9 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
     Иначе бронь помечается расхождением (база = проживание как есть).
     При наличии инвентаря roomId сопоставляется с номером/корпусом; ID
     незанятого или неизвестного номера не переносится в отчёт как номер.
+    Скидка корректирует только отдельную налоговую базу; импортированная
+    цена проживания остаётся со скидкой. Исключения задаются в
+    ``campaigns_with_discount``.
     """
     room_map = accommodation_room_map(accommodation_inventory)
     has_room_inventory = accommodation_inventory is not None
@@ -665,6 +738,10 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
            'rows': 0, 'mismatch': [], 'channels': {},
            'discount_audit': {
                'stays_with_discount': 0, 'discount_amount': 0.0,
+               'discount_base_added': 0.0,
+               'discount_exception_retained': 0.0,
+               'discount_exception_stays': 0,
+               'discounts_missing_campaign_name': 0,
                'nights_with_discount_identified': 0,
                'discounts_without_night_attribution': 0,
                'daily_rates_checked': 0, 'daily_rates_matched': 0,
@@ -729,18 +806,24 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
             stay_room = _money(rs.get('total'))
             stay_svc = sum(_money(s.get('total'))
                            for s in rs.get('services') or [])
-            discount_amount, discount_percent, discount_dates = (
-                _discount_details(rs))
+            discount = _discount_details(rs, campaigns_with_discount)
             daily_rate_sum, daily_rate_check = _daily_rate_audit(rs)
             discount_stats = rep['discount_audit']
-            if discount_amount > 0:
+            if discount['amount'] > 0:
                 discount_stats['stays_with_discount'] += 1
-                discount_stats['discount_amount'] += discount_amount
-                if discount_dates == 'Не распределена по датам':
+                discount_stats['discount_amount'] += discount['amount']
+                discount_stats['discount_base_added'] += discount['added']
+                discount_stats['discount_exception_retained'] += (
+                    discount['retained'])
+                if discount['retained'] > 0:
+                    discount_stats['discount_exception_stays'] += 1
+                if discount['missing_campaign_name']:
+                    discount_stats['discounts_missing_campaign_name'] += 1
+                if discount['dates'] == 'Не распределена по датам':
                     discount_stats['discounts_without_night_attribution'] += 1
                 else:
                     discount_stats['nights_with_discount_identified'] += len(
-                        discount_dates.split(', '))
+                        discount['dates'].split(', '))
             if daily_rate_sum is None or daily_rate_check.startswith(
                     ('Нет', 'Неполные')):
                 discount_stats['daily_rates_missing'] += 1
@@ -772,6 +855,10 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
                 base = base if base > 0 else 0.0
             else:
                 base = stay_room
+            # Keep the imported accommodation price unchanged for the existing
+            # agent-commission calculation. Reconstruct the tax-only base in a
+            # separate column; campaign exceptions leave it discounted.
+            tax_base = base + discount['added']
             guests = ', '.join(_guest_name(g) for g in rs.get('guests') or []
                                if _guest_name(g))
             rt = rs.get('roomType') or {}
@@ -812,19 +899,25 @@ def bookings_to_rows(details, qs, qe, accommodation_inventory=None):
                 COL_SVC_NAME: '; '.join(row_svc_names),
                 COL_SVC_EXTENSION: round(row_svc_extension, 2),
                 COL_TOTAL: round(tot, 2),
-                COL_TL_DISCOUNT: discount_amount,
-                COL_TL_DISCOUNT_PERCENT: discount_percent,
-                COL_TL_DISCOUNT_DATES: discount_dates,
+                COL_TL_DISCOUNT: discount['amount'],
+                COL_TL_DISCOUNT_PERCENT: discount['percent'],
+                COL_TL_DISCOUNT_DATES: discount['dates'],
                 COL_TL_DAILY_SUM: daily_rate_sum,
                 COL_TL_DAILY_CHECK: daily_rate_check,
+                COL_TL_DISCOUNT_CAMPAIGN: discount['campaigns'],
+                COL_TL_DISCOUNT_ADDED: discount['added'],
+                COL_TL_DISCOUNT_RETAINED: discount['retained'],
+                COL_TL_DISCOUNT_RULE: discount['rule'],
+                COL_TL_TAX_BASE: round(tax_base, 2),
             })
             first = False
         ch[1] += room
         ch[2] += paid_extras
     rep['rows'] = len(rows)
     rep['votes'] = votes
-    rep['discount_audit']['discount_amount'] = round(
-        rep['discount_audit']['discount_amount'], 2)
+    for key in ('discount_amount', 'discount_base_added',
+                'discount_exception_retained'):
+        rep['discount_audit'][key] = round(rep['discount_audit'][key], 2)
     return rows, rep
 
 
@@ -836,7 +929,10 @@ def write_data_workbook(rows, path):
             COL_BRON, COL_NIGHTS, COL_TARIFF, COL_SVC, COL_SVC_NAME,
             COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS,
             COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
-            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
+            COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
+            COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
+            COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
+            COL_TL_TAX_BASE]
     ws.append(cols)
     for r in rows:
         values = []
@@ -852,7 +948,7 @@ def write_data_workbook(rows, path):
         for cell in ws[col][1:]:
             if isinstance(cell.value, datetime):
                 cell.number_format = 'DD.MM.YYYY HH:MM'
-    for col in ('P', 'S'):
+    for col in ('P', 'S', 'V', 'W', 'Y'):
         for cell in ws[col][1:]:
             cell.number_format = '#,##0.00'
     # Room assignment is consumed by the processor but kept out of the way
@@ -906,6 +1002,20 @@ def _inspection_cell(value):
     return value
 
 
+def _inspection_discount_summary(stay):
+    """Отдельно показывает названия скидок/кампаний, не раскрывая ФИО."""
+    total = stay.get('total') or {}
+    discounts = total.get('discounts') or []
+    if isinstance(discounts, dict):
+        discounts = [discounts]
+    return [{
+        'name': item.get('name') or '',
+        'discountType': item.get('discountType') or '',
+        'percent': item.get('percent'),
+        'amount': item.get('amount'),
+    } for item in discounts if isinstance(item, dict)]
+
+
 def _inspection_redact(value):
     """Сохраняет техполя для отладки, убирая ФИО/контакты из сырого JSON."""
     private_parts = ('guest', 'name', 'email', 'phone', 'passport',
@@ -956,6 +1066,14 @@ def write_api_inspection_workbook(rows, report, path, details=None,
          discount_stats.get('stays_with_discount', 0)),
         ('Общая скидка TravelLine, ₽',
          discount_stats.get('discount_amount', 0.0)),
+        ('Добавлено к стоимости для налоговой базы, ₽',
+         discount_stats.get('discount_base_added', 0.0)),
+        ('Оставлено со скидкой по исключениям, ₽',
+         discount_stats.get('discount_exception_retained', 0.0)),
+        ('Проживаний с исключением кампании',
+         discount_stats.get('discount_exception_stays', 0)),
+        ('Скидок без названия кампании',
+         discount_stats.get('discounts_missing_campaign_name', 0)),
         ('Предполагаемых ночей со скидкой (вывод по dailyRates)',
          discount_stats.get('nights_with_discount_identified', 0)),
         ('Скидок без однозначной даты',
@@ -973,7 +1091,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
             '«Обновить из TravelLine», чтобы получить исходные roomId и инвентарь.'))
     for row_index, item in enumerate(summary_rows, 1):
         summary.append(item)
-        if item[0] == 'Общая скидка TravelLine, ₽':
+        if item[0].endswith('₽'):
             summary.cell(row=row_index, column=2).number_format = '#,##0.00'
     if stats.get('unknown_room_id_samples'):
         summary.append(('Примеры ID без совпадения',
@@ -988,11 +1106,14 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                     COL_SVC_EXTENSION, COL_TOTAL, COL_ROOM, COL_CORPUS,
                     COL_BUILDING_NAME, COL_TL_DISCOUNT,
                     COL_TL_DISCOUNT_PERCENT, COL_TL_DISCOUNT_DATES,
-                    COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK]
+                    COL_TL_DAILY_SUM, COL_TL_DAILY_CHECK,
+                    COL_TL_DISCOUNT_CAMPAIGN, COL_TL_DISCOUNT_ADDED,
+                    COL_TL_DISCOUNT_RETAINED, COL_TL_DISCOUNT_RULE,
+                    COL_TL_TAX_BASE]
     data_sheet.append(data_columns)
     for row in rows or []:
         data_sheet.append([row.get(column) for column in data_columns])
-    for col in ('Q', 'T'):
+    for col in ('Q', 'T', 'W', 'X', 'Z'):
         for cell in data_sheet[col][1:]:
             cell.number_format = '#,##0.00'
 
@@ -1057,6 +1178,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
         'roomTypeId', 'roomType', 'Заезд API', 'Выезд API', 'Все ключи roomStay',
         'Поля размещения (JSON)', 'roomId использован из',
         'Результат сопоставления', 'Номер из инвентаря', 'Корпус',
+        'Скидки API: название/тип/процент/сумма',
     ])
     room_map = accommodation_room_map(accommodation_inventory)
     if details is not None:
@@ -1068,7 +1190,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                 if not isinstance(stay, dict):
                     stays_sheet.append([booking_number, index, '', '', '', '', '',
                                         '', '', '', _inspection_json(stay), '',
-                                        'roomStay не является объектом', '', ''])
+                                        'roomStay не является объектом', '', '', ''])
                     continue
                 raw_room_id = stay.get('roomId')
                 raw_room = stay.get('room')
@@ -1106,6 +1228,7 @@ def write_api_inspection_workbook(rows, report, path, details=None,
                     _inspection_json(safe_stay), room_id_source, match_status,
                     assignment.get('room') if assignment else None,
                     assignment.get('corpus') if assignment else None,
+                    _inspection_json(_inspection_discount_summary(stay)),
                 ])
     if details is None:
         stays_sheet.append([
@@ -1115,10 +1238,10 @@ def write_api_inspection_workbook(rows, report, path, details=None,
 
     default_widths = {
         'Данные': [26, 16, 20, 20, 26, 28, 26, 10, 28, 14, 48, 20,
-                   16, 16, 12, 28, 18, 24, 38, 16, 34],
+                   16, 16, 12, 28, 18, 24, 38, 16, 34, 42, 16, 16, 58, 20],
         'Номера': [32, 16, 12, 28, 28],
         'Номерной фонд API': [12, 18, 28, 18, 24, 28, 28, 22, 22, 18, 26, 72],
-        'Проживания API': [28, 12, 28, 32, 32, 24, 32, 24, 24, 54, 72, 18, 36, 20, 14],
+        'Проживания API': [28, 12, 28, 32, 32, 24, 32, 24, 24, 54, 72, 18, 36, 20, 14, 60],
     }
     for worksheet in wb.worksheets:
         worksheet.freeze_panes = 'A2' if worksheet.max_row > 1 else 'A1'

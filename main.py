@@ -50,7 +50,7 @@ from updater import (UpdateError, check_for_updates, download_release,
                      verify_package)
 from ui_theme import COLORS as UI  # палитра боевых диалогов
 
-APP_VERSION = "3.32"
+APP_VERSION = "3.33"
 
 ID2CODE = {'chai': 'tch', 'dona': 'dna', 'usadba': 'usd'}
 CODE2ID = {'tch': 'chai', 'dna': 'dona', 'usadba': 'usadba'}
@@ -406,6 +406,7 @@ class RealSettingsWindow(SettingsWindow):
             "usadba": self.panes["usadba"].collect(),
             "db": self.panes["data"].path_ent.get(),
             "agents": self.panes["agents"].collect_agents(),
+            "tl_campaigns": self.panes["tl_campaigns"].collect(),
         }
         self.app.hook_save_settings(payload)
         self.destroy()
@@ -636,6 +637,9 @@ class RealApp(TurNalogApp):
                 return
         if payload.get('agents'):
             self.cfg['agents'] = payload['agents']
+        for code, campaigns in (payload.get('tl_campaigns') or {}).items():
+            tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
+            tl_cfg['campaigns_with_discount'] = list(campaigns or [])
         save_config(self.cfg)
         self._sync_theme()
         self.toast("Настройки сохранены")
@@ -668,8 +672,10 @@ class RealApp(TurNalogApp):
         depth = qs
         tl_cfg = self.cfg.setdefault('travelline', {}).setdefault(code, {})
         property_id = str(tl_cfg.get('property_id', '')).strip()
-        cache_key = (tl_import_cache_key(code, property_id, qs, qe, depth)
-                     if property_id else None)
+        campaigns_with_discount = tl_cfg.get('campaigns_with_discount') or []
+        cache_key = (tl_import_cache_key(
+            code, property_id, qs, qe, depth, campaigns_with_discount)
+            if property_id else None)
         cache_record = None
         if cache_key:
             try:
@@ -745,7 +751,7 @@ class RealApp(TurNalogApp):
             save_config(self.cfg)
             property_id = str(tl_cfg['property_id']).strip()
             cache_key = tl_import_cache_key(
-                code, property_id, qs, qe, depth)
+                code, property_id, qs, qe, depth, campaigns_with_discount)
 
         cancel_event = threading.Event()
         prog = TlProgressDialog(self, cancel_event)
@@ -794,7 +800,8 @@ class RealApp(TurNalogApp):
                     details, room_inventory = fetched, None
                 api_details = details
                 rows, rep = bookings_to_rows(
-                    details, qs, qe, accommodation_inventory=room_inventory)
+                    details, qs, qe, accommodation_inventory=room_inventory,
+                    campaigns_with_discount=campaigns_with_discount)
             if cancel_event.is_set():
                 raise TLCancelled()
             # Persist the fetched/prepared data before writing temporary XLSX
@@ -917,11 +924,21 @@ class RealApp(TurNalogApp):
             discount_audit = rep.get('discount_audit') or {}
             discount_stays = discount_audit.get('stays_with_discount', 0)
             if discount_stays:
-                discount_sum = f"{discount_audit.get('discount_amount', 0.0):,.2f}"
-                discount_sum = discount_sum.replace(',', ' ').replace('.', ',')
+                def format_rub(value):
+                    return f'{value:,.2f}'.replace(',', ' ').replace('.', ',')
+
+                discount_sum = format_rub(
+                    discount_audit.get('discount_amount', 0.0))
+                discount_added = format_rub(
+                    discount_audit.get('discount_base_added', 0.0))
+                discount_retained = format_rub(
+                    discount_audit.get('discount_exception_retained', 0.0))
                 lines.append(
-                    f'Скидки TravelLine уже учтены в ценах: {discount_stays} '
-                    f'проживаний, всего {discount_sum} ₽.')
+                    f'Скидки TravelLine: {discount_stays} проживаний, '
+                    f'сумма {discount_sum} ₽. По правилу восстановления базы '
+                    f'добавлено к стоимости для налога: {discount_added} ₽; '
+                    f'по кампаниям-исключениям оставлено со скидкой: '
+                    f'{discount_retained} ₽.')
                 lines.append(
                     'Предполагаемых ночей со скидкой по уникальному '
                     f"совпадению dailyRates: {discount_audit.get('nights_with_discount_identified', 0)}; "

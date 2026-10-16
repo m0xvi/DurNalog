@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Окно настроек: левое меню вместо Tabview. Только GUI, Save — заглушка."""
+"""Окно настроек: левое меню вместо Tabview, с вкладками приложения."""
 
 from __future__ import annotations
 
@@ -556,6 +556,79 @@ class DataPane(ctk.CTkFrame):
         self.path_ent.insert(0, DB_PATH_DEMO)
         self.path_ent.configure(state="disabled")
 
+class TlCampaignsPane(ctk.CTkScrollableFrame):
+    """Список кампаний TravelLine, где скидка остаётся в налоговой базе."""
+
+    def __init__(self, master, app: "TurNalogApp"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.boxes = {}
+        cfg = getattr(app, "cfg", {}) or {}
+        tl_cfg = cfg.get("travelline", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(tl_cfg, dict):
+            tl_cfg = {}
+
+        ctk.CTkLabel(
+            self, text="Кампании TravelLine: считать налог со скидкой",
+            anchor="w", font=_f("h2"), text_color=COLORS["text"]
+        ).pack(anchor="w", pady=(0, 8))
+        ctk.CTkLabel(
+            self,
+            text=("По правилу расчёта скидка обычно добавляется обратно к "
+                  "налоговой базе (это не отдельная комиссия из API). "
+                  "Для перечисленных ниже кампаний она остаётся вычтенной.\n"
+                  "Вставляйте точное название из поля «discounts[].name», "
+                  "по одному названию на строку. Список задаётся отдельно по отелям."),
+            anchor="w", justify="left", wraplength=700, font=_f("sm"),
+            text_color=COLORS["muted"]
+        ).pack(anchor="w", pady=(0, 12))
+
+        for code, hotel_name in (("tch", "Чайковский"), ("dna", "Дона")):
+            card = ctk.CTkFrame(
+                self, fg_color="#FFFFFF", corner_radius=10,
+                border_width=1, border_color=COLORS["line"])
+            card.pack(fill="x", pady=(0, 12))
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=14, pady=12)
+            ctk.CTkLabel(
+                inner, text=hotel_name, anchor="w", font=_f("ui_b"),
+                text_color=COLORS["text"]
+            ).pack(anchor="w", pady=(0, 5))
+            textbox = ctk.CTkTextbox(
+                inner, height=112, wrap="word", border_color=COLORS["line"],
+                fg_color="#F8FAFC", font=_f("mono"))
+            textbox.pack(fill="x")
+            hotel_cfg = tl_cfg.get(code, {})
+            if not isinstance(hotel_cfg, dict):
+                hotel_cfg = {}
+            saved = hotel_cfg.get("campaigns_with_discount", [])
+            if isinstance(saved, str):
+                saved = saved.splitlines()
+            textbox.insert("1.0", "\n".join(str(x) for x in saved or []))
+            self.boxes[code] = textbox
+
+        ctk.CTkLabel(
+            self,
+            text=("Пустой список = скидки всех кампаний добавляются обратно. "
+                  "Изменение списка создаёт отдельную версию кэша TravelLine."),
+            anchor="w", justify="left", wraplength=700, font=_f("xs"),
+            text_color=COLORS["muted"]
+        ).pack(anchor="w", pady=(0, 8))
+
+    def collect(self):
+        result = {}
+        for code, textbox in self.boxes.items():
+            names, seen = [], set()
+            for value in textbox.get("1.0", "end").splitlines():
+                name = value.strip()
+                key = " ".join(name.casefold().replace("ё", "е").split())
+                if key and key not in seen:
+                    seen.add(key)
+                    names.append(name)
+            result[code] = names
+        return result
+
+
 class UpdatesPane(ctk.CTkFrame):
     """Проверка и установка обновлений с GitHub Releases."""
 
@@ -923,6 +996,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self._nav_label("СИСТЕМА")
         self.panes["data"] = DataPane(self.host, app)
         self._nav_btn("data", "База данных")
+        self.panes["tl_campaigns"] = TlCampaignsPane(self.host, app)
+        self._nav_btn("tl_campaigns", "Кампании TL")
         self.panes["updates"] = UpdatesPane(self.host, app)
         self._nav_btn("updates", "Обновления")
 

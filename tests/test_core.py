@@ -156,6 +156,39 @@ def test_tchaikovsky_end_to_end(tmp_path):
     assert bookings[0]["price"] == 5000.0
 
 
+def test_travelline_tax_base_override_does_not_reapply_agent_commission(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import core
+
+    src = tmp_path / "tl-tax-base.csv"
+    rooms = tmp_path / "rooms.csv"
+    out = tmp_path / "tl-tax-base.xlsx"
+    tax_base_header = "Налоговая база TravelLine, ₽"
+    pd.DataFrame([[
+        "Иванов Иван", 88448.20, "22.08.2026", "27.08.2026",
+        "TravelLine YAX", "Стандарт", "TL-8186", 5, 89000,
+    ]], columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник",
+                "Категория номера", "№ брони", "Ночей", tax_base_header]
+                 ).to_csv(src, index=False)
+    pd.DataFrame([["Иванов Иван", 12]],
+                 columns=["ФИО", "№ комнаты"]).to_csv(rooms, index=False)
+
+    _, bookings = core.process_tchaikovsky(
+        str(src), str(rooms), str(out), extra_data=[tax_base_header],
+        source_map={"TravelLine YAX": (18, "Яндекс.Путешествия")},
+        tax={"include_extras_in_tax": False})
+    ws = openpyxl.load_workbook(out)["1&2"]
+    assert ws["D2"].value == 88448.2
+    assert ws["E2"].value == 18
+    assert ws["F2"].value == "Яндекс.Путешествия"
+    assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
+    assert ws["V1"].value == tax_base_header
+    assert ws["V2"].value == 89000.0
+    assert ws["I2"].value == "=ROUND(IF(ISNUMBER(V2),V2,G2),2)"
+    assert bookings[0]["price"] == 88448.2
+
+
 def test_tchaikovsky_tax_includes_extras_after_commission_and_can_disable(tmp_path):
     import pandas as pd
     import openpyxl
@@ -199,6 +232,32 @@ def test_tchaikovsky_tax_includes_extras_after_commission_and_can_disable(tmp_pa
     assert ws_off["I2"].value == "=ROUND(G2,2)"
     assert ws_off["M2"].value == "=I2/L2"
     assert ws_off["O2"].value == '=ROUND(IF(N2="мин.ставка",L2*100,I2/102*2),2)'
+
+
+def test_dona_travelline_tax_base_override_keeps_discounted_exception(tmp_path):
+    import pandas as pd
+    import openpyxl
+    import core
+
+    src = tmp_path / "dona-tl-tax-base.csv"
+    out = tmp_path / "dona-tl-tax-base.xlsx"
+    tax_base_header = "Налоговая база TravelLine, ₽"
+    pd.DataFrame([[
+        "Иванов Иван", 88448.20, "22.08.2026", "27.08.2026",
+        "TravelLine YAX", 88448.20,
+    ]], columns=["Гость", "Стоимость", "Заезд", "Выезд", "Источник",
+                tax_base_header]).to_csv(src, index=False)
+
+    core.process_dona(
+        str(src), str(out), extra_data=[tax_base_header],
+        source_map={"TravelLine YAX": (18, "Яндекс.Путешествия")},
+        tax={"include_extras_in_tax": False})
+    ws = openpyxl.load_workbook(out)["Дона"]
+    assert ws["E2"].value == 18
+    assert ws["G2"].value == "=ROUND(D2/(100-E2)*100,2)"
+    assert ws["I2"].value == "=ROUND(IF(ISNUMBER(U2),U2,G2),2)"
+    assert ws["U1"].value == tax_base_header
+    assert ws["U2"].value == 88448.20
 
 
 def test_dona_does_not_add_extras_to_tax_base(tmp_path):

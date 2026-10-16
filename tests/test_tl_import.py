@@ -10,7 +10,10 @@ from schemas import DNA_DATA_SCHEMA, TCH_DATA_SCHEMA, TCH_ROOMS_SCHEMA
 from tl_client import (TL_DATA_MAP, TL_EXTRA, TL_ROOMS_MAP,
                        COL_TL_DISCOUNT, COL_TL_DISCOUNT_PERCENT,
                        COL_TL_DISCOUNT_DATES, COL_TL_DAILY_SUM,
-                       COL_TL_DAILY_CHECK, ROOM_LABEL_TEXT_PREFIX,
+                       COL_TL_DAILY_CHECK, COL_TL_DISCOUNT_CAMPAIGN,
+                       COL_TL_DISCOUNT_ADDED, COL_TL_DISCOUNT_RETAINED,
+                       COL_TL_DISCOUNT_RULE, COL_TL_TAX_BASE,
+                       ROOM_LABEL_TEXT_PREFIX,
                        accommodation_room_map, bookings_to_rows, channel_label,
                        is_tl_export, write_api_inspection_workbook,
                        write_data_workbook, write_rooms_workbook)
@@ -76,23 +79,31 @@ def test_discount_night_is_inferred_only_from_unique_daily_rate_match(tmp_path):
         'priceAfterTax': 88448.20,
         'discounts': [{
             'amount': 551.80, 'percent': 3.1,
-            'discountType': 'Percentage',
+            'discountType': 'Percentage', 'name': 'Скидка первая ночь',
         }],
     }
     booking = _book(stays=[stay], total=88448.20)
     rows, report = bookings_to_rows([booking], QS, QE)
 
     row = rows[0]
-    assert row['Стоимость'] == 88448.20  # dailyRates уже после скидки
+    assert row['Стоимость'] == 88448.20  # исходная цена проживания со скидкой
+    assert row['Итог брони'] == 88448.20  # сумма API остаётся без изменений
     assert row[COL_TL_DISCOUNT] == 551.80
     assert row[COL_TL_DISCOUNT_PERCENT] == '3.1%'
     assert row[COL_TL_DISCOUNT_DATES] == '2026-08-22'
     assert row[COL_TL_DAILY_SUM] == 88448.20
     assert row[COL_TL_DAILY_CHECK] == 'Сошлось по ночным тарифам'
+    assert row[COL_TL_DISCOUNT_CAMPAIGN] == 'Скидка первая ночь'
+    assert row[COL_TL_DISCOUNT_ADDED] == 551.80
+    assert row[COL_TL_DISCOUNT_RETAINED] == 0.0
+    assert row[COL_TL_DISCOUNT_RULE] == 'Скидка добавлена к налоговой базе'
+    assert row[COL_TL_TAX_BASE] == 89000.0
     audit = report['discount_audit']
     assert audit['stays_with_discount'] == 1
     assert audit['nights_with_discount_identified'] == 1
     assert audit['discounts_without_night_attribution'] == 0
+    assert audit['discount_base_added'] == 551.80
+    assert audit['discount_exception_retained'] == 0.0
     assert audit['daily_rates_matched'] == 1
 
     import openpyxl
@@ -105,8 +116,93 @@ def test_discount_night_is_inferred_only_from_unique_daily_rate_match(tmp_path):
     assert data['Q2'].value == 551.80
     assert data['S2'].value == '2026-08-22'
     assert data['T2'].value == 88448.20
+    assert data['V2'].value == 'Скидка первая ночь'
+    assert data['W2'].value == 551.80
+    assert data['Z1'].value == COL_TL_TAX_BASE
+    assert data['Z2'].value == 89000.0
     assert workbook['Сводка']['B12'].value == 551.80
     assert workbook['Сводка']['B12'].number_format == '#,##0.00'
+    assert workbook['Сводка']['B13'].value == 551.80
+    stays = workbook['Проживания API']
+    headers = [cell.value for cell in stays[1]]
+    discounts_col = headers.index('Скидки API: название/тип/процент/сумма') + 1
+    assert 'Скидка первая ночь' in stays.cell(2, discounts_col).value
+    raw_stay = stays['K2'].value
+    assert 'Иван' not in raw_stay and 'Петров' not in raw_stay
+    assert '<скрыто>' in raw_stay
+
+
+def test_imported_discount_reaches_tax_base_without_agent_commission(tmp_path):
+    import openpyxl
+    import core
+    from openpyxl.utils import get_column_letter
+
+    stay = _stay(arr='2026-08-22T14:00', dep='2026-08-27T12:00',
+                 room=88448.20)
+    stay['total'] = {
+        'priceBeforeTax': 88448.20, 'priceAfterTax': 88448.20,
+        'discounts': [{'amount': 551.80, 'percent': 3.1,
+                       'discountType': 'Percentage',
+                       'name': 'Скидка первая ночь'}],
+    }
+    rows, _ = bookings_to_rows(
+        [_book(stays=[stay], total=88448.20)], QS, QE)
+    data_path = str(tmp_path / 'TL_tch_2026III_data.xlsx')
+    rooms_path = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
+    output_path = str(tmp_path / 'report.xlsx')
+    write_data_workbook(rows, data_path)
+    write_rooms_workbook(rows, rooms_path)
+
+    core.process_tchaikovsky(
+        data_path, rooms_path, output_path, TL_DATA_MAP, TL_ROOMS_MAP,
+        extra_data=TL_EXTRA,
+        source_map={'TravelLine YAX': (18, 'Яндекс.Путешествия')},
+        tax={'include_extras_in_tax': False})
+    report = openpyxl.load_workbook(output_path, data_only=False)['1&2']
+    headers = [cell.value for cell in report[1]]
+    tax_base_col = get_column_letter(headers.index(COL_TL_TAX_BASE) + 1)
+    actual_total_col = get_column_letter(headers.index('Итог брони') + 1)
+    assert report['D2'].value == 88448.20
+    assert report['E2'].value == 18
+    assert report['G2'].value == '=ROUND(D2/(100-E2)*100,2)'
+    assert report['I2'].value == (
+        f'=ROUND(IF(ISNUMBER({tax_base_col}2),{tax_base_col}2,G2),2)')
+    assert report[f'{actual_total_col}2'].value == 88448.20
+    assert report[f'{tax_base_col}2'].value == 89000.0
+
+
+def test_campaign_exception_keeps_discount_in_tax_base():
+    stay = _stay(arr='2026-08-22T14:00', dep='2026-08-27T12:00',
+                 room=88448.20)
+    stay['dailyRates'] = [
+        {'date': '2026-08-22', 'priceBeforeTax': 17248.20},
+        {'date': '2026-08-23', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-24', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-25', 'priceBeforeTax': 17800.00},
+        {'date': '2026-08-26', 'priceBeforeTax': 17800.00},
+    ]
+    stay['total'] = {
+        'priceBeforeTax': 88448.20, 'priceAfterTax': 88448.20,
+        'discounts': [{
+            'amount': 551.80, 'percent': 3.1,
+            'discountType': 'Percentage', 'name': 'Скидка первая ночь',
+        }],
+    }
+    rows, report = bookings_to_rows(
+        [_book(stays=[stay], total=88448.20)], QS, QE,
+        campaigns_with_discount=['скидка первая ночь'])
+
+    row = rows[0]
+    assert row['Стоимость'] == 88448.20
+    assert row['Итог брони'] == 88448.20
+    assert row[COL_TL_DISCOUNT_ADDED] == 0.0
+    assert row[COL_TL_DISCOUNT_RETAINED] == 551.80
+    assert row[COL_TL_TAX_BASE] == 88448.20
+    assert row[COL_TL_DISCOUNT_RULE] == (
+        'Кампания-исключение: скидка сохранена в налоговой базе')
+    assert report['discount_audit']['discount_base_added'] == 0.0
+    assert report['discount_audit']['discount_exception_retained'] == 551.80
+    assert report['discount_audit']['discount_exception_stays'] == 1
 
 
 def test_ambiguous_discount_is_reported_without_guessing_a_date():
@@ -673,6 +769,10 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
     rp = str(tmp_path / 'TL_tch_2026III_rooms.xlsx')
     write_data_workbook(rows, dp)
     write_rooms_workbook(rows, rp)
+    import openpyxl
+    data_sheet = openpyxl.load_workbook(dp, data_only=True)['Брони']
+    assert data_sheet['Y1'].value == COL_TL_TAX_BASE
+    assert data_sheet['Y2'].value == 10000.0
     assert is_tl_export(dp) and is_tl_export(rp)
     assert not is_tl_export(str(tmp_path / 'other.xlsx'))
     df = read_table(dp)
@@ -684,7 +784,12 @@ def test_workbooks_roundtrip_and_mapping(tmp_path):
                                 'Скидка TravelLine, ₽',
                                 'Процент скидки TravelLine',
                                 'Предполагаемые ночи со скидкой TravelLine',
-                                'Сумма dailyRates', 'Сверка dailyRates']
+                                'Сумма dailyRates', 'Сверка dailyRates',
+                                'Название скидки/кампании TravelLine',
+                                'Скидка добавлена к налоговой базе, ₽',
+                                'Скидка сохранена в базе, ₽',
+                                'Правило скидки TravelLine',
+                                'Налоговая база TravelLine, ₽']
     assert df.iloc[0]['Стоимость'] == 10000.0
     assert df.iloc[0]['Гость'] == 'Иван Петров'
     headers = [str(c) for c in df.columns]
@@ -915,8 +1020,9 @@ def test_import_cache_key_is_scoped_to_property_period_and_query():
 
     common = ('tch', '8186', '2026-07-01', '2026-10-01', '2026-07-01')
     key = tl_import_cache_key(*common)
-    assert key.startswith('tlcache-v5|')
+    assert key.startswith('tlcache-v6|')
     assert tl_import_cache_key(*common) == key
+    assert tl_import_cache_key(*common, campaigns_with_discount=['Promo A']) != key
     assert tl_import_cache_key('tch', '479', *common[2:]) != key
     assert tl_import_cache_key('tch', '8186', '2026-10-01', '2027-01-01',
                                '2026-10-01') != key

@@ -68,6 +68,31 @@ def _is_extension_amount_header(label):
     }
 
 
+def _is_travelline_tax_base_header(label):
+    return norm_key(label) in {
+        'налоговаябазаtravelline', 'налоговаябазатравеллайн',
+        'налоговаябазаtl',
+    }
+
+
+def _tax_base_formula(base_column, row, extra_term='', tax_base_column=None,
+                      report_extra_columns=None, extra_start_column=22):
+    """Prefer an explicit TravelLine tax base without grossing it up again.
+
+    The regular agent commission formula remains visible and unchanged, but a
+    TravelLine tax-base override is already reconstructed to the desired gross
+    amount. Applying the agent percentage to that override would count a
+    second, unrelated commission and inflate the tax base.
+    """
+    base_ref = f'{base_column}{row}'
+    report_extra_columns = report_extra_columns or []
+    if tax_base_column in report_extra_columns:
+        index = report_extra_columns.index(tax_base_column)
+        override_ref = f'{get_column_letter(extra_start_column + index)}{row}'
+        base_ref = f'IF(ISNUMBER({override_ref}),{override_ref},{base_ref})'
+    return f'=ROUND({base_ref}{extra_term},2)'
+
+
 def _service_name_parts(value):
     for part in str(value or '').split(';'):
         match = re.match(r'^(.*?)\s+[—–-]\s+(.*)$', part.strip())
@@ -510,7 +535,11 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
         (c for c in df_data.columns if _is_service_name_header(c)), None)
     extension_amount_col = next(
         (c for c in df_data.columns if _is_extension_amount_header(c)), None)
-    for special_col in (extra_amount_col, service_name_col, extension_amount_col):
+    tax_base_col = next(
+        (c for c in df_data.columns
+         if _is_travelline_tax_base_header(c)), None)
+    for special_col in (extra_amount_col, service_name_col,
+                        extension_amount_col, tax_base_col):
         if special_col is not None and special_col not in extra_data:
             extra_data.append(special_col)
     report_extra_data = [
@@ -826,7 +855,9 @@ def process_tchaikovsky( data_path, rooms_path, output_path,
             c_extras.number_format = '#,##0.00'
             extra_term = f'+H{r}' if tp.include_extras_in_tax else ''
             c_tax_base = ws.cell(
-                row=r, column=9, value=f'=ROUND({base}{r}{extra_term},2)')
+                row=r, column=9,
+                value=_tax_base_formula(
+                    base, r, extra_term, tax_base_col, report_extra_data, 22))
             c_tax_base.number_format = '#,##0.00'
             c_names = ws.cell(row=r, column=10, value=rec['service_names'])
             c_names.alignment = Alignment(wrap_text=True, vertical='top')
@@ -985,7 +1016,11 @@ def process_dona(data_path, output_path, map_data=None,
         (c for c in df_data.columns if _is_service_name_header(c)), None)
     extension_amount_col = next(
         (c for c in df_data.columns if _is_extension_amount_header(c)), None)
-    for special_col in (extra_amount_col, service_name_col, extension_amount_col):
+    tax_base_col = next(
+        (c for c in df_data.columns
+         if _is_travelline_tax_base_header(c)), None)
+    for special_col in (extra_amount_col, service_name_col,
+                        extension_amount_col, tax_base_col):
         if special_col is not None and special_col not in extra_data:
             extra_data.append(special_col)
     report_extra_data = [
@@ -1144,7 +1179,9 @@ def process_dona(data_path, output_path, map_data=None,
         c_extras.number_format = '#,##0.00'
         extra_term = f'+J{r}' if tp.include_extras_in_tax else ''
         c_tax_base = ws.cell(
-            row=r, column=9, value=f'=ROUND({base}{r}{extra_term},2)')
+            row=r, column=9,
+            value=_tax_base_formula(
+                base, r, extra_term, tax_base_col, report_extra_data, 21))
         c_tax_base.number_format = '#,##0.00'
         c_extension = ws.cell(row=r, column=10, value=rec['extension_amount'])
         c_extension.number_format = '#,##0.00'
